@@ -12,7 +12,7 @@ use prometheus::{self, proto, CounterVec, IntCounterVec, IntGaugeVec, Opts};
 
 use procinfo::pid;
 
-use super::ThreadSpawnWrapper;
+use super::{ThreadBuildWrapper, TokioThreadBuildWrapper};
 
 /// Monitors threads of the current process.
 pub fn monitor_threads<S: Into<String>>(namespace: S) -> Result<()> {
@@ -297,7 +297,7 @@ lazy_static! {
     static ref THREAD_NAME_HASHMAP: Mutex<HashMap<pid_t, String>> = Mutex::new(HashMap::new());
 }
 
-impl ThreadSpawnWrapper for thread::Builder {
+impl ThreadBuildWrapper for thread::Builder {
     fn spawn_wrapper<F, T>(self, f: F) -> Result<thread::JoinHandle<T>>
     where
         F: FnOnce() -> T,
@@ -305,6 +305,24 @@ impl ThreadSpawnWrapper for thread::Builder {
         T: Send + 'static,
     {
         self.spawn(|| {
+            if let Some(name) = thread::current().name() {
+                let tid = pid_t::from(gettid());
+                THREAD_NAME_HASHMAP
+                    .lock()
+                    .unwrap()
+                    .insert(tid, name.to_string());
+                debug!("tid {} thread name is {}", tid, name);
+            }
+            f()
+        })
+    }
+}
+
+impl TokioThreadBuildWrapper for tokio_threadpool::Builder {
+    fn after_start_wrapper<F>(&mut self, f: F) -> &mut Self
+        where F: Fn() + Send + Sync + 'static
+    {
+        self.after_start(|| {
             if let Some(name) = thread::current().name() {
                 let tid = pid_t::from(gettid());
                 THREAD_NAME_HASHMAP
