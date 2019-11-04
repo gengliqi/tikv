@@ -1200,6 +1200,7 @@ impl Peer {
                     .get_region_epoch()
                     .get_version()
             {
+                // 如果 apply snapshot 放到 apply batch 是不是就没问题了？？？
                 // For merge process, when applying snapshot or create new peer the stale source
                 // peer is destroyed asynchronously. So here checks whether there is any overlap, if
                 // so, wait and do not handle raft ready.

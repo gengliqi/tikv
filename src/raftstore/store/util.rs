@@ -138,6 +138,7 @@ pub fn conf_change_type_str(conf_type: eraftpb::ConfChangeType) -> &'static str 
     }
 }
 
+// 前者有一个比后者小就返回 true，反之 false
 // check whether epoch is staler than check_epoch.
 pub fn is_epoch_stale(epoch: &metapb::RegionEpoch, check_epoch: &metapb::RegionEpoch) -> bool {
     epoch.get_version() < check_epoch.get_version()

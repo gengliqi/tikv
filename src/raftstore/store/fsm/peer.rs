@@ -871,8 +871,8 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             self.handle_gc_peer_msg(&msg);
             return Ok(());
         }
-
         if msg.has_merge_target() {
+            println!("merge msg {:?}", msg);
             if self.need_gc_merge(&msg)? {
                 self.on_stale_merge();
             }
@@ -2354,6 +2354,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     }
 
     fn propose_raft_command(&mut self, mut msg: RaftCmdRequest, cb: Callback) {
+        println!("msg {:?}", msg);
         match self.pre_propose_raft_command(&msg) {
             Ok(Some(resp)) => {
                 cb.invoke_with_response(resp);

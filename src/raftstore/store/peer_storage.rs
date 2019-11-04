@@ -313,7 +313,7 @@ impl InvokeContext {
     }
 
     #[inline]
-    pub fn save_apply_state_to(&self, kv_engine: &DB, kv_wb: &mut WriteBatch) -> Result<()> {
+    pub fn save_apply_state_to(&self, kv_engine: &DB, kv_wb: &WriteBatch) -> Result<()> {
         let handle = rocks::util::get_cf_handle(kv_engine, CF_RAFT)?;
         kv_wb.put_msg_cf(
             handle,
@@ -1169,7 +1169,7 @@ impl PeerStorage {
 
         // only when apply snapshot
         if snapshot_index != 0 {
-            ctx.save_apply_state_to(&self.engines.kv, &mut ready_ctx.kv_wb_mut())?;
+            ctx.save_apply_state_to(&self.engines.kv, &ready_ctx.kv_wb())?;
         }
 
         Ok(ctx)
