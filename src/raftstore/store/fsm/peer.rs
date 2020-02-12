@@ -357,6 +357,10 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 // Maybe do some safe check first?
                 self.fsm.group_state = GroupState::Chaos;
                 self.register_raft_base_tick();
+
+                if self.fsm.peer.raft_group.raft.is_learner {
+                    self.fsm.peer.send_load_merge_target(&mut self.ctx.trans);
+                }
             }
         }
     }
@@ -874,6 +878,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             return Ok(());
         }
 
+        if msg.has_merge() {
+            // noop
+            return Ok(());
+        }
+
         if self.check_msg(&msg) {
             return Ok(());
         }
@@ -1241,7 +1250,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 return Ok(Some(key));
             }
         }
-
+        let mut is_overlapped = false;
         let mut regions_to_destroy = vec![];
         // In some extreme cases, it may cause source peer destroyed improperly so that a later
         // CommitMerge may panic because source is already destroyed, so just drop the message:
@@ -1280,12 +1289,17 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 // check but the peer is already destroyed.
                 regions_to_destroy.push(exist_region.get_id());
                 continue;
-            } else {
+            }
+            is_overlapped = true;
+            if snap_region.get_region_epoch().get_version() > exist_region.get_region_epoch().get_version()
+            {
                 let _ = self.ctx.router.force_send(
                     exist_region.get_id(),
                     PeerMsg::CasualMessage(CasualMessage::RegionOverlapped),
                 );
             }
+        }
+        if is_overlapped {
             self.ctx.raft_metrics.message_dropped.region_overlap += 1;
             return Ok(Some(key));
         }

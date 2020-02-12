@@ -171,7 +171,7 @@ dependencies = [
  "futures-util",
  "grpcio",
  "hex 0.3.2",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "lazy_static 1.4.0",
  "prometheus",
  "protobuf",
@@ -477,7 +477,7 @@ dependencies = [
  "futures 0.1.29",
  "grpcio",
  "hex 0.3.2",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "libc",
  "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix 0.11.0",
@@ -931,7 +931,7 @@ name = "engine"
 version = "0.0.1"
 dependencies = [
  "hex 0.3.2",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "lazy_static 1.4.0",
  "prometheus",
  "protobuf",
@@ -1002,7 +1002,7 @@ dependencies = [
  "futures-executor",
  "futures-io",
  "futures-util",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "rand 0.7.2",
  "rusoto_core",
  "rusoto_credential",
@@ -1740,7 +1740,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.1"
-source = "git+https://github.com/pingcap/kvproto.git?branch=release-3.1#549d10f19d46e1cc22331f484b448262d3983cae"
+source = "git+https://github.com/gengliqi/kvproto.git?branch=learner-merge#e1bae00fbfed76f66b2bf1dc0e898cefadfc6518"
 dependencies = [
  "bytes",
  "futures 0.1.29",
@@ -1752,6 +1752,12 @@ dependencies = [
  "protobuf-build",
  "raft",
 ]
+
+[[package]]
+name = "kvproto"
+version = "0.0.1"
+source = "git+https://github.com/pingcap/kvproto.git?branch=release-3.1#549d10f19d46e1cc22331f484b448262d3983cae"
+replace = "kvproto 0.0.1 (git+https://github.com/gengliqi/kvproto.git?branch=learner-merge)"
 
 [[package]]
 name = "language-tags"
@@ -1913,7 +1919,7 @@ name = "log_wrappers"
 version = "0.0.1"
 dependencies = [
  "hex 0.3.2",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "slog",
  "slog-term",
  "tikv_alloc",
@@ -2706,7 +2712,7 @@ version = "2.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb1a649b870f7fe03c965bf2fa6728361f6abbb6f3b72079515af8cb56d769cf"
 dependencies = [
- "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2796,7 +2802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43648985159f2c4c25f934182a63b0dd4c5cc06a5ae96e5d40e12c3a3785abde"
 dependencies = [
  "fxhash",
- "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "protobuf",
  "quick-error 1.2.2",
  "rand 0.5.5",
@@ -3841,7 +3847,7 @@ name = "test_coprocessor"
 version = "0.0.1"
 dependencies = [
  "futures 0.1.29",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "protobuf",
  "test_storage",
  "tikv",
@@ -3857,7 +3863,7 @@ dependencies = [
  "futures 0.1.29",
  "grpcio",
  "hex 0.3.2",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "protobuf",
  "raft",
  "rand 0.6.5",
@@ -3875,7 +3881,7 @@ name = "test_storage"
 version = "0.0.1"
 dependencies = [
  "futures 0.1.29",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "test_raftstore",
  "tikv",
  "tikv_util",
@@ -3947,7 +3953,7 @@ dependencies = [
  "hex 0.3.2",
  "hyper 0.12.35",
  "indexmap",
- "kvproto",
+ "kvproto 0.0.1 (git+https://github.com/pingcap/kvproto.git?branch=release-3.1)",
  "lazy_static 1.4.0",
  "libc",
  "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
