@@ -10,7 +10,7 @@ use kvproto::errorpb::Error as PbError;
 use kvproto::metapb::{self, Peer, RegionEpoch};
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
-use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState};
+use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState, RaftLocalState};
 use tempdir::TempDir;
 
 use engine::rocks;
@@ -788,6 +788,13 @@ impl<T: Simulator> Cluster<T> {
             .unwrap()
             .unwrap()
             .take_truncated_state()
+    }
+
+    pub fn raft_local_state(&self, region_id: u64, store_id: u64) -> RaftLocalState {
+        self.get_raft_engine(store_id)
+            .get_msg::<RaftLocalState>(&keys::raft_state_key(region_id))
+            .unwrap()
+            .unwrap()
     }
 
     pub fn transfer_leader(&mut self, region_id: u64, leader: metapb::Peer) {

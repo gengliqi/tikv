@@ -16,6 +16,7 @@ use tikv::pd::PdClient;
 use tikv::raftstore::store::keys;
 use tikv_util::config::*;
 use tikv_util::HandyRwLock;
+use std::time::*;
 
 /// Test if merge is working as expected in a general condition.
 #[test]
@@ -785,4 +786,123 @@ fn test_merge_with_slow_promote() {
     pd_client.must_merge(right.get_id(), left.get_id());
     cluster.sim.wl().clear_send_filters(3);
     cluster.must_transfer_leader(left.get_id(), new_peer(3, left.get_id() + 3));
+}
+
+fn test_raft_catch_up_speed(log_num: u32, key_len: u32, value_len: u32) {
+    let mut cluster = new_server_cluster(0, 3);
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::hours(10);
+    cluster.cfg.raft_store.raft_log_gc_threshold = 10000000;
+    cluster.cfg.raft_store.raft_log_gc_count_limit = 10000000;
+    cluster.cfg.raft_store.raft_log_gc_size_limit = ReadableSize::gb(100);
+    cluster.cfg.raft_store.split_region_check_tick_interval = ReadableDuration::hours(10);
+    cluster.cfg.coprocessor.region_max_size = ReadableSize(100 * GB);
+    cluster.cfg.coprocessor.region_split_size = ReadableSize(100 * GB);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    let region = pd_client.get_region(b"k1").unwrap();
+    let peer_on_store1 = find_peer(&region, 1).unwrap().to_owned();
+    cluster.must_transfer_leader(region.get_id(), peer_on_store1);
+
+    cluster.stop_node(3);
+
+    let mut key = String::new();
+    for _ in 0..key_len {
+        key += "k";
+    }
+    let mut value = String::new();
+    for _ in 0..value_len {
+        value += "v";
+    }
+    for i in 0..log_num {
+        cluster.must_put(format!("{}{}", key, i).as_bytes(), value.as_bytes());
+    }
+    let truncated_state = cluster.truncated_state(1, 1);
+    println!("truncated_state {:?}", truncated_state);
+    let raft_local_state = cluster.raft_local_state(1, 1);
+    println!("raft_local_state {:?}", raft_local_state);
+    cluster.add_send_filter(IsolationFilterFactory::new(3));
+    
+    cluster.run_node(3).unwrap();
+
+    let timer = Instant::now();
+    cluster.clear_send_filters();
+    let delay_filter = Box::new(DelayFilter::new(Duration::from_millis(2)));
+    cluster.sim.wl().add_send_filter(3, delay_filter);
+
+    loop {
+        let raft_local_state_3 = cluster.raft_local_state(1, 3);
+        if raft_local_state_3.get_last_index() >= raft_local_state.get_last_index() {
+            println!("log_num {}, key_len {}, value_len {}, time {:?}", log_num, key_len, value_len, timer.elapsed());
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn test_raft_catch_up_speed_1() {
+    test_raft_catch_up_speed(1000, 10, 100);
+}
+
+#[test]
+fn test_raft_catch_up_speed_2() {
+    test_raft_catch_up_speed(1000, 100, 1000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_3() {
+    test_raft_catch_up_speed(1000, 100, 10000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_4() {
+    test_raft_catch_up_speed(1000, 300, 100000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_5() {
+    test_raft_catch_up_speed(3000, 10, 100);
+}
+
+#[test]
+fn test_raft_catch_up_speed_6() {
+    test_raft_catch_up_speed(3000, 100, 1000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_7() {
+    test_raft_catch_up_speed(3000, 100, 10000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_8() {
+    test_raft_catch_up_speed(3000, 300, 100000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_9() {
+    test_raft_catch_up_speed(3000, 500, 100000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_10() {
+    test_raft_catch_up_speed(3000, 500, 1000000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_11() {
+    test_raft_catch_up_speed(5000, 300, 100000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_12() {
+    test_raft_catch_up_speed(5000, 500, 100000);
+}
+
+#[test]
+fn test_raft_catch_up_speed_13() {
+    test_raft_catch_up_speed(5000, 500, 1000000);
 }
