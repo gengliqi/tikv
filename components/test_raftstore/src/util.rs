@@ -143,10 +143,10 @@ pub fn new_server_config(cluster_id: u64) -> ServerConfig {
     ServerConfig {
         cluster_id,
         addr: "127.0.0.1:0".to_owned(),
-        grpc_concurrency: 1,
+        //grpc_concurrency: 1,
         // Considering connection selection algo is involved, maybe
         // use 2 or larger value here?
-        grpc_raft_conn_num: 1,
+        //grpc_raft_conn_num: 1,
         ..ServerConfig::default()
     }
 }
@@ -170,14 +170,14 @@ pub fn new_readpool_cfg() -> ReadPoolConfig {
 
 pub fn new_tikv_config(cluster_id: u64) -> TiKvConfig {
     TiKvConfig {
-        storage: StorageConfig {
+        /*storage: StorageConfig {
             scheduler_worker_pool_size: 1,
             scheduler_concurrency: 10,
             ..StorageConfig::default()
-        },
+        },*/
         server: new_server_config(cluster_id),
-        raft_store: new_store_cfg(),
-        readpool: new_readpool_cfg(),
+        //raft_store: new_store_cfg(),
+        //readpool: new_readpool_cfg(),
         ..TiKvConfig::default()
     }
 }

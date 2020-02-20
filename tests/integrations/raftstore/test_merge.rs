@@ -11,12 +11,12 @@ use raft::eraftpb::MessageType;
 
 use engine::Peekable;
 use engine::{CF_RAFT, CF_WRITE};
+use std::time::*;
 use test_raftstore::*;
 use tikv::pd::PdClient;
 use tikv::raftstore::store::keys;
 use tikv_util::config::*;
 use tikv_util::HandyRwLock;
-use std::time::*;
 
 /// Test if merge is working as expected in a general condition.
 #[test]
@@ -788,8 +788,42 @@ fn test_merge_with_slow_promote() {
     cluster.must_transfer_leader(left.get_id(), new_peer(3, left.get_id() + 3));
 }
 
-fn test_raft_catch_up_speed(log_num: u32, key_len: u32, value_len: u32) {
+#[test]
+fn test_raft_catch_up_speed() {
     let mut cluster = new_server_cluster(0, 3);
+
+    use std::fs::File;
+    use std::io::prelude::*;
+    use std::io::BufReader;
+
+    let mut log_num = 0;
+    let mut key_len = 0;
+    let mut value_len = 0;
+    let mut raft_max_size_per_msg = 1;
+    let mut raft_max_inflight_msgs = 256;
+    let file = File::open("./config.tmp").unwrap();
+    let fin = BufReader::new(file);
+    let mut x = 0;
+    for line in fin.lines() {
+        let number = line.unwrap().parse::<i32>().unwrap();
+        match x {
+            0 => log_num = number,
+            1 => key_len = number,
+            2 => value_len = number,
+            3 => raft_max_size_per_msg = number,
+            4 => raft_max_inflight_msgs = number,
+            _ => {
+                panic!("too many config num");
+            }
+        }
+        x = x + 1;
+    }
+    if x != 3 && x != 5 {
+        panic!("config num error {}", x);
+    }
+    cluster.cfg.raft_store.raft_max_size_per_msg = ReadableSize::mb(raft_max_size_per_msg as u64);
+    cluster.cfg.raft_store.raft_max_inflight_msgs = raft_max_inflight_msgs as usize;
+
     cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::hours(10);
     cluster.cfg.raft_store.raft_log_gc_threshold = 10000000;
     cluster.cfg.raft_store.raft_log_gc_count_limit = 10000000;
@@ -797,10 +831,13 @@ fn test_raft_catch_up_speed(log_num: u32, key_len: u32, value_len: u32) {
     cluster.cfg.raft_store.split_region_check_tick_interval = ReadableDuration::hours(10);
     cluster.cfg.coprocessor.region_max_size = ReadableSize(100 * GB);
     cluster.cfg.coprocessor.region_split_size = ReadableSize(100 * GB);
+
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
 
     cluster.run();
+
+    cluster.must_put(b"k", b"v");
 
     let region = pd_client.get_region(b"k1").unwrap();
     let peer_on_store1 = find_peer(&region, 1).unwrap().to_owned();
@@ -824,85 +861,21 @@ fn test_raft_catch_up_speed(log_num: u32, key_len: u32, value_len: u32) {
     let raft_local_state = cluster.raft_local_state(1, 1);
     println!("raft_local_state {:?}", raft_local_state);
     cluster.add_send_filter(IsolationFilterFactory::new(3));
-    
+
     cluster.run_node(3).unwrap();
 
     let timer = Instant::now();
     cluster.clear_send_filters();
-    let delay_filter = Box::new(DelayFilter::new(Duration::from_millis(2)));
-    cluster.sim.wl().add_send_filter(3, delay_filter);
+    //let delay_filter = Box::new(DelayFilter::new(Duration::from_millis(2)));
+    //cluster.sim.wl().add_send_filter(3, delay_filter);
 
     loop {
         let raft_local_state_3 = cluster.raft_local_state(1, 3);
         if raft_local_state_3.get_last_index() >= raft_local_state.get_last_index() {
-            println!("log_num {}, key_len {}, value_len {}, time {:?}", log_num, key_len, value_len, timer.elapsed());
+            println!("log_num {}, key_len {}, value_len {}, raft_max_size_per_msg {}mb, raft_max_inflight_msgs {}, time {:?}", 
+                    log_num, key_len, value_len, raft_max_size_per_msg, raft_max_inflight_msgs, timer.elapsed());
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
-}
-
-#[test]
-fn test_raft_catch_up_speed_1() {
-    test_raft_catch_up_speed(1000, 10, 100);
-}
-
-#[test]
-fn test_raft_catch_up_speed_2() {
-    test_raft_catch_up_speed(1000, 100, 1000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_3() {
-    test_raft_catch_up_speed(1000, 100, 10000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_4() {
-    test_raft_catch_up_speed(1000, 300, 100000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_5() {
-    test_raft_catch_up_speed(3000, 10, 100);
-}
-
-#[test]
-fn test_raft_catch_up_speed_6() {
-    test_raft_catch_up_speed(3000, 100, 1000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_7() {
-    test_raft_catch_up_speed(3000, 100, 10000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_8() {
-    test_raft_catch_up_speed(3000, 300, 100000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_9() {
-    test_raft_catch_up_speed(3000, 500, 100000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_10() {
-    test_raft_catch_up_speed(3000, 500, 1000000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_11() {
-    test_raft_catch_up_speed(5000, 300, 100000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_12() {
-    test_raft_catch_up_speed(5000, 500, 100000);
-}
-
-#[test]
-fn test_raft_catch_up_speed_13() {
-    test_raft_catch_up_speed(5000, 500, 1000000);
 }

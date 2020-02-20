@@ -10,7 +10,7 @@ use kvproto::errorpb::Error as PbError;
 use kvproto::metapb::{self, Peer, RegionEpoch};
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
-use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState, RaftLocalState};
+use kvproto::raft_serverpb::{RaftApplyState, RaftLocalState, RaftMessage, RaftTruncatedState};
 use tempdir::TempDir;
 
 use engine::rocks;
@@ -361,7 +361,7 @@ impl<T: Simulator> Cluster<T> {
             .filter(|id| node_ids.contains(id))
             .cloned()
             .collect();
-        for _ in 0..500 {
+        for _ in 0..10000 {
             for store_id in &alive_store_ids {
                 let l = match self.query_leader(*store_id, region_id, Duration::from_secs(1)) {
                     None => continue,
@@ -676,7 +676,7 @@ impl<T: Simulator> Cluster<T> {
             key,
             vec![new_put_cf_cmd(cf, key, value)],
             false,
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         );
         if resp.get_header().has_error() {
             panic!("response {:?} has error", resp);
@@ -818,7 +818,7 @@ impl<T: Simulator> Cluster<T> {
             if self.leader_of_region(region_id) == Some(leader.clone()) {
                 return;
             }
-            if timer.elapsed() > Duration::from_secs(5) {
+            if timer.elapsed() > Duration::from_secs(10) {
                 panic!("failed to transfer leader to [{}] {:?}", region_id, leader);
             }
             self.transfer_leader(region_id, leader.clone());
