@@ -241,7 +241,8 @@ pub fn check_store_id(req: &RaftCmdRequest, store_id: u64) -> Result<()> {
     if peer.get_store_id() == store_id {
         Ok(())
     } else {
-        Err(Error::StoreNotMatch(peer.get_store_id(), store_id))
+        panic!("store id {:?} not match peer {:?} mss {:?}", store_id, peer, req);
+        //Err(Error::StoreNotMatch(peer.get_store_id(), store_id))
     }
 }
 

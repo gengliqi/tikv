@@ -56,6 +56,9 @@ pub struct Task {
 impl Task {
     /// Creates a task for a running command.
     pub fn new(cid: u64, cmd: Command) -> Task {
+        if cmd.ctx.get_peer().get_store_id() == 6 {
+            panic!("it should not happen command {:?}", cmd);
+        }
         Task {
             cid,
             tag: cmd.tag(),
