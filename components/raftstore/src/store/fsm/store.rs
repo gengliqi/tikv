@@ -1340,6 +1340,7 @@ impl<'a, T: Transport, C: PdClient> StoreFsmDelegate<'a, T, C> {
                 "store_id" => self.ctx.store_id(),
                 "to_store_id" => msg.get_to_peer().get_store_id(),
                 "region_id" => region_id,
+                "msg" => ?msg
             );
             self.ctx.raft_metrics.message_dropped.mismatch_store_id += 1;
             return Ok(());
