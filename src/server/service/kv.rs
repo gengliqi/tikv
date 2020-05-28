@@ -767,6 +767,11 @@ impl<T: RaftStoreRouter + 'static, E: Engine, L: LockManager> Tikv for Service<T
                     } else {
                         let read_index = raft_resps[0].get_read_index().get_read_index();
                         resp.set_read_index(read_index);
+                        info!(
+                            "read index";
+                            "region_id" => region_id,
+                            "index" => read_index,
+                        );
                     }
                 }
                 resp

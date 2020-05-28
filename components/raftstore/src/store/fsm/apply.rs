@@ -753,6 +753,12 @@ impl ApplyDelegate {
                 // This peer is about to be destroyed, skip everything.
                 break;
             }
+            info!(
+                "apply log";
+                "region_id" => self.region_id(),
+                "peer_id" => self.id(),
+                "index" => entry.get_index(),
+            );
 
             let expect_index = self.apply_state.get_applied_index() + 1;
             if expect_index != entry.get_index() {
