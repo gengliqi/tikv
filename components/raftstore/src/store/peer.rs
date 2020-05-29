@@ -2044,7 +2044,7 @@ impl Peer {
                             info!(
                                 "request to get a read index(batch)";
                                 "uu" => ?uu,
-                                "first uu" => ?read.cmds[0].0.get_reqeusts()[0].get_put().get_key(),
+                                "first uu" => ?read.cmds[0].0.get_requests()[0].get_put().get_key(),
                                 "region_id" => self.region_id,
                             );
                             read.push_command(req, cb);
@@ -2937,7 +2937,7 @@ where
                         resp.set_read_index(res);
                         info!(
                             "read index response";
-                            "uu" => ?request.get_put().get_key(),
+                            "uu" => ?req.get_put().get_key(),
                             "read_index" => read_index,
                             "region_id" => region.get_id(),
                         );
