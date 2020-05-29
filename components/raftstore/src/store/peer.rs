@@ -2035,6 +2035,18 @@ impl Peer {
                     if let Some(read) = self.pending_reads.back_mut() {
                         let max_lease = poll_ctx.cfg.raft_store_max_leader_lease();
                         if read.renew_lease_time + max_lease > renew_lease_time {
+                            let uu = Uuid::new_v4().as_bytes().to_vec();
+                            if req.get_requests().len() == 1
+                                && req.get_requests()[0].get_cmd_type() == CmdType::ReadIndex
+                            {
+                                req.mut_requests()[0].mut_put().set_key(uu);
+                            }
+                            info!(
+                                "request to get a read index(batch)";
+                                "uu" => ?uu,
+                                "first uu" => ?read.cmds[0].0.get_reqeusts()[0].get_put().get_key(),
+                                "region_id" => self.region_id,
+                            );
                             read.push_command(req, cb);
                             return false;
                         }
@@ -2092,6 +2104,12 @@ impl Peer {
             return false;
         }
 
+        let uu = Uuid::new_v4().as_bytes().to_vec();
+        if req.get_requests().len() == 1
+            && req.get_requests()[0].get_cmd_type() == CmdType::ReadIndex
+        {
+            req.mut_requests()[0].mut_put().set_key(uu);
+        }
         let read = ReadIndexRequest::with_command(id, req, cb, renew_lease_time);
         self.pending_reads.push_back(read, self.is_leader());
         self.should_wake_up = true;
@@ -2102,6 +2120,7 @@ impl Peer {
             "region_id" => self.region_id,
             "peer_id" => self.peer.get_id(),
             "is_leader" => self.is_leader(),
+            "uu" => ?uu,
         );
 
         // TimeoutNow has been sent out, so we need to propose explicitly to
@@ -2916,6 +2935,12 @@ where
                         let mut res = ReadIndexResponse::default();
                         res.set_read_index(read_index);
                         resp.set_read_index(res);
+                        info!(
+                            "read index response";
+                            "uu" => ?request.get_put().get_key(),
+                            "read_index" => read_index,
+                            "region_id" => region.get_id(),
+                        );
                     } else {
                         panic!("[region {}] can not get readindex", region.get_id(),);
                     }
