@@ -2005,7 +2005,7 @@ impl Peer {
     fn read_index<T: Transport, C>(
         &mut self,
         poll_ctx: &mut PollContext<T, C>,
-        req: RaftCmdRequest,
+        mut req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
         cb: Callback<RocksEngine>,
     ) -> bool {
@@ -2039,7 +2039,7 @@ impl Peer {
                             if req.get_requests().len() == 1
                                 && req.get_requests()[0].get_cmd_type() == CmdType::ReadIndex
                             {
-                                req.mut_requests()[0].mut_put().set_key(uu);
+                                req.mut_requests()[0].mut_put().set_key(uu.clone());
                             }
                             info!(
                                 "request to get a read index(batch)";
@@ -2108,7 +2108,7 @@ impl Peer {
         if req.get_requests().len() == 1
             && req.get_requests()[0].get_cmd_type() == CmdType::ReadIndex
         {
-            req.mut_requests()[0].mut_put().set_key(uu);
+            req.mut_requests()[0].mut_put().set_key(uu.clone());
         }
         let read = ReadIndexRequest::with_command(id, req, cb, renew_lease_time);
         self.pending_reads.push_back(read, self.is_leader());
