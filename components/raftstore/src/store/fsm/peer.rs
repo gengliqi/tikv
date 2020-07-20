@@ -694,6 +694,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                     self.fsm.peer.raft_group.report_unreachable(to_peer_id);
                 } else if to_peer_id == self.fsm.peer.leader_id() {
                     self.fsm.group_state = GroupState::Chaos;
+                    /*info!(
+                        "unreachable";
+                        "region_id" => self.fsm.region_id(),
+                        "peer_id" => self.fsm.peer_id(),
+                    );*/
                     self.register_raft_base_tick();
                 }
             }
@@ -704,6 +709,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                         self.fsm.peer.raft_group.report_unreachable(peer_id);
                     } else if peer_id == self.fsm.peer.leader_id() {
                         self.fsm.group_state = GroupState::Chaos;
+                        /*info!(
+                            "store unreachable";
+                            "region_id" => self.fsm.region_id(),
+                            "peer_id" => self.fsm.peer_id(),
+                        );*/
                         self.register_raft_base_tick();
                     }
                 }
@@ -963,7 +973,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             if self.fsm.group_state == GroupState::Idle {
                 // missing_ticks should be less than election timeout ticks otherwise
                 // follower may tick more than an election timeout in chaos state.
-                if self.fsm.missing_ticks + 1 < self.ctx.cfg.raft_election_timeout_ticks {
+                if self.fsm.missing_ticks + 4 < self.ctx.cfg.raft_election_timeout_ticks {
                     self.register_raft_base_tick();
                     self.fsm.missing_ticks += 1;
                 }
@@ -996,6 +1006,12 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
 
         debug!("stop ticking"; "region_id" => self.region_id(), "peer_id" => self.fsm.peer_id(), "res" => ?res);
         self.fsm.group_state = GroupState::Idle;
+        /*info!(
+            "group_state change";
+            "group_state" => ?self.fsm.group_state,
+            "region_id" => self.fsm.region_id(),
+            "peer_id" => self.fsm.peer_id(),
+        );*/
         // Followers will stop ticking at L789. Keep ticking for followers
         // to allow it to campaign quickly when abnormal situation is detected.
         if !self.fsm.peer.is_leader() {
@@ -1114,7 +1130,10 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         if util::is_vote_msg(&msg.get_message())
             || msg.get_message().get_msg_type() == MessageType::MsgTimeoutNow
         {
-            self.reset_raft_tick(GroupState::Chaos);
+            if self.fsm.group_state != GroupState::Chaos {
+                self.fsm.group_state = GroupState::Chaos;
+                self.register_raft_base_tick();
+            }
         } else if msg.get_from_peer().get_id() == self.fsm.peer.leader_id() {
             self.reset_raft_tick(GroupState::Ordered);
         }
@@ -1160,6 +1179,12 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
 
     fn reset_raft_tick(&mut self, state: GroupState) {
         self.fsm.group_state = state;
+        /*info!(
+            "group_state change";
+            "group_state" => ?self.fsm.group_state,
+            "region_id" => self.fsm.region_id(),
+            "peer_id" => self.fsm.peer_id(),
+        );*/
         self.fsm.missing_ticks = 0;
         self.fsm.peer.should_wake_up = false;
         self.register_raft_base_tick();
@@ -3277,6 +3302,12 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                     // If leader is able to receive messge but can't send out any,
                     // follower should be able to start an election.
                     self.fsm.group_state = GroupState::PreChaos;
+                    /*info!(
+                        "group_state change check peer stale";
+                        "group_state" => ?self.fsm.group_state,
+                        "region_id" => self.fsm.region_id(),
+                        "peer_id" => self.fsm.peer_id(),
+                    );*/
                 } else {
                     self.fsm.has_ready = true;
                     // Schedule a pd heartbeat to discover down and pending peer when
@@ -3285,6 +3316,12 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 }
             } else if self.fsm.group_state == GroupState::PreChaos {
                 self.fsm.group_state = GroupState::Chaos;
+                /*info!(
+                    "group_state change check peer stale";
+                    "group_state" => ?self.fsm.group_state,
+                    "region_id" => self.fsm.region_id(),
+                    "peer_id" => self.fsm.peer_id(),
+                );*/
             } else if self.fsm.group_state == GroupState::Chaos {
                 // Register tick if it's not yet. Only when it fails to receive ping from leader
                 // after two stale check can a follower actually tick.
