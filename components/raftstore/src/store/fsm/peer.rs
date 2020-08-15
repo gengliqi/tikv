@@ -2134,6 +2134,8 @@ where
             new_peer.peer.init_replication_mode(&mut *replication_state);
             drop(replication_state);
 
+            new_peer.peer.init_split_create_time();
+
             let meta_peer = new_peer.peer.peer.clone();
 
             for p in new_region.get_peers() {

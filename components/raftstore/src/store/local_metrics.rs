@@ -242,6 +242,7 @@ pub struct RaftProposeMetrics {
     pub transfer_leader: u64,
     pub conf_change: u64,
     pub request_wait_time: LocalHistogram,
+    pub split_region_leader_wait_time: LocalHistogram,
 }
 
 impl Default for RaftProposeMetrics {
@@ -256,6 +257,7 @@ impl Default for RaftProposeMetrics {
             conf_change: 0,
             batch: 0,
             request_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
+            split_region_leader_wait_time: SPLIT_REGION_LEADER_WAIT_TIME_HISTOGRAM.local(),
         }
     }
 }
@@ -307,6 +309,7 @@ impl RaftProposeMetrics {
             self.batch = 0;
         }
         self.request_wait_time.flush();
+        self.split_region_leader_wait_time.flush();
     }
 }
 

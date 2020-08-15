@@ -286,6 +286,8 @@ where
     pub local_first_replicate: bool,
 
     pub txn_extra_op: Arc<AtomicCell<TxnExtraOp>>,
+
+    pub split_create_time: Option<UtilInstant>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -375,6 +377,7 @@ where
             check_stale_peers: vec![],
             local_first_replicate: false,
             txn_extra_op: Arc::new(AtomicCell::new(TxnExtraOp::Noop)),
+            split_create_time: None,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -383,6 +386,10 @@ where
         }
 
         Ok(peer)
+    }
+
+    pub fn init_split_create_time(&mut self) {
+        self.split_create_time = Some(UtilInstant::now_coarse());
     }
 
     /// Sets commit group to the peer.
@@ -1112,6 +1119,20 @@ where
             }
             ctx.coprocessor_host
                 .on_role_change(self.region(), ss.raft_state);
+            if ss.leader_id != 0 {
+                if let Some(time) = self.split_create_time.take() {
+                    ctx.raft_metrics
+                        .propose
+                        .split_region_leader_wait_time
+                        .observe(duration_to_sec(time.elapsed()) as f64);
+                    slow_log!(
+                        time.elapsed(),
+                        "{} leader election too slow after splitting, leader id {}",
+                        self.tag,
+                        ss.leader_id,
+                    );
+                }
+            }
         }
     }
 
