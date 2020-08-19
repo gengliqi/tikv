@@ -129,6 +129,13 @@ make_auto_flush_static_metric! {
         consistency_check,
         cleanup_import_sst,
     }
+    pub label_enum CmdCheckEpochVecType {
+        all,
+        admin_cmd_failure,
+        normal_cmd_failure,
+        admin_cmd_success,
+        normal_cmd_success,
+    }
 
     pub struct RaftEventDuration : LocalHistogram {
         "type" => RaftEventDurationType
@@ -175,6 +182,10 @@ make_auto_flush_static_metric! {
     }
     pub struct PerfContextTimeDuration : LocalHistogram {
         "type" => PerfContextType
+    }
+
+    pub struct CmdCheckEpochVec: LocalIntCounter {
+        "type" => CmdCheckEpochVecType
     }
 }
 
@@ -482,4 +493,13 @@ lazy_static! {
             "The number of pending entries in the channel of apply FSMs."
     )
     .unwrap();
+
+    pub static ref CMD_CHECK_EPOCH_COUNTER_VEC: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_cmd_check_epoch_count",
+            "Total number of admin cmd processed.",
+            &["type", "status"]
+        ).unwrap();
+    pub static ref CMD_CHECK_EPOCH_COUNTER: CmdCheckEpochVec =
+        auto_flush_from!(CMD_CHECK_EPOCH_COUNTER_VEC, CmdCheckEpochVec);
 }

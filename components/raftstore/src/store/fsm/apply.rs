@@ -1246,10 +1246,20 @@ where
         // Include region for epoch not match after merge may cause key not in range.
         let include_region =
             req.get_header().get_region_epoch().get_version() >= self.last_merge_version;
-        check_region_epoch(req, &self.region, include_region)?;
+        CMD_CHECK_EPOCH_COUNTER.all.inc();
+        if let Err(e) = check_region_epoch(req, &self.region, include_region) {
+            if req.has_admin_request() {
+                CMD_CHECK_EPOCH_COUNTER.admin_cmd_failure.inc();
+            } else {
+                CMD_CHECK_EPOCH_COUNTER.normal_cmd_failure.inc();
+            }
+            return Err(e);
+        }
         if req.has_admin_request() {
+            CMD_CHECK_EPOCH_COUNTER.admin_cmd_success.inc();
             self.exec_admin_cmd(ctx, req)
         } else {
+            CMD_CHECK_EPOCH_COUNTER.normal_cmd_success.inc();
             self.exec_write_cmd(ctx, req)
         }
     }
