@@ -498,7 +498,7 @@ lazy_static! {
         register_int_counter_vec!(
             "tikv_raftstore_cmd_check_epoch_count",
             "Total number of admin cmd processed.",
-            &["type", "status"]
+            &["type"]
         ).unwrap();
     pub static ref CMD_CHECK_EPOCH_COUNTER: CmdCheckEpochVec =
         auto_flush_from!(CMD_CHECK_EPOCH_COUNTER_VEC, CmdCheckEpochVec);
