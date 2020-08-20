@@ -649,8 +649,6 @@ fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
             AdminCmdType::ComputeHash |
-            // Merge needs to get the latest apply index.
-            AdminCmdType::CommitMerge |
             AdminCmdType::RollbackMerge => return true,
             _ => {}
         }
