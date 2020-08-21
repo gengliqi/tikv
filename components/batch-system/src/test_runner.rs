@@ -97,9 +97,12 @@ impl PollHandler<Runner, Runner> for Handler {
         self.handle(control)
     }
 
-    fn handle_normal(&mut self, normal: &mut Runner) -> Option<usize> {
+    fn handle_normal(&mut self, normal: &mut Runner) -> HandleNormalResult {
         self.local.normal += 1;
-        self.handle(normal)
+        match self.handle(normal) {
+            None => HandleNormalResult::NoRelease,
+            Some(s) => HandleNormalResult::ReleaseIf(s),
+        }
     }
 
     fn end(&mut self, _normals: &mut [Box<Runner>]) {
