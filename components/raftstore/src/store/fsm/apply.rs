@@ -15,9 +15,7 @@ use std::time::Duration;
 use std::vec::Drain;
 use std::{cmp, usize};
 
-use batch_system::{
-    BasicMailbox, BatchRouter, BatchSystem, Fsm, HandleNormalResult, HandlerBuilder, PollHandler,
-};
+use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_rocks::{PerfContext, PerfLevel};
 use engine_traits::{KvEngine, Snapshot, WriteBatch, WriteBatchVecExt};
@@ -651,7 +649,8 @@ fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
-            AdminCmdType::ComputeHash | AdminCmdType::RollbackMerge => return true,
+            AdminCmdType::ComputeHash |
+            AdminCmdType::RollbackMerge => return true,
             _ => {}
         }
     }
@@ -957,20 +956,14 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if apply_ctx.kv_wb().should_write_to_engine() {
-                return ApplyResult::Yield;
-            }
-            if should_write_to_engine(&cmd) {
-                apply_ctx.commit(self);
-            }
-            /*if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
                         return ApplyResult::Yield;
                     }
                 }
-            }*/
+            }
 
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
@@ -3167,21 +3160,6 @@ where
     ) {
         let mut channel_timer = None;
         let mut drainer = msgs.drain(..);
-        let mut apply_number = 0;
-        let mut other_number = 0;
-        for msg in drainer.as_ref() {
-            match msg {
-                Msg::Apply { start: _, apply } => {
-                    apply_number += apply.entries.len();
-                }
-                _ => {
-                    other_number += 1;
-                }
-            }
-        }
-        APPLY_LOG_NUM_EACH_ROUND.observe(apply_number as f64);
-        APPLY_OTHER_LOG_NUM_EACH_ROUND.observe(other_number as f64);
-
         loop {
             match drainer.next() {
                 Some(Msg::Apply { start, apply }) => {
@@ -3310,38 +3288,40 @@ where
         unimplemented!()
     }
 
-    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> HandleNormalResult {
+    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
+        let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
-            let mut expected_msg_count = 0;
             if normal.delegate.wait_merge_state.is_some() {
                 // We need to query the length first, otherwise there is a race
                 // condition that new messages are queued after resuming and before
                 // query the length.
-                expected_msg_count = normal.receiver.len();
+                expected_msg_count = Some(normal.receiver.len());
             }
             normal.resume_pending(&mut self.apply_ctx);
             if normal.delegate.wait_merge_state.is_some() {
                 // Yield due to applying CommitMerge, this fsm can be released if its
                 // channel msg count equals to expected_msg_count because it will receive
                 // a new message if its source region has applied all needed logs.
-                return HandleNormalResult::ReleaseIf(expected_msg_count);
+                return expected_msg_count;
             } else if normal.delegate.yield_state.is_some() {
                 // Yield due to other reasons, this fsm must not be released because
                 // it's possible that no new message will be sent to itself.
                 // The remaining messages will be handled in next rounds.
-                return HandleNormalResult::End;
+                return None;
             }
-            return HandleNormalResult::ReleaseIf(0);
+            expected_msg_count = None;
         }
         while self.msg_buf.len() < self.messages_per_tick {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
                 Err(TryRecvError::Empty) => {
+                    expected_msg_count = Some(0);
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
                     normal.delegate.stopped = true;
+                    expected_msg_count = Some(0);
                     break;
                 }
             }
@@ -3349,13 +3329,12 @@ where
         normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
         if normal.delegate.wait_merge_state.is_some() {
             // Check it again immediately as catching up logs can be very fast.
-            HandleNormalResult::NoRelease
+            expected_msg_count = Some(0);
         } else if normal.delegate.yield_state.is_some() {
             // Let it continue to run next time.
-            HandleNormalResult::End
-        } else {
-            HandleNormalResult::ReleaseIf(0)
+            expected_msg_count = None;
         }
+        expected_msg_count
     }
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {

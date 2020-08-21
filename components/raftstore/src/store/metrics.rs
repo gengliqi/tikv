@@ -502,20 +502,4 @@ lazy_static! {
         ).unwrap();
     pub static ref CMD_CHECK_EPOCH_COUNTER: CmdCheckEpochVec =
         auto_flush_from!(CMD_CHECK_EPOCH_COUNTER_VEC, CmdCheckEpochVec);
-
-    pub static ref APPLY_LOG_NUM_EACH_ROUND: Histogram =
-        register_histogram!(
-            "tikv_raftstore_apply_log_number",
-            "Bucketed histogram of apply log number in a region.",
-            vec![2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0,
-                    512.0, 1024.0, 5120.0, 10240.0, 20480.0, 40960.0, 81920.0]
-        ).unwrap();
-
-    pub static ref APPLY_OTHER_LOG_NUM_EACH_ROUND: Histogram =
-        register_histogram!(
-            "tikv_raftstore_apply_other_log_number",
-            "Bucketed histogram of apply other log number in a region.",
-            vec![2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0,
-                    512.0, 1024.0, 5120.0, 10240.0, 20480.0, 40960.0, 81920.0]
-        ).unwrap();
 }

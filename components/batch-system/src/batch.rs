@@ -118,7 +118,7 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
     /// Only when channel length is larger than `checked_len` will trigger
     /// further notification. This function may fail if channel length is
     /// larger than the given value before FSM is released.
-    pub fn release(&mut self, index: usize, checked_len: usize, router: &BatchRouter<N, C>) {
+    pub fn release(&mut self, index: usize, checked_len: usize) {
         let mut fsm = self.normals.swap_remove(index);
         let mailbox = fsm.take_mailbox().unwrap();
         mailbox.release(fsm);
@@ -129,10 +129,9 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
                 None => (),
                 Some(mut s) => {
                     s.set_mailbox(Cow::Owned(mailbox));
-                    router.normal_scheduler.schedule(s);
-                    /*let last_index = self.normals.len();
+                    let last_index = self.normals.len();
                     self.normals.push(s);
-                    self.normals.swap(index, last_index);*/
+                    self.normals.swap(index, last_index);
                 }
             }
         }
@@ -143,7 +142,7 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
     /// This method should only be called when the FSM is stopped.
     /// If there are still messages in channel, the FSM is untouched and
     /// the function will return false to let caller to keep polling.
-    pub fn remove(&mut self, index: usize, router: &BatchRouter<N, C>) {
+    pub fn remove(&mut self, index: usize) {
         let mut fsm = self.normals.swap_remove(index);
         let mailbox = fsm.take_mailbox().unwrap();
         if mailbox.is_empty() {
@@ -151,10 +150,9 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
             self.timers.swap_remove(index);
         } else {
             fsm.set_mailbox(Cow::Owned(mailbox));
-            router.normal_scheduler.schedule(fsm);
-            /*let last_index = self.normals.len();
+            let last_index = self.normals.len();
             self.normals.push(fsm);
-            self.normals.swap(index, last_index);*/
+            self.normals.swap(index, last_index);
         }
     }
 
@@ -166,12 +164,7 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
     }
 
     /// Same as `release`, but working on control FSM.
-    pub fn release_control(
-        &mut self,
-        control_box: &BasicMailbox<C>,
-        checked_len: usize,
-        router: &BatchRouter<N, C>,
-    ) -> bool {
+    pub fn release_control(&mut self, control_box: &BasicMailbox<C>, checked_len: usize) -> bool {
         let s = self.control.take().unwrap();
         control_box.release(s);
         if control_box.len() == checked_len {
@@ -180,7 +173,7 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
             match control_box.take_fsm() {
                 None => true,
                 Some(s) => {
-                    router.control_scheduler.schedule(s);
+                    self.control = Some(s);
                     false
                 }
             }
@@ -194,12 +187,6 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
             control_box.release(s);
         }
     }
-}
-
-pub enum HandleNormalResult {
-    NoRelease,
-    ReleaseIf(usize),
-    End,
 }
 
 /// A handler that poll all FSM in ready.
@@ -234,7 +221,7 @@ pub trait PollHandler<N, C> {
     /// This function is called when handling readiness for normal FSM.
     ///
     /// The returned value is handled in the same way as `handle_control`.
-    fn handle_normal(&mut self, normal: &mut N) -> HandleNormalResult;
+    fn handle_normal(&mut self, normal: &mut N) -> Option<usize>;
 
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
@@ -255,12 +242,17 @@ struct Poller<N: Fsm, C: Fsm, Handler> {
 enum ReschedulePolicy {
     Release(usize),
     Remove,
+    Schedule,
 }
 
 impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
     fn fetch_fsm(&mut self, batch: &mut Batch<N, C>) -> bool {
         if batch.control.is_some() {
             return true;
+        }
+
+        if let Ok(fsm) = self.fsm_receiver.try_recv() {
+            return batch.push(fsm);
         }
 
         if batch.is_empty() {
@@ -277,42 +269,63 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut reschedule_fsms = Vec::with_capacity(self.max_batch_size);
 
+        // Fetch batch after every round is finished. It's helpful to protect regions
+        // from becoming hungry if some regions are hot points. Since we fetch new fsm every time
+        // calling `poll`, we do not need to configure a large value for `self.max_batch_size`.
         let mut run = true;
         while run && self.fetch_fsm(&mut batch) {
-            self.handler.begin(self.max_batch_size);
+            // If there is some region wait to be deal, we must deal with it even if it has overhead
+            // max size of batch. It's helpful to protect regions from becoming hungry
+            // if some regions are hot points.
+            let max_batch_size = std::cmp::max(self.max_batch_size, batch.normals.len());
+            self.handler.begin(max_batch_size);
 
             if batch.control.is_some() {
                 let len = self.handler.handle_control(batch.control.as_mut().unwrap());
                 if batch.control.as_ref().unwrap().is_stopped() {
                     batch.remove_control(&self.router.control_box);
                 } else if let Some(len) = len {
-                    batch.release_control(&self.router.control_box, len, &self.router);
+                    batch.release_control(&self.router.control_box, len);
                 }
             }
-            let mut fsm_cnt = 0;
-            while fsm_cnt < self.max_batch_size {
-                if fsm_cnt >= batch.normals.len() {
-                    if let Ok(fsm) = self.fsm_receiver.try_recv() {
-                        run = batch.push(fsm);
+
+            let mut hot_fsm_count = 0;
+            for (i, p) in batch.normals.iter_mut().enumerate() {
+                let len = self.handler.handle_normal(p);
+                if p.is_stopped() {
+                    reschedule_fsms.push((i, ReschedulePolicy::Remove));
+                } else {
+                    if batch.timers[i].elapsed() >= self.reschedule_duration {
+                        hot_fsm_count += 1;
+                        // We should only reschedule a half of the hot regions, otherwise,
+                        // it's possible all the hot regions are fetched in a batch the
+                        // next time.
+                        if hot_fsm_count % 2 == 0 {
+                            reschedule_fsms.push((i, ReschedulePolicy::Schedule));
+                            continue;
+                        }
                     }
-                    if !run || fsm_cnt >= batch.normals.len() {
-                        break;
+                    if let Some(l) = len {
+                        reschedule_fsms.push((i, ReschedulePolicy::Release(l)));
                     }
                 }
-
-                let res = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
+            }
+            let mut fsm_cnt = batch.normals.len();
+            while batch.normals.len() < max_batch_size {
+                if let Ok(fsm) = self.fsm_receiver.try_recv() {
+                    run = batch.push(fsm);
+                }
+                // If we receive a ControlFsm, break this cycle and call `end`. Because ControlFsm
+                // may change state of the handler, we shall deal with it immediately after
+                // calling `begin` of `Handler`.
+                if !run || fsm_cnt >= batch.normals.len() {
+                    break;
+                }
+                let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
                 if batch.normals[fsm_cnt].is_stopped() {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Remove));
-                } else {
-                    match res {
-                        HandleNormalResult::NoRelease => (),
-                        HandleNormalResult::ReleaseIf(s) => {
-                            reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(s)));
-                        }
-                        HandleNormalResult::End => {
-                            break;
-                        }
-                    }
+                } else if let Some(l) = len {
+                    reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
                 }
                 fsm_cnt += 1;
             }
@@ -322,8 +335,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             // to remove the correct FSM.
             while let Some((r, mark)) = reschedule_fsms.pop() {
                 match mark {
-                    ReschedulePolicy::Release(l) => batch.release(r, l, &self.router),
-                    ReschedulePolicy::Remove => batch.remove(r, &self.router),
+                    ReschedulePolicy::Release(l) => batch.release(r, l),
+                    ReschedulePolicy::Remove => batch.remove(r),
+                    ReschedulePolicy::Schedule => batch.reschedule(&self.router, r),
                 }
             }
         }
