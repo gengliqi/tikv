@@ -36,7 +36,7 @@ use tikv_util::{escape, is_zero_duration};
 
 use crate::raftstore::coprocessor::RegionChangeEvent;
 use crate::raftstore::store::cmd_resp::{bind_term, new_error};
-use crate::raftstore::store::fsm::store::{PollContext, StoreMeta};
+use crate::raftstore::store::fsm::store::{CollectPeerStateResult, PollContext, StoreMeta};
 use crate::raftstore::store::fsm::{
     apply, ApplyMetrics, ApplyTask, ApplyTaskRes, BasicMailbox, CatchUpLogs, ChangePeer,
     ExecResult, Fsm, RegionProposal,
@@ -44,7 +44,7 @@ use crate::raftstore::store::fsm::{
 use crate::raftstore::store::keys::{self, enc_end_key, enc_start_key};
 use crate::raftstore::store::metrics::*;
 use crate::raftstore::store::msg::Callback;
-use crate::raftstore::store::peer::{ConsistencyState, Peer, StaleState, WaitApplyResultState};
+use crate::raftstore::store::peer::{ConsistencyState, Peer, StaleState, WaitApplyResultState, PeerCurrentState};
 use crate::raftstore::store::peer_storage::{ApplySnapResult, InvokeContext};
 use crate::raftstore::store::transport::Transport;
 use crate::raftstore::store::util::KeysInfoFormatter;
@@ -306,6 +306,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                     }
                 }
                 PeerMsg::Noop => {}
+                PeerMsg::CollectState(result) => self.on_collect_state(result),
             }
         }
     }
@@ -605,6 +606,17 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             "status" => ?status,
         );
         self.fsm.peer.raft_group.report_snapshot(to_peer_id, status)
+    }
+
+    fn on_collect_state(&mut self, mut result: CollectPeerStateResult) {
+        let current_state = PeerCurrentState {
+            region: self.fsm.peer.region().clone(),
+            peer_id: self.fsm.peer_id(),
+            leader_id: self.fsm.peer.leader_id(),
+            last_index: self.fsm.peer.get_store().last_index(),
+            applied_index: self.fsm.peer.get_store().applied_index(),
+        };
+        result.on_finish(current_state);
     }
 
     fn on_role_changed(&mut self, ready: &Ready) {

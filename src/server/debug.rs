@@ -60,6 +60,9 @@ quick_error! {
             description(msg)
             display("Not Found {:?}", msg)
         }
+        DeadlineExceed(secs: u64) {
+            display("Deadline Exceed {} secs", secs)
+        }
         Other(err: Box<dyn error::Error + Sync + Send>) {
             from()
             cause(err.as_ref())

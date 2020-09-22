@@ -14,6 +14,7 @@ use raft::SnapshotStatus;
 use crate::raftstore::store::fsm::apply::TaskRes as ApplyTaskRes;
 use crate::raftstore::store::util::KeysInfoFormatter;
 use crate::raftstore::store::SnapKey;
+use crate::raftstore::store::fsm::store::{CollectPeerStateResult, CollectPeerStateTask};
 use crate::storage::kv::CompactedEvent;
 use tikv_util::escape;
 
@@ -303,6 +304,8 @@ pub enum PeerMsg {
     CasualMessage(CasualMessage),
     /// Ask region to report a heartbeat to PD.
     HeartbeatPd,
+    /// Collect the current state then callback.
+    CollectState(CollectPeerStateResult),
 }
 
 impl fmt::Debug for PeerMsg {
@@ -321,6 +324,7 @@ impl fmt::Debug for PeerMsg {
             PeerMsg::Noop => write!(fmt, "Noop"),
             PeerMsg::CasualMessage(msg) => write!(fmt, "CasualMessage {:?}", msg),
             PeerMsg::HeartbeatPd => write!(fmt, "HeartbeatPd"),
+            PeerMsg::CollectState(_) => write!(fmt, "CollectState"),
         }
     }
 }
@@ -350,6 +354,7 @@ pub enum StoreMsg {
     Start {
         store: metapb::Store,
     },
+    CollectTotalPeerState(CollectPeerStateTask),
 }
 
 impl fmt::Debug for StoreMsg {
@@ -372,6 +377,7 @@ impl fmt::Debug for StoreMsg {
             ),
             StoreMsg::Tick(tick) => write!(fmt, "StoreTick {:?}", tick),
             StoreMsg::Start { ref store } => write!(fmt, "Start store {:?}", store),
+            StoreMsg::CollectTotalPeerState(_) => write!(fmt, "CollectTotalPeerState"),
         }
     }
 }

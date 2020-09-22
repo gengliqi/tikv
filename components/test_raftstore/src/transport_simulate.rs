@@ -207,6 +207,8 @@ impl<C: RaftStoreRouter> RaftStoreRouter for SimulateTransport<C> {
     fn significant_send(&self, region_id: u64, msg: SignificantMsg) -> Result<()> {
         self.ch.significant_send(region_id, msg)
     }
+
+    fn collect_peer_current_state(&self, task: CollectPeerStateTask) {}
 }
 
 pub trait FilterFactory {

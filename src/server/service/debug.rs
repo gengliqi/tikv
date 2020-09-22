@@ -1,8 +1,12 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::time::{Duration, Instant};
+
 use engine::rocks::util::stats as rocksdb_stats;
 use engine::Engines;
 use fail;
+use futures::future::IntoFuture;
+use futures::sync::mpsc as future_mpsc;
 use futures::sync::oneshot;
 use futures::{future, stream, Future, Stream};
 use futures_cpupool::{Builder, CpuPool};
@@ -17,11 +21,14 @@ use kvproto::raft_cmdpb::{
 use protobuf::text_format::print_to_string;
 
 use crate::raftstore::store::msg::Callback;
+use crate::raftstore::store::CollectPeerStateTask;
 use crate::server::debug::{Debugger, Error};
 use crate::server::transport::RaftStoreRouter;
 use crate::storage::gc_worker::GCWorker;
 use crate::storage::kv::Engine;
 use tikv_util::metrics;
+use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use tokio_timer::timer::Handle;
 
 use tikv_alloc;
 
@@ -29,6 +36,10 @@ fn error_to_status(e: Error) -> RpcStatus {
     let (code, msg) = match e {
         Error::NotFound(msg) => (RpcStatusCode::NotFound, Some(msg)),
         Error::InvalidArgument(msg) => (RpcStatusCode::InvalidArgument, Some(msg)),
+        Error::DeadlineExceed(secs) => (
+            RpcStatusCode::DeadlineExceeded,
+            Some(format!("{} secs", secs)),
+        ),
         Error::Other(e) => (RpcStatusCode::Unknown, Some(format!("{:?}", e))),
     };
     RpcStatus::new(code, msg)
@@ -51,6 +62,7 @@ pub struct Service<T: RaftStoreRouter, E: Engine> {
     pool: CpuPool,
     debugger: Debugger<E>,
     raft_router: T,
+    timer: Handle,
 }
 
 impl<T: RaftStoreRouter, E: Engine> Service<T, E> {
@@ -65,6 +77,7 @@ impl<T: RaftStoreRouter, E: Engine> Service<T, E> {
             pool,
             debugger,
             raft_router,
+            timer: GLOBAL_TIMER_HANDLE.clone(),
         }
     }
 
@@ -413,6 +426,26 @@ impl<T: RaftStoreRouter + 'static, E: Engine + 'static> debugpb_grpc::Debug for 
 
         self.handle_response(ctx, sink, f, TAG);
     }
+
+    fn collect_peer_current_state(
+        &mut self,
+        ctx: RpcContext,
+        request: CollectPeerCurrentStateRequest,
+        sink: UnarySink<CollectPeerCurrentStateResponse>,
+    ) {
+        /*if !check_common_name(self.security_mgr.cert_allowed_cn(), &ctx) {
+            return;
+        }*/
+        const TAG: &str = "debug_collect_peer_current_state";
+
+        let f = self.pool.spawn(collect_peer_current_state(
+            request.get_timeout_secs(),
+            self.raft_router.clone(),
+            self.timer.clone(),
+        ));
+
+        self.handle_response(ctx, sink, f, TAG);
+    }
 }
 
 fn region_detail<T: RaftStoreRouter>(
@@ -483,4 +516,47 @@ fn consistency_check<T: RaftStoreRouter>(
                     Ok(())
                 })
         })
+}
+
+fn collect_peer_current_state<T: RaftStoreRouter>(
+    timeout_secs: u64,
+    raft_router: T,
+    timer: Handle,
+) -> impl Future<Item = CollectPeerCurrentStateResponse, Error = Error> {
+    let (tx, rx) = future_mpsc::channel(1);
+    future::ok(CollectPeerStateTask::new(tx)).and_then(move |task| {
+        raft_router.collect_peer_current_state(task.clone());
+        let f = rx
+            .into_future()
+            .map(|_| Some(()))
+            .map_err(|_| Error::Other(box_err!("channel close with no result")));
+        let timeout_f = timer
+            .delay(Instant::now() + Duration::from_secs(timeout_secs))
+            .map(|_| None)
+            .map_err(|e| Error::Other(Box::new(e)));
+        f.select(timeout_f)
+            .into_future()
+            .then(move |res| match res {
+                Ok((v, _)) => {
+                    let mut data = task.data.lock().unwrap();
+                    if data.counter == 0 && v.is_none() {
+                        future::err(Error::DeadlineExceed(timeout_secs))
+                    } else {
+                        let mut response = CollectPeerCurrentStateResponse::default();
+                        for (region_id, state) in data.states.iter_mut() {
+                            let mut peer_state = PeerCurrentState::default();
+                            if let Some(state) = state.take() {
+                                peer_state = state.into_proto();
+                            } else {
+                                peer_state.set_region_id(*region_id);
+                                peer_state.set_valid(false);
+                            }
+                            response.mut_states().push(peer_state);
+                        }
+                        future::ok(response)
+                    }
+                }
+                Err((e, _)) => future::err(e),
+            })
+    })
 }

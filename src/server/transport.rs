@@ -11,7 +11,7 @@ use super::resolve::StoreAddrResolver;
 use super::snap::Task as SnapTask;
 use crate::raftstore::store::fsm::RaftRouter;
 use crate::raftstore::store::{
-    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, SignificantMsg, StoreMsg, Transport,
+    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, SignificantMsg, StoreMsg, Transport, CollectPeerStateTask,
 };
 use crate::raftstore::{DiscardReason, Error as RaftStoreError, Result as RaftStoreResult};
 use crate::server::raft_client::RaftClient;
@@ -63,6 +63,8 @@ pub trait RaftStoreRouter: Send + Clone {
     }
 
     fn casual_send(&self, region_id: u64, msg: CasualMessage) -> RaftStoreResult<()>;
+
+    fn collect_peer_current_state(&self, task: CollectPeerStateTask);
 }
 
 #[derive(Clone)]
@@ -89,6 +91,8 @@ impl RaftStoreRouter for RaftStoreBlackHole {
     fn casual_send(&self, _: u64, _: CasualMessage) -> RaftStoreResult<()> {
         Ok(())
     }
+
+    fn collect_peer_current_state(&self, _: CollectPeerStateTask) {}
 }
 
 /// A router that routes messages to the raftstore
@@ -169,6 +173,12 @@ impl RaftStoreRouter for ServerRaftStoreRouter {
         let _ = self
             .router
             .send_control(StoreMsg::StoreUnreachable { store_id });
+    }
+
+    fn collect_peer_current_state(&self, task: CollectPeerStateTask) {
+        let _ = self
+            .router
+            .send_control(StoreMsg::CollectTotalPeerState(task));
     }
 }
 
