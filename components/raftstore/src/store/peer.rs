@@ -1630,20 +1630,14 @@ impl Peer {
         }
 
         if let Some(ts) = current_ts {
-            if ready.must_sync() || self.last_persisted_number + 1 < ready.number() {
-                ctx.sync_policy.mark_region_unsynced(
-                    self.region_id,
-                    ready.number(),
-                    self.persisted_notifier.clone(),
-                    ts,
-                );
-                self.raft_group.advance_append_async(ready);
-                return;
-            }
-            // If this ready need not to sync and there is no previous unpersisted ready,
-            // we can safely consider it is persisted.
-            // It's probably the case that the follower of a cold region receives a heartbeat.
-            assert_eq!(self.last_persisted_number + 1, ready.number());
+            ctx.sync_policy.mark_region_unsynced(
+                self.region_id,
+                ready.number(),
+                self.persisted_notifier.clone(),
+                ts,
+            );
+            self.raft_group.advance_append_async(ready);
+            return;
         }
 
         self.last_persisted_number = ready.number();
