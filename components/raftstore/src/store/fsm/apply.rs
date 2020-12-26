@@ -1160,7 +1160,7 @@ impl ApplyDelegate {
                 "normal".to_string()
             };
             APPLY_CMD_EPOCH_CHECK_VEC
-                .with_label_values(&[s.to_str(), "epoch-failed"])
+                .with_label_values(&[s.as_str(), "epoch-failed"])
                 .inc();
             return Err(e);
         }
