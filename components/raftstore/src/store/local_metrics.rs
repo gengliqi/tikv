@@ -2,8 +2,9 @@
 
 use prometheus::local::LocalHistogram;
 use std::sync::{Arc, Mutex};
+use std::mem;
 
-use tikv_util::collections::HashSet;
+use tikv_util::collections::{HashSet, HashMap};
 
 use super::metrics::*;
 
@@ -248,6 +249,7 @@ pub struct RaftProposeMetrics {
     pub transfer_leader: u64,
     pub conf_change: u64,
     pub request_wait_time: LocalHistogram,
+    pub normal_propose: HashMap<String, u64>,
 }
 
 impl Default for RaftProposeMetrics {
@@ -262,6 +264,7 @@ impl Default for RaftProposeMetrics {
             conf_change: 0,
             batch: 0,
             request_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
+            normal_propose: HashMap::new(),
         }
     }
 }
@@ -319,6 +322,11 @@ impl RaftProposeMetrics {
             self.batch = 0;
         }
         self.request_wait_time.flush();
+        for (key, val) in mem::take(self.normal_propose).iter() {
+            PEER_NORMAL_PROPOSAL_COUNTER_VEC
+                .with_label_values(&[key.as_str()])
+                .inc_by(val as i64);
+        }
     }
 }
 

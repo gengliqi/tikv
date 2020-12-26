@@ -17,6 +17,13 @@ lazy_static! {
             &["type", "status"]
         ).unwrap();
 
+    pub static ref PEER_NORMAL_PROPOSAL_COUNTER_VEC: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_normal_proposal_total",
+            "Total number of normal proposal.",
+            &["type"]
+        ).unwrap();
+
     pub static ref PEER_APPEND_LOG_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_append_log_duration_seconds",
@@ -252,5 +259,12 @@ lazy_static! {
             "tikv_read_qps_topn",
             "collect topN of read qps",
         &["order"]
+        ).unwrap();
+
+    pub static ref APPLY_CMD_EPOCH_CHECK_VEC: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_apply_cmd_epoch_check",
+            "Total number of apply cmd processed.",
+            &["type", "status"]
         ).unwrap();
 }

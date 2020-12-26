@@ -2321,6 +2321,13 @@ impl Peer {
         }
 
         poll_ctx.raft_metrics.propose.normal += 1;
+        let s = if req.has_admin_request() {
+            format!("{:?}", req.get_admin_request().get_cmd_type())
+        } else {
+            "normal".to_string()
+        };
+        let val = poll_ctx.raft_metrics.propose.normal_propose.entry(s).or_default();
+        poll_ctx.raft_metrics.propose.normal_propose.entry[s] = val + 1;
 
         // TODO: validate request for unexpected changes.
         let ctx = match self.pre_propose(poll_ctx, &mut req) {
@@ -2362,6 +2369,9 @@ impl Peer {
         if ctx.contains(ProposalContext::PREPARE_MERGE) {
             self.last_proposed_prepare_merge_idx = propose_index;
         }
+
+        let val = poll_ctx.raft_metrics.propose.normal_propose.entry("success").or_default();
+        poll_ctx.raft_metrics.propose.normal_propose.entry["success"] = val + 1;
 
         Ok(propose_index)
     }

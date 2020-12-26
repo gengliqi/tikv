@@ -1153,7 +1153,17 @@ impl ApplyDelegate {
         // Include region for epoch not match after merge may cause key not in range.
         let include_region =
             req.get_header().get_region_epoch().get_version() >= self.last_merge_version;
-        check_region_epoch(req, &self.region, include_region)?;
+        if let Err(e) = check_region_epoch(req, &self.region, include_region) {
+            let s = if req.has_admin_request() {
+                format!("{:?}", req.get_admin_request().get_cmd_type())
+            } else {
+                "normal".to_string()
+            };
+            APPLY_CMD_EPOCH_CHECK_VEC
+                .with_label_values(&[s.to_str(), "epoch-failed"])
+                .inc();
+            return Err(e);
+        }
         if req.has_admin_request() {
             self.exec_admin_cmd(ctx, req)
         } else {
