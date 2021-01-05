@@ -42,49 +42,49 @@ lazy_static! {
         register_histogram!(
             "tikv_raftstore_handle_messages",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_REMAIN_MSG_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_remain_messages",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_TOTAL_MSG_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_TOTAL_messages",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_TOTAL_PROPOSALS_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_total_proposals",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_EACH_PROPOSALS_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_each_proposal",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_ACTIVE_LEADER_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_active_leader",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_ACTIVE_FOLLOWER_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_active_follower",
             "TODO",
-            exponential_buckets(1, 2.0, 22).unwrap()
+            exponential_buckets(1.0, 2.0, 22).unwrap()
         ).unwrap();
 
     pub static ref PEER_RECEIVE_MESSAGES_VEC: IntCounterVec =

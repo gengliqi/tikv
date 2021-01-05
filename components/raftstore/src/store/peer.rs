@@ -747,8 +747,9 @@ impl Peer {
         let msg_type = m.get_msg_type();
         ctx.raft_metrics
             .receive_messages
-            .with_label_values(format!("{:?}", msg_type).as_str())
-            .inc_by(1.0);
+            .with_label_values(&[format!("{:?}", msg_type).as_str()])
+            .inc_by(1);
+        
         let committed = self.raft_group.raft.raft_log.committed;
         let expected_term = self.raft_group.raft.raft_log.term(committed).unwrap_or(0);
         if msg_type == MessageType::MsgReadIndex && expected_term == self.raft_group.raft.term {
@@ -2337,7 +2338,7 @@ impl Peer {
             .normal_propose
             .entry(s)
             .or_default();
-        poll_ctx.raft_metrics.propose.normal_propose.entry[s] = val + 1;
+        *val += 1;
 
         // TODO: validate request for unexpected changes.
         let ctx = match self.pre_propose(poll_ctx, &mut req) {
@@ -2384,9 +2385,9 @@ impl Peer {
             .raft_metrics
             .propose
             .normal_propose
-            .entry("success")
+            .entry("success".to_string())
             .or_default();
-        poll_ctx.raft_metrics.propose.normal_propose.entry["success"] = val + 1;
+        *val += 1;
 
         Ok(propose_index)
     }

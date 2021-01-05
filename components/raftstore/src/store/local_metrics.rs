@@ -1,6 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use prometheus::local::LocalHistogram;
+use prometheus::local::{LocalHistogram, LocalIntCounterVec};
 use std::mem;
 use std::sync::{Arc, Mutex};
 
@@ -264,7 +264,7 @@ impl Default for RaftProposeMetrics {
             conf_change: 0,
             batch: 0,
             request_wait_time: REQUEST_WAIT_TIME_HISTOGRAM.local(),
-            normal_propose: HashMap::new(),
+            normal_propose: HashMap::default(),
         }
     }
 }
@@ -322,10 +322,10 @@ impl RaftProposeMetrics {
             self.batch = 0;
         }
         self.request_wait_time.flush();
-        for (key, val) in mem::take(self.normal_propose).iter() {
+        for (key, val) in mem::take(&mut self.normal_propose).iter() {
             PEER_NORMAL_PROPOSAL_COUNTER_VEC
                 .with_label_values(&[key.as_str()])
-                .inc_by(val as i64);
+                .inc_by(*val as i64);
         }
     }
 }
@@ -438,7 +438,7 @@ pub struct RaftMetrics {
     pub each_proposal: LocalHistogram,
     pub active_leader: LocalHistogram,
     pub active_follower: LocalHistogram,
-    pub receive_messages: LocalHistogram,
+    pub receive_messages: LocalIntCounterVec,
 }
 
 impl Default for RaftMetrics {

@@ -795,7 +795,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
                 .raft_metrics
                 .remain_messages
                 .observe(peer.receiver.len() as f64);
-            self.poll_ctx.total_messages += self.peer_msg_buf.len();
+            self.poll_ctx.total_messages += self.peer_msg_buf.len() as u64;
         }
 
         let pre_proposal = self.poll_ctx.raft_metrics.propose.normal;
@@ -1093,6 +1093,10 @@ where
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
+            total_messages: 0,
+            total_proposal: 0,
+            active_leader: 0,
+            active_follower: 0,
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
