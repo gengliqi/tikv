@@ -799,6 +799,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
         }
 
         let pre_proposal = self.poll_ctx.raft_metrics.propose.normal;
+        peer.peer.receive_append_msg = false;
 
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
