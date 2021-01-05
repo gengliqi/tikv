@@ -1,10 +1,10 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use prometheus::local::LocalHistogram;
-use std::sync::{Arc, Mutex};
 use std::mem;
+use std::sync::{Arc, Mutex};
 
-use tikv_util::collections::{HashSet, HashMap};
+use tikv_util::collections::{HashMap, HashSet};
 
 use super::metrics::*;
 
@@ -430,6 +430,15 @@ pub struct RaftMetrics {
     pub commit_log: LocalHistogram,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
     pub invalid_proposal: RaftInvalidProposeMetrics,
+
+    pub handle_messages: LocalHistogram,
+    pub remain_messages: LocalHistogram,
+    pub total_messages: LocalHistogram,
+    pub total_proposals: LocalHistogram,
+    pub each_proposal: LocalHistogram,
+    pub active_leader: LocalHistogram,
+    pub active_follower: LocalHistogram,
+    pub receive_messages: LocalHistogram,
 }
 
 impl Default for RaftMetrics {
@@ -446,6 +455,15 @@ impl Default for RaftMetrics {
             commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
             leader_missing: Arc::default(),
             invalid_proposal: Default::default(),
+
+            handle_messages: PEER_HANDLE_MSG_HISTOGRAM.local(),
+            remain_messages: PEER_REMAIN_MSG_HISTOGRAM.local(),
+            total_messages: PEER_TOTAL_MSG_HISTOGRAM.local(),
+            total_proposals: PEER_TOTAL_PROPOSALS_HISTOGRAM.local(),
+            each_proposal: PEER_EACH_PROPOSALS_HISTOGRAM.local(),
+            active_leader: PEER_ACTIVE_LEADER_HISTOGRAM.local(),
+            active_follower: PEER_ACTIVE_FOLLOWER_HISTOGRAM.local(),
+            receive_messages: PEER_RECEIVE_MESSAGES_VEC.local(),
         }
     }
 }
@@ -461,6 +479,16 @@ impl RaftMetrics {
         self.commit_log.flush();
         self.message_dropped.flush();
         self.invalid_proposal.flush();
+
+        self.handle_messages.flush();
+        self.remain_messages.flush();
+        self.total_messages.flush();
+        self.total_proposals.flush();
+        self.each_proposal.flush();
+        self.active_leader.flush();
+        self.active_follower.flush();
+        self.receive_messages.flush();
+
         let mut missing = self.leader_missing.lock().unwrap();
         LEADER_MISSING.set(missing.len() as i64);
         missing.clear();

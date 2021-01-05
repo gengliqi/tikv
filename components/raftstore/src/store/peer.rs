@@ -741,9 +741,14 @@ impl Peer {
             // As another role know we're not missing.
             self.leader_missing_time.take();
         }
+
         // Here we hold up MsgReadIndex. If current peer has valid lease, then we could handle the
         // request directly, rather than send a heartbeat to check quorum.
         let msg_type = m.get_msg_type();
+        ctx.raft_metrics
+            .receive_messages
+            .with_label_values(format!("{:?}", msg_type).as_str())
+            .inc_by(1.0);
         let committed = self.raft_group.raft.raft_log.committed;
         let expected_term = self.raft_group.raft.raft_log.term(committed).unwrap_or(0);
         if msg_type == MessageType::MsgReadIndex && expected_term == self.raft_group.raft.term {
@@ -2326,7 +2331,12 @@ impl Peer {
         } else {
             "normal".to_string()
         };
-        let val = poll_ctx.raft_metrics.propose.normal_propose.entry(s).or_default();
+        let val = poll_ctx
+            .raft_metrics
+            .propose
+            .normal_propose
+            .entry(s)
+            .or_default();
         poll_ctx.raft_metrics.propose.normal_propose.entry[s] = val + 1;
 
         // TODO: validate request for unexpected changes.
@@ -2370,7 +2380,12 @@ impl Peer {
             self.last_proposed_prepare_merge_idx = propose_index;
         }
 
-        let val = poll_ctx.raft_metrics.propose.normal_propose.entry("success").or_default();
+        let val = poll_ctx
+            .raft_metrics
+            .propose
+            .normal_propose
+            .entry("success")
+            .or_default();
         poll_ctx.raft_metrics.propose.normal_propose.entry["success"] = val + 1;
 
         Ok(propose_index)

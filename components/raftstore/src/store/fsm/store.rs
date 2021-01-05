@@ -258,6 +258,10 @@ pub struct PollContext<T, C: 'static> {
     pub perf_context_statistics: PerfContextStatistics,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
+    pub total_messages: u64,
+    pub total_proposal: u64,
+    pub active_leader: u64,
+    pub active_follower: u64,
 }
 
 impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
@@ -689,6 +693,10 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
         self.poll_ctx.pending_count = 0;
         self.poll_ctx.sync_log = false;
         self.poll_ctx.has_ready = false;
+
+        self.poll_ctx.total_proposal = 0;
+        self.poll_ctx.active_leader = 0;
+        self.poll_ctx.active_follower = 0;
         if self.pending_proposals.capacity() == 0 {
             self.pending_proposals = Vec::with_capacity(batch_size);
         }
@@ -778,9 +786,34 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
                 }
             }
         }
+        if self.peer_msg_buf.len() != 0 {
+            self.poll_ctx
+                .raft_metrics
+                .handle_messages
+                .observe(self.peer_msg_buf.len() as f64);
+            self.poll_ctx
+                .raft_metrics
+                .remain_messages
+                .observe(peer.receiver.len() as f64);
+            self.poll_ctx.total_messages += self.peer_msg_buf.len();
+        }
+
+        let pre_proposal = self.poll_ctx.raft_metrics.propose.normal;
+
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         delegate.collect_ready(&mut self.pending_proposals);
+
+        let new_proposals = self.poll_ctx.raft_metrics.propose.normal - pre_proposal;
+        if new_proposals != 0 {
+            self.poll_ctx.total_proposal += new_proposals;
+            self.poll_ctx
+                .raft_metrics
+                .each_proposal
+                .observe(new_proposals as f64);
+            self.poll_ctx.active_leader += 1;
+        }
+
         expected_msg_count
     }
 
@@ -800,6 +833,22 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
             .raft_metrics
             .process_ready
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
+        self.poll_ctx
+            .raft_metrics
+            .total_messages
+            .observe(self.poll_ctx.total_messages as f64);
+        self.poll_ctx
+            .raft_metrics
+            .total_proposals
+            .observe(self.poll_ctx.total_proposal as f64);
+        self.poll_ctx
+            .raft_metrics
+            .active_leader
+            .observe(self.poll_ctx.active_leader as f64);
+        /*self.poll_ctx
+            .raft_metrics
+            .active_follower
+            .observe(self.poll_ctx.active_follower as f64);*/
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
     }
