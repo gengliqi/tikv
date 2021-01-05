@@ -262,6 +262,8 @@ pub struct Peer {
     pub check_stale_peers: Vec<metapb::Peer>,
 
     pub txn_extra_op: Arc<AtomicCell<TxnExtraOp>>,
+
+    pub receive_append_msg: bool,
 }
 
 impl Peer {
@@ -344,6 +346,7 @@ impl Peer {
             check_stale_conf_ver: 0,
             check_stale_peers: vec![],
             txn_extra_op: Arc::new(AtomicCell::new(TxnExtraOp::Noop)),
+            receive_append_msg: false,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -749,7 +752,9 @@ impl Peer {
             .receive_messages
             .with_label_values(&[format!("{:?}", msg_type).as_str()])
             .inc_by(1);
-        
+        if msg_type == MessageType::MsgAppend {
+            self.receive_append_msg = true;
+        }
         let committed = self.raft_group.raft.raft_log.committed;
         let expected_term = self.raft_group.raft.raft_log.term(committed).unwrap_or(0);
         if msg_type == MessageType::MsgReadIndex && expected_term == self.raft_group.raft.term {

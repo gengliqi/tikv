@@ -812,6 +812,10 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
                 .each_proposal
                 .observe(new_proposals as f64);
             self.poll_ctx.active_leader += 1;
+        } else {
+            if !peer.peer.is_leader() && peer.peer.receive_append_msg {
+                self.poll_ctx.active_follower += 1;
+            }
         }
 
         expected_msg_count
@@ -845,10 +849,10 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
             .raft_metrics
             .active_leader
             .observe(self.poll_ctx.active_leader as f64);
-        /*self.poll_ctx
+        self.poll_ctx
             .raft_metrics
             .active_follower
-            .observe(self.poll_ctx.active_follower as f64);*/
+            .observe(self.poll_ctx.active_follower as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
     }
