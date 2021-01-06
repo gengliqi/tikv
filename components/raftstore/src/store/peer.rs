@@ -1685,17 +1685,19 @@ where
             self.handle_raft_committed_entries(ctx, ready.take_committed_entries());
         }
 
-        let invoke_ctx = match self
-            .mut_store()
-            .handle_raft_ready(ctx, &mut ready, destroy_regions)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // We may have written something to writebatch and it can't be reverted, so has
-                // to panic here.
-                panic!("{} failed to handle raft ready: {:?}", self.tag, e)
-            }
-        };
+        let notifier = self.persisted_notifier.clone();
+        let invoke_ctx =
+            match self
+                .mut_store()
+                .handle_raft_ready(ctx, &mut ready, destroy_regions, notifier)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // We may have written something to writebatch and it can't be reverted, so has
+                    // to panic here.
+                    panic!("{} failed to handle raft ready: {:?}", self.tag, e)
+                }
+            };
 
         Some((ready, invoke_ctx))
     }
