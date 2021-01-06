@@ -403,12 +403,22 @@ impl<T: Simulator> Cluster<T> {
                 e @ Err(_) => return e,
                 Ok(resp) => resp,
             };
-            if self.refresh_leader_if_needed(&resp, region_id) && timer.elapsed() < timeout {
-                warn!(
-                    "{:?} is no longer leader, let's retry",
-                    request.get_header().get_peer()
-                );
-                continue;
+            if timer.elapsed() < timeout {
+                if resp
+                    .get_header()
+                    .get_error()
+                    .get_message()
+                    .contains("not applied to current term")
+                {
+                    warn!("not applied to current term, let's retry");
+                    continue;
+                } else if self.refresh_leader_if_needed(&resp, region_id) {
+                    warn!(
+                        "{:?} is no longer leader, let's retry",
+                        request.get_header().get_peer()
+                    );
+                    continue;
+                }
             }
             return Ok(resp);
         }
@@ -1205,9 +1215,7 @@ impl<T: Simulator> Cluster<T> {
                         if error.has_epoch_not_match()
                             || error.has_not_leader()
                             || error.has_stale_command()
-                            || error
-                                .get_message()
-                                .contains("peer has not applied to current term")
+                            || error.get_message().contains("not applied to current term")
                         {
                             warn!("fail to split: {:?}, ignore.", error);
                             return;
