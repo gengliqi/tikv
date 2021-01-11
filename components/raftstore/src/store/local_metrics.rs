@@ -439,6 +439,7 @@ pub struct RaftMetrics {
     pub active_leader: LocalHistogram,
     pub active_follower: LocalHistogram,
     pub receive_messages: LocalIntCounterVec,
+    pub send_raft_log: LocalHistogram,
 }
 
 impl Default for RaftMetrics {
@@ -464,6 +465,7 @@ impl Default for RaftMetrics {
             active_leader: PEER_ACTIVE_LEADER_HISTOGRAM.local(),
             active_follower: PEER_ACTIVE_FOLLOWER_HISTOGRAM.local(),
             receive_messages: PEER_RECEIVE_MESSAGES_VEC.local(),
+            send_raft_log: PEER_SEND_RAFT_LOG_HISTOGRAM.local(),
         }
     }
 }
@@ -488,6 +490,7 @@ impl RaftMetrics {
         self.active_leader.flush();
         self.active_follower.flush();
         self.receive_messages.flush();
+        self.send_raft_log.flush();
 
         let mut missing = self.leader_missing.lock().unwrap();
         LEADER_MISSING.set(missing.len() as i64);

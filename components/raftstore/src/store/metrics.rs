@@ -94,6 +94,13 @@ lazy_static! {
             &["type"]
         ).unwrap();
 
+    pub static ref PEER_SEND_RAFT_LOG_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_send_raft_log",
+            "TODO",
+            exponential_buckets(0.0005, 2.0, 20).unwrap()
+        ).unwrap();
+
     pub static ref STORE_APPLY_LOG_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_apply_log_duration_seconds",

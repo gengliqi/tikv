@@ -262,6 +262,7 @@ pub struct PollContext<T, C: 'static> {
     pub total_proposal: u64,
     pub active_leader: u64,
     pub active_follower: u64,
+    pub send_raft_log: Duration,
 }
 
 impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
@@ -544,7 +545,9 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         if self.poll_ctx.need_flush_trans
             && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
         {
+            let time = TiInstant::now_coarse();
             self.poll_ctx.trans.flush();
+            self.ctx.send_raft_log += time.elapsed();
             self.poll_ctx.need_flush_trans = false;
         }
         let ready_cnt = self.poll_ctx.ready_res.len();
@@ -697,6 +700,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
         self.poll_ctx.total_proposal = 0;
         self.poll_ctx.active_leader = 0;
         self.poll_ctx.active_follower = 0;
+        self.poll_ctx.send_raft_log = 0;
         if self.pending_proposals.capacity() == 0 {
             self.pending_proposals = Vec::with_capacity(batch_size);
         }
@@ -854,6 +858,10 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksEngine>, StoreFsm> for 
             .raft_metrics
             .active_follower
             .observe(self.poll_ctx.active_follower as f64);
+        self.poll_ctx
+            .raft_metrics
+            .send_raft_log
+            .observe(duration_to_sec(self.poll_ctx.send_raft_log) as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
     }
@@ -1102,6 +1110,7 @@ where
             total_proposal: 0,
             active_leader: 0,
             active_follower: 0,
+            ransport_send_time: 0,
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());

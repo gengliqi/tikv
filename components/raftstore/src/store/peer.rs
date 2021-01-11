@@ -675,9 +675,8 @@ impl Peer {
     }
 
     #[inline]
-    fn send<T, I>(&mut self, trans: &mut T, msgs: I, metrics: &mut RaftMessageMetrics)
+    fn send<I>(&mut self, ctx: &mut PollContext<T, C>, msgs: I, metrics: &mut RaftMessageMetrics)
     where
-        T: Transport,
         I: IntoIterator<Item = eraftpb::Message>,
     {
         for msg in msgs {
@@ -721,7 +720,7 @@ impl Peer {
                 | MessageType::MsgSnapStatus
                 | MessageType::MsgCheckQuorum => {}
             }
-            self.send_raft_message(msg, trans);
+            self.send_raft_message(msg, ctx);
         }
     }
 
@@ -1147,7 +1146,7 @@ impl Peer {
             fail_point!("raft_before_follower_send");
             let messages = mem::replace(&mut self.pending_messages, vec![]);
             ctx.need_flush_trans = true;
-            self.send(&mut ctx.trans, messages, &mut ctx.raft_metrics.message);
+            self.send(ctx, messages, &mut ctx.raft_metrics.message);
         }
 
         if let Some(snap) = self.get_pending_snapshot() {
@@ -1309,7 +1308,7 @@ impl Peer {
             fail_point!("raft_before_leader_send");
             let msgs = ready.messages.drain(..);
             ctx.need_flush_trans = true;
-            self.send(&mut ctx.trans, msgs, &mut ctx.raft_metrics.message);
+            self.send(ctx, msgs, &mut ctx.raft_metrics.message);
         }
 
         let invoke_ctx = match self.mut_store().handle_raft_ready(ctx, &ready) {
@@ -1362,11 +1361,7 @@ impl Peer {
             if self.is_applying_snapshot() {
                 self.pending_messages = mem::replace(&mut ready.messages, vec![]);
             } else {
-                self.send(
-                    &mut ctx.trans,
-                    ready.messages.drain(..),
-                    &mut ctx.raft_metrics.message,
-                );
+                self.send(ctx, ready.messages.drain(..), &mut ctx.raft_metrics.message);
                 ctx.need_flush_trans = true;
             }
         }
@@ -2650,7 +2645,8 @@ impl Peer {
         }
     }
 
-    fn send_raft_message<T: Transport>(&mut self, msg: eraftpb::Message, trans: &mut T) {
+    fn send_raft_message(&mut self, msg: eraftpb::Message, ctx: &mut PollContext<T, C>) {
+        let trans = ctx.trans;
         let mut send_msg = RaftMessage::default();
         send_msg.set_region_id(self.region_id);
         // set current epoch
@@ -2701,6 +2697,7 @@ impl Peer {
         }
         send_msg.set_message(msg);
 
+        let time = UtilInstant::now_coarse();
         if let Err(e) = trans.send(send_msg) {
             warn!(
                 "failed to send msg to other peer";
@@ -2721,6 +2718,7 @@ impl Peer {
                     .report_snapshot(to_peer_id, SnapshotStatus::Failure);
             }
         }
+        ctx.transport_send_time += time.elapsed();
     }
 
     pub fn bcast_wake_up_message<T: Transport, C>(&self, ctx: &mut PollContext<T, C>) {
