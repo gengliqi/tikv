@@ -644,6 +644,7 @@ struct YieldState {
     /// the source peer has applied its logs and pending entries
     /// are all handled.
     pending_msgs: Vec<Msg>,
+    offset: usize,
 }
 
 impl Debug for YieldState {
@@ -768,6 +769,7 @@ impl ApplyDelegate {
         &mut self,
         apply_ctx: &mut ApplyContext<W>,
         mut committed_entries: Vec<Entry>,
+        offset: usize,
     ) {
         if committed_entries.is_empty() {
             return;
@@ -777,14 +779,14 @@ impl ApplyDelegate {
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
         apply_ctx.committed_count += committed_entries.len();
-        let mut drainer = committed_entries.drain(..);
         let mut results = VecDeque::new();
-        while let Some(entry) = drainer.next() {
+        for i in offset..committed_entries.len() {
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
             }
 
+            let entry = committed_entries[i];
             let expect_index = self.apply_state.get_applied_index() + 1;
             if expect_index != entry.get_index() {
                 panic!(
@@ -807,14 +809,11 @@ impl ApplyDelegate {
                 ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => {
                     // Both cancel and merge will yield current processing.
                     apply_ctx.committed_count -= drainer.len() + 1;
-                    let mut pending_entries = Vec::with_capacity(drainer.len() + 1);
-                    // Note that current entry is skipped when yield.
-                    pending_entries.push(entry);
-                    pending_entries.extend(drainer);
                     apply_ctx.finish_for(self, results);
                     self.yield_state = Some(YieldState {
-                        pending_entries,
+                        pending_entries: committed_entries,
                         pending_msgs: Vec::default(),
+                        offset: i,
                     });
                     if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
@@ -867,9 +866,18 @@ impl ApplyDelegate {
         let data = entry.get_data();
 
         if !data.is_empty() {
+            if apply_ctx.kv_wb().should_write_to_engine() {
+                apply_ctx.commit(self);
+                if let Some(start) = self.handle_start.as_ref() {
+                    if start.elapsed() >= apply_ctx.yield_duration {
+                        return ApplyResult::Yield;
+                    }
+                }
+            }
+
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if should_write_to_engine(&cmd) {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -2639,7 +2647,7 @@ impl ApplyFsm {
         self.delegate.apply_state.set_commit_term(cur_state.2);
 
         self.delegate
-            .handle_raft_committed_entries(apply_ctx, apply.entries);
+            .handle_raft_committed_entries(apply_ctx, apply.entries, 0);
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
         if self.delegate.yield_state.is_some() {
             return;
@@ -2740,7 +2748,7 @@ impl ApplyFsm {
         }
         if !state.pending_entries.is_empty() {
             self.delegate
-                .handle_raft_committed_entries(ctx, state.pending_entries);
+                .handle_raft_committed_entries(ctx, state.pending_entries, state.offset);
             if let Some(ref mut s) = self.delegate.yield_state {
                 // So the delegate is expected to yield the CPU.
                 // It can either be executing another `CommitMerge` in pending_msgs
