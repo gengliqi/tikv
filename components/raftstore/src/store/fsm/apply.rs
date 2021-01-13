@@ -771,7 +771,7 @@ impl ApplyDelegate {
         committed_entries: Vec<Entry>,
         offset: usize,
     ) {
-        if committed_entries.is_empty() || offset + 1 >= committed_entries.len() {
+        if committed_entries.is_empty() || offset >= committed_entries.len() {
             return;
         }
         apply_ctx.prepare_for(self);
