@@ -768,17 +768,17 @@ impl ApplyDelegate {
     fn handle_raft_committed_entries<W: WriteBatch + WriteBatchVecExt<RocksEngine>>(
         &mut self,
         apply_ctx: &mut ApplyContext<W>,
-        mut committed_entries: Vec<Entry>,
+        committed_entries: Vec<Entry>,
         offset: usize,
     ) {
-        if committed_entries.is_empty() {
+        if committed_entries.is_empty() || offset + 1 >= committed_entries.len() {
             return;
         }
         apply_ctx.prepare_for(self);
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
-        apply_ctx.committed_count += committed_entries.len();
+        apply_ctx.committed_count += committed_entries.len() - offset;
         let mut results = VecDeque::new();
         for i in offset..committed_entries.len() {
             if self.pending_remove {
@@ -786,7 +786,7 @@ impl ApplyDelegate {
                 break;
             }
 
-            let entry = committed_entries[i];
+            let entry = &committed_entries[i];
             let expect_index = self.apply_state.get_applied_index() + 1;
             if expect_index != entry.get_index() {
                 panic!(
@@ -798,8 +798,8 @@ impl ApplyDelegate {
             }
 
             let res = match entry.get_entry_type() {
-                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
-                EntryType::EntryConfChange => self.handle_raft_entry_conf_change(apply_ctx, &entry),
+                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, entry),
+                EntryType::EntryConfChange => self.handle_raft_entry_conf_change(apply_ctx, entry),
                 EntryType::EntryConfChangeV2 => unimplemented!(),
             };
 
@@ -808,7 +808,7 @@ impl ApplyDelegate {
                 ApplyResult::Res(res) => results.push_back(res),
                 ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => {
                     // Both cancel and merge will yield current processing.
-                    apply_ctx.committed_count -= drainer.len() + 1;
+                    apply_ctx.committed_count -= committed_entries.len() - i;
                     apply_ctx.finish_for(self, results);
                     self.yield_state = Some(YieldState {
                         pending_entries: committed_entries,
@@ -819,6 +819,22 @@ impl ApplyDelegate {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
                     }
                     return;
+                }
+            }
+
+            if apply_ctx.kv_wb().should_write_to_engine() {
+                apply_ctx.commit(self);
+                if let Some(start) = self.handle_start.as_ref() {
+                    if start.elapsed() >= apply_ctx.yield_duration {
+                        apply_ctx.committed_count -= committed_entries.len() - i - 1;
+                        apply_ctx.finish_for(self, results);
+                        self.yield_state = Some(YieldState {
+                            pending_entries: committed_entries,
+                            pending_msgs: Vec::default(),
+                            offset: i + 1,
+                        });
+                        return;
+                    }
                 }
             }
         }
@@ -866,24 +882,10 @@ impl ApplyDelegate {
         let data = entry.get_data();
 
         if !data.is_empty() {
-            if apply_ctx.kv_wb().should_write_to_engine() {
-                apply_ctx.commit(self);
-                if let Some(start) = self.handle_start.as_ref() {
-                    if start.elapsed() >= apply_ctx.yield_duration {
-                        return ApplyResult::Yield;
-                    }
-                }
-            }
-
             let cmd = util::parse_data_at(data, index, &self.tag);
 
             if should_write_to_engine(&cmd) {
                 apply_ctx.commit(self);
-                if let Some(start) = self.handle_start.as_ref() {
-                    if start.elapsed() >= apply_ctx.yield_duration {
-                        return ApplyResult::Yield;
-                    }
-                }
             }
 
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
