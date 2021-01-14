@@ -367,7 +367,7 @@ impl<W: WriteBatch + WriteBatchVecExt<RocksEngine>> ApplyContext<W> {
             yield_duration: cfg.apply_yield_duration.0,
             perf_context_statistics: PerfContextStatistics::new(cfg.perf_level),
             txn_extras: MustConsumeVec::new("extra data from txn"),
-            db_write_size: cfg.db_write_size.0,
+            db_write_size: cfg.db_write_size.0 as usize,
         }
     }
 
@@ -825,7 +825,7 @@ impl ApplyDelegate {
                 }
             }
 
-            if apply_ctx.kv_wb().data_size() >= apply_ctx.db_write_size {
+            if apply_ctx.kv_wb().should_write_to_engine() {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -2951,9 +2951,8 @@ impl ApplyFsm {
         loop {
             match drainer.next() {
                 Some(Msg::Apply { start, apply }) => {
-                    if channel_timer.is_none() {
-                        channel_timer = Some(start);
-                    }
+                    let elapsed = duration_to_sec(start.elapsed());
+                    APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
                     self.handle_apply(apply_ctx, apply);
                     if let Some(ref mut state) = self.delegate.yield_state {
                         state.pending_msgs = drainer.collect();
