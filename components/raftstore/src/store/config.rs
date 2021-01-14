@@ -169,6 +169,8 @@ pub struct Config {
     pub dev_assert: bool,
     #[config(hidden)]
     pub apply_yield_duration: ReadableDuration,
+    #[config(hidden)]
+    pub db_write_size: ReadableSize,
 
     // Deprecated! These two configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
@@ -249,6 +251,7 @@ impl Default for Config {
             early_apply: true,
             dev_assert: false,
             apply_yield_duration: ReadableDuration::millis(500),
+            db_write_size: ReadableSize::kb(15),
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),

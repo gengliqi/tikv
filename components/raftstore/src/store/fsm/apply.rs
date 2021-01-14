@@ -329,6 +329,8 @@ struct ApplyContext<W: WriteBatch + WriteBatchVecExt<RocksEngine>> {
 
     // TxnExtra collected from applied cmds.
     txn_extras: MustConsumeVec<TxnExtra>,
+
+    db_write_size: usize,
 }
 
 impl<W: WriteBatch + WriteBatchVecExt<RocksEngine>> ApplyContext<W> {
@@ -365,6 +367,7 @@ impl<W: WriteBatch + WriteBatchVecExt<RocksEngine>> ApplyContext<W> {
             yield_duration: cfg.apply_yield_duration.0,
             perf_context_statistics: PerfContextStatistics::new(cfg.perf_level),
             txn_extras: MustConsumeVec::new("extra data from txn"),
+            db_write_size: cfg.db_write_size.0,
         }
     }
 
@@ -822,7 +825,7 @@ impl ApplyDelegate {
                 }
             }
 
-            if apply_ctx.kv_wb().should_write_to_engine() {
+            if apply_ctx.kv_wb().data_size() >= apply_ctx.db_write_size {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
