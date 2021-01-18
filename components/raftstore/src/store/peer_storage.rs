@@ -26,10 +26,15 @@ use crate::{Error, Result};
 use engine_traits::{RaftEngine, RaftLogBatch};
 use into_other::into_other;
 use tikv_util::worker::Scheduler;
+use std::sync::Mutex;
 
 use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
+
+use tikv_util::collections::HashMap;
+use crate::store::fsm::sync_policy::UnsyncedReady;
+use std::sync::atomic::AtomicU64;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -304,15 +309,24 @@ impl Drop for EntryCache {
     }
 }
 
+pub struct AsyncWriterTask<WR>
+where
+    WR: RaftLogBatch,
+{
+    pub wb: WR,
+    pub unsynced_readies: HashMap<u64, UnsyncedReady>,
+}
+
 pub trait HandleRaftReadyContext<WK, WR>
 where
     WK: Mutable,
     WR: RaftLogBatch,
 {
     /// Returns the mutable references of WriteBatch for both KvDB and RaftDB in one interface.
-    fn wb_mut(&mut self) -> (&mut WK, &mut WR);
+    fn wb_mut(&mut self) -> (&mut WK, Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>);
     fn kv_wb_mut(&mut self) -> &mut WK;
-    fn raft_wb_mut(&mut self) -> &mut WR;
+    //fn raft_wb_mut(&mut self) -> &mut WR;
+    fn raft_wb_pool(&mut self) -> Arc<Mutex<VecDeque<AsyncWriterTask<WR>>>>;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -680,11 +694,11 @@ where
         let last_term = init_last_term(&engines, region, &raft_state, &apply_state)?;
         let applied_index_term = init_applied_index_term(&engines, region, &apply_state)?;
 
-        let cache = if engines.raft.has_builtin_entry_cache() {
+        /*let cache = if engines.raft.has_builtin_entry_cache() {
             None
         } else {
             Some(EntryCache::default())
-        };
+        };*/
 
         Ok(PeerStorage {
             engines,
@@ -699,7 +713,7 @@ where
             tag,
             applied_index_term,
             last_term,
-            cache,
+            cache: Some(EntryCache::default()),
         })
     }
 
@@ -1011,11 +1025,11 @@ where
     // to the return one.
     // WARNING: If this function returns error, the caller must panic otherwise the entry cache may
     // be wrong and break correctness.
-    pub fn append<H: HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>>(
+    pub fn append(
         &mut self,
         invoke_ctx: &mut InvokeContext,
         entries: Vec<Entry>,
-        ready_ctx: &mut H,
+        raft_wb: &mut ER::LogBatch,
     ) -> Result<u64> {
         let region_id = self.get_region_id();
         debug!(
@@ -1043,13 +1057,10 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        ready_ctx.raft_wb_mut().append(region_id, entries)?;
-
+        raft_wb.append(region_id, entries)?;
         // Delete any previously appended log entries which never committed.
         // TODO: Wrap it as an engine::Error.
-        ready_ctx
-            .raft_wb_mut()
-            .cut_logs(region_id, last_index + 1, prev_last_index);
+        raft_wb.cut_logs(region_id, last_index + 1, prev_last_index);
 
         invoke_ctx.raft_state.set_last_index(last_index);
         invoke_ctx.last_term = last_term;
@@ -1072,11 +1083,11 @@ where
     }
 
     pub fn maybe_gc_cache(&mut self, replicated_idx: u64, apply_idx: u64) {
-        if self.engines.raft.has_builtin_entry_cache() {
+        /*if self.engines.raft.has_builtin_entry_cache() {
             let rid = self.get_region_id();
             self.engines.raft.gc_entry_cache(rid, apply_idx + 1);
             return;
-        }
+        }*/
 
         let cache = self.cache.as_mut().unwrap();
         if replicated_idx == apply_idx {
@@ -1182,9 +1193,10 @@ where
     ) -> Result<()> {
         let region_id = self.get_region_id();
         clear_meta(&self.engines, kv_wb, raft_wb, region_id, &self.raft_state)?;
-        if !self.engines.raft.has_builtin_entry_cache() {
+        /*if !self.engines.raft.has_builtin_entry_cache() {
             self.cache = Some(EntryCache::default());
-        }
+        }*/
+        self.cache = Some(EntryCache::default());
         Ok(())
     }
 
@@ -1365,47 +1377,54 @@ where
         ready_ctx: &mut H,
         ready: &mut Ready,
         destroy_regions: Vec<metapb::Region>,
+        region_notifier: Arc<AtomicU64>,
     ) -> Result<InvokeContext> {
+        let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
-        let snapshot_index = if ready.snapshot().is_empty() {
-            0
-        } else {
-            fail_point!("raft_before_apply_snap");
-            let (kv_wb, raft_wb) = ready_ctx.wb_mut();
-            self.apply_snapshot(&mut ctx, ready.snapshot(), kv_wb, raft_wb, &destroy_regions)?;
-            fail_point!("raft_after_apply_snap");
+        let mut snapshot_index = 0;
 
-            ctx.destroyed_regions = destroy_regions;
+        {
+            let raft_wb_pool = ready_ctx.raft_wb_pool();
+            let mut raft_wbs = raft_wb_pool.lock().unwrap();
+            let current = raft_wbs.front_mut().unwrap();
 
-            last_index(&ctx.raft_state)
-        };
+            if !ready.snapshot().is_empty() {
+                fail_point!("raft_before_apply_snap");
+                self.apply_snapshot(&mut ctx, ready.snapshot(), ready_ctx.kv_wb_mut(), &mut current.wb, &destroy_regions)?;
+                fail_point!("raft_after_apply_snap");
+                ctx.destroyed_regions = destroy_regions;
+                snapshot_index = last_index(&ctx.raft_state);
+            };
 
-        if !ready.entries().is_empty() {
-            self.append(&mut ctx, ready.take_entries(), ready_ctx)?;
-        }
-
-        // Last index is 0 means the peer is created from raft message
-        // and has not applied snapshot yet, so skip persistent hard state.
-        if ctx.raft_state.get_last_index() > 0 {
-            if let Some(hs) = ready.hs() {
-                ctx.raft_state.set_hard_state(hs.clone());
+            if !ready.entries().is_empty() {
+                self.append(&mut ctx, ready.take_entries(), &mut current.wb)?;
             }
-        }
+            // Last index is 0 means the peer is created from raft message
+            // and has not applied snapshot yet, so skip persistent hard state.
+            if ctx.raft_state.get_last_index() > 0 {
+                if let Some(hs) = ready.hs() {
+                    ctx.raft_state.set_hard_state(hs.clone());
+                }
+            }
 
-        // Save raft state if it has changed or there is a snapshot.
-        if ctx.raft_state != self.raft_state || snapshot_index > 0 {
-            ctx.save_raft_state_to(ready_ctx.raft_wb_mut())?;
-            if snapshot_index > 0 {
-                // in case of restart happen when we just write region state to Applying,
-                // but not write raft_local_state to raft rocksdb in time.
-                // we write raft state to default rocksdb, with last index set to snap index,
-                // in case of recv raft log after snapshot.
-                ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
+            // Save raft state if it has changed or there is a snapshot.
+            if ctx.raft_state != self.raft_state || snapshot_index > 0 {
+                ctx.save_raft_state_to(&mut current.wb)?;
+            }
+
+            if ready.must_sync() {
+                current.unsynced_readies.insert(region_id,
+                    UnsyncedReady{number: ready.number(), region_id, notifier: region_notifier.clone(), version: 0});
             }
         }
 
         // only when apply snapshot
         if snapshot_index > 0 {
+            // in case of restart happen when we just write region state to Applying,
+            // but not write raft_local_state to raft rocksdb in time.
+            // we write raft state to default rocksdb, with last index set to snap index,
+            // in case of recv raft log after snapshot.
+            ctx.save_snapshot_raft_state_to(snapshot_index, ready_ctx.kv_wb_mut())?;
             ctx.save_apply_state_to(ready_ctx.kv_wb_mut())?;
         }
 
@@ -1642,7 +1661,7 @@ pub fn write_peer_state<T: Mutable>(
     kv_wb.put_msg_cf(CF_RAFT, &keys::region_state_key(region_id), &region_state)?;
     Ok(())
 }
-
+/*
 #[cfg(test)]
 mod tests {
     use crate::coprocessor::CoprocessorHost;
@@ -1705,14 +1724,14 @@ mod tests {
     }
 
     impl HandleRaftReadyContext<KvTestWriteBatch, RaftTestWriteBatch> for ReadyContext {
-        fn wb_mut(&mut self) -> (&mut KvTestWriteBatch, &mut RaftTestWriteBatch) {
-            (&mut self.kv_wb, &mut self.raft_wb)
-        }
+        //fn wb_mut(&mut self) -> (&mut KvTestWriteBatch, &mut RaftTestWriteBatch) {
+        //    (&mut self.kv_wb, &mut self.raft_wb)
+        //}
         fn kv_wb_mut(&mut self) -> &mut KvTestWriteBatch {
             &mut self.kv_wb
         }
-        fn raft_wb_mut(&mut self) -> &mut RaftTestWriteBatch {
-            &mut self.raft_wb
+        fn raft_wb_pool(&mut self) -> &mut RaftTestWriteBatch {
+            &mut self.raft_wbs
         }
         fn sync_log(&self) -> bool {
             self.sync_log
@@ -2621,3 +2640,5 @@ mod tests {
         assert!(build_storage().is_err());
     }
 }
+
+*/
