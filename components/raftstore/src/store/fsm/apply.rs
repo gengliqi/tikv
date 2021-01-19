@@ -2946,7 +2946,6 @@ impl ApplyFsm {
         apply_ctx: &mut ApplyContext<W>,
         msgs: &mut Vec<Msg>,
     ) {
-        let mut channel_timer = None;
         let mut drainer = msgs.drain(..);
         loop {
             match drainer.next() {
@@ -2974,10 +2973,6 @@ impl ApplyFsm {
                 Some(Msg::Validate(_, f)) => f((&self.delegate, apply_ctx.enable_sync_log)),
                 None => break,
             }
-        }
-        if let Some(timer) = channel_timer {
-            let elapsed = duration_to_sec(timer.elapsed());
-            APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
         }
     }
 }
