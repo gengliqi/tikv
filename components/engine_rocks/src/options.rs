@@ -39,6 +39,7 @@ impl From<engine_traits::WriteOptions> for RocksWriteOptions {
     fn from(opts: engine_traits::WriteOptions) -> Self {
         let mut r = RawWriteOptions::default();
         r.set_sync(opts.sync());
+        r.disable_wal(opts.disable_wal());
         RocksWriteOptions(r)
     }
 }

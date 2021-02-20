@@ -431,7 +431,9 @@ where
         if !task.kv_wb.is_empty() {
             let now = Instant::now_coarse();
             let mut write_opts = WriteOptions::new();
-            write_opts.set_sync(task.sync_log);
+            //write_opts.set_sync(task.sync_log);
+            write_opts.set_sync(false);
+            write_opts.set_disable_wal(true);
             task.kv_wb
                 .write_to_engine(&self.kv_engine, &write_opts)
                 .unwrap_or_else(|e| {
