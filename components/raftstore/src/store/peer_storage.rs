@@ -3,12 +3,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Sender, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp, error, u64};
-
-use crossbeam::channel::{SendError, Sender};
 
 use engine_traits::CF_RAFT;
 use engine_traits::{Engines, KvEngine, Mutable, Peekable};
@@ -309,7 +307,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    fn async_write_batch(&mut self, id: usize) -> &mut AsyncWriteMsgBatch<EK, ER>;
+    fn async_write_sender(&mut self, id: usize) -> &mut Sender<AsyncWriteMsg<EK, ER>>;
     fn sync_log(&self) -> bool;
     fn set_sync_log(&mut self, sync: bool);
 }
@@ -1453,12 +1451,13 @@ where
         write_task.msg_seq_id = msg_seq_id;
 
         if !write_task.is_empty() {
-            let batch = ready_ctx.async_write_batch(async_writer_id);
-            if batch.msgs.is_empty() {
-                batch.begin = Some(Instant::now());
+            let now = Instant::now();
+            let sender = ready_ctx.async_write_sender(async_writer_id);
+            if let Err(e) = sender.send(AsyncWriteMsg::WriteTask(write_task)) {
+                panic!("{} failed to send write msg, err: {:?}", self.tag, e);
             }
-            batch.size += write_task.size;
-            batch.msgs.push(AsyncWriteMsg::WriteTask(write_task));
+            STORE_SEND_WRITE_DURATION_HISTOGRAM
+                .observe(duration_to_sec(now.elapsed()) as f64);
         }
 
         Ok(ctx)

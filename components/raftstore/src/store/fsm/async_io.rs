@@ -113,13 +113,15 @@ impl UnsyncedReady {
             region_id,
             PeerMsg::Persisted((self.peer_id, self.number, Instant::now())),
         ) {
-            error!(
-                "failed to send noop to trigger persisted ready";
-                "region_id" => region_id,
-                "peer_id" => self.peer_id,
-                "ready_number" => self.number,
-                "error" => ?e,
-            );
+            if !router.is_shutdown() {
+                error!(
+                    "failed to send noop to trigger persisted ready";
+                    "region_id" => region_id,
+                    "peer_id" => self.peer_id,
+                    "ready_number" => self.number,
+                    "error" => ?e,
+                );
+            }
         }
     }
 }
@@ -454,7 +456,7 @@ where
     tag: String,
     kv_engine: EK,
     raft_engine: ER,
-    receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
+    receiver: Receiver<AsyncWriteMsg<EK, ER>>,
     sync_sender: CBSender<SyncMsg>,
     //queue: AsyncWriteAdaptiveQueue<EK, ER>,
     batch: AsyncWriteBatch<EK, ER>,
@@ -473,7 +475,7 @@ where
         tag: String,
         kv_engine: EK,
         raft_engine: ER,
-        receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
+        receiver: Receiver<AsyncWriteMsg<EK, ER>>,
         sync_sender: CBSender<SyncMsg>,
         config: &Config,
     ) -> Self {
@@ -509,27 +511,25 @@ where
         loop {
             let loop_begin = UtilInstant::now();
 
-            let mut msg_vec = match self.receiver.recv() {
-                Ok(msg_vec) => msg_vec,
+            let mut msg = match self.receiver.recv() {
+                Ok(m) => m,
                 Err(_) => return,
             };
             STORE_WRITE_TASK_GEN_DURATION_HISTOGRAM.observe(duration_to_sec(loop_begin.elapsed()));
 
             let begin = UtilInstant::now();
             loop {
-                for msg in msg_vec {
-                    match msg {
-                        AsyncWriteMsg::Shutdown => return,
-                        AsyncWriteMsg::WriteTask(task) => {
-                            self.batch.add_write_task(task);
-                        }
+                match msg {
+                    AsyncWriteMsg::Shutdown => return,
+                    AsyncWriteMsg::WriteTask(task) => {
+                        self.batch.add_write_task(task);
                     }
                 }
                 if self.batch.get_raft_size() >= self.trigger_write_size {
                     break;
                 }
-                msg_vec = match self.receiver.try_recv() {
-                    Ok(msg_vec) => msg_vec,
+                msg = match self.receiver.try_recv() {
+                    Ok(m) => m,
                     Err(_) => break,
                 };
             }
@@ -655,7 +655,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    workers: Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>>,
+    workers: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
     handlers: Vec<JoinHandle<()>>,
     sync_sender: Option<CBSender<SyncMsg>>,
     sync_handler: Option<JoinHandle<()>>,
@@ -675,7 +675,7 @@ where
         }
     }
 
-    pub fn senders(&self) -> &Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>> {
+    pub fn senders(&self) -> &Vec<Sender<AsyncWriteMsg<EK, ER>>> {
         &self.workers
     }
 
@@ -721,7 +721,7 @@ where
     pub fn shutdown(&mut self) {
         assert_eq!(self.workers.len(), self.handlers.len());
         for worker in &self.workers {
-            worker.send(vec![AsyncWriteMsg::Shutdown]).unwrap();
+            worker.send(AsyncWriteMsg::Shutdown).unwrap();
         }
         for handler in self.handlers.drain(..) {
             handler.join().unwrap();
@@ -837,6 +837,7 @@ where
             STORE_TRIGGER_SYNC_COUNT.total.inc_by(1);
 
             let begin = UtilInstant::now();
+            let len = self.receiver.len();
             self.raft_engine.sync().unwrap_or_else(|e| {
                 panic!("syncer failed to sync raft db: {:?}", e);
             });
@@ -845,6 +846,15 @@ where
             let begin = UtilInstant::now();
             for task in msgs.drain(..) {
                 self.after_sync(task);
+            }
+            for _ in 0..len {
+                let msg = self.receiver.try_recv().unwrap();
+                match msg {
+                    SyncMsg::Shutdown => return,
+                    SyncMsg::Task(task) => {
+                        self.after_sync(task);
+                    }
+                }
             }
             STORE_AFTER_SYNC_DURATION.observe(duration_to_sec(begin.elapsed()));
         }
