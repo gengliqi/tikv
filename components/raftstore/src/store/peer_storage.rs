@@ -304,7 +304,7 @@ impl Drop for EntryCache {
     }
 }
 
-pub trait HandleRaftReadyContext<EK, ER> 
+pub trait HandleRaftReadyContext<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,

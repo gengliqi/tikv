@@ -131,6 +131,12 @@ make_auto_flush_static_metric! {
         cleanup_import_sst,
         raft_engine_purge,
     }
+    pub label_enum RaftTriggerSyncType {
+        total,
+        size,
+        timeout,
+        adaptive_timeout,
+    }
 
     pub struct RaftEventDuration : LocalHistogram {
         "type" => RaftEventDurationType
@@ -178,9 +184,46 @@ make_auto_flush_static_metric! {
     pub struct PerfContextTimeDuration : LocalHistogram {
         "type" => PerfContextType
     }
+
+    pub struct RaftTriggerSyncVec : LocalIntCounter {
+        "type" => RaftTriggerSyncType
+    }
 }
 
 lazy_static! {
+    pub static ref STORE_AFTER_SYNC_DURATION: Histogram =
+        register_histogram!(
+            "tikv_raftstore_raftdb_after_sync_duration_secs",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_SYNC_DURATION: Histogram =
+        register_histogram!(
+            "tikv_raftstore_raftdb_sync_duration_secs",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_TRIGGER_SYNC_SIZE: Histogram =
+        register_histogram!(
+            "tikv_raftstore_trigger_sync_size",
+            "TODO",
+            exponential_buckets(0.5, 2.0, 20).unwrap()
+        ).unwrap();
+    pub static ref STORE_TRIGGER_SYNC_DURATION: Histogram =
+        register_histogram!(
+            "tikv_raftstore_trigger_sync_duration_secs",
+            "TODO",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref STORE_TRIGGER_SYNC_COUNT_VEC: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_trigger_sync_count",
+            "TODO",
+            &["type"]
+        ).unwrap();
+    pub static ref STORE_TRIGGER_SYNC_COUNT: RaftTriggerSyncVec =
+        auto_flush_from!(STORE_TRIGGER_SYNC_COUNT_VEC, RaftTriggerSyncVec);
+
     pub static ref STORE_WRITE_TRIGGER_SEND_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_write_trigger_send_duration_secs",

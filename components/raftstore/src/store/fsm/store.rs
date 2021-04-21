@@ -5,12 +5,13 @@ use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{thread, u64};
 
 use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
-use crossbeam::channel::{Sender, TryRecvError, TrySendError};
+use crossbeam::channel::{TryRecvError, TrySendError};
 //use engine_rocks::{PerfContext, PerfLevel};
 use engine_traits::{Engines, KvEngine, Mutable, WriteBatch, WriteBatchExt};
 use engine_traits::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
@@ -289,7 +290,7 @@ impl Clone for PeerTickBatch {
     }
 }
 
-pub struct AsyncWriteMsgBatch<EK, ER> 
+pub struct AsyncWriteMsgBatch<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
@@ -299,7 +300,7 @@ where
     pub size: usize,
 }
 
-impl<EK, ER> AsyncWriteMsgBatch<EK, ER> 
+impl<EK, ER> AsyncWriteMsgBatch<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,

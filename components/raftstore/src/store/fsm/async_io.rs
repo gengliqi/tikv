@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use std::marker::PhantomData;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{collections::VecDeque, time::Instant};
@@ -25,8 +25,8 @@ use std::time::Duration;
 use tikv_util::collections::HashMap;
 use tikv_util::time::{duration_to_micros, duration_to_sec, Instant as UtilInstant};
 
-const KV_WB_SHRINK_SIZE: usize = 256 * 1024;
-const RAFT_WB_SHRINK_SIZE: usize = 1024 * 1024;
+const KV_WB_SHRINK_SIZE: usize = 1024 * 1024;
+const RAFT_WB_SHRINK_SIZE: usize = 10 * 1024 * 1024;
 
 pub struct SampleWindow {
     count: usize,
@@ -164,14 +164,17 @@ where
     }
 
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty() 
+        self.messages.is_empty()
             && self.entries.is_empty()
             && self.raft_state.is_none()
             && self.cut_logs.is_none()
             && self.unsynced_ready.is_none()
             && self.proposal_times.is_empty()
             && self.kv_wb.as_ref().map_or_else(|| true, |wb| wb.is_empty())
-            && self.raft_wb.as_ref().map_or_else(|| true, |wb| wb.is_empty())
+            && self
+                .raft_wb
+                .as_ref()
+                .map_or_else(|| true, |wb| wb.is_empty())
     }
 }
 
@@ -363,9 +366,7 @@ where
         }
     }
 
-    pub fn prepare_current_for_write(
-        &mut self,
-    ) -> &mut AsyncWriteBatch<EK, ER> {
+    pub fn prepare_current_for_write(&mut self) -> &mut AsyncWriteBatch<EK, ER> {
         if self.adaptive_size {
             let current_size = self.wbs[self.current_idx].get_raft_size();
             if current_size
@@ -444,41 +445,39 @@ where
     }
 }
 
-struct AsyncWriteWorker<EK, ER, T>
+struct AsyncWriteWorker<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
-    T: Transport,
 {
     store_id: u64,
     tag: String,
     kv_engine: EK,
     raft_engine: ER,
-    router: RaftRouter<EK, ER>,
     receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
-    queue: AsyncWriteAdaptiveQueue<EK, ER>,
-    trans: T,
+    sync_sender: Sender<SyncMsg>,
+    //queue: AsyncWriteAdaptiveQueue<EK, ER>,
+    batch: AsyncWriteBatch<EK, ER>,
     perf_context_statistics: PerfContextStatistics,
     io_max_wait_us: i64,
+    trigger_write_size: usize,
 }
 
-impl<EK, ER, T> AsyncWriteWorker<EK, ER, T>
+impl<EK, ER> AsyncWriteWorker<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
-    T: Transport,
 {
     fn new(
         store_id: u64,
         tag: String,
         kv_engine: EK,
         raft_engine: ER,
-        router: RaftRouter<EK, ER>,
         receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
-        trans: T,
+        sync_sender: Sender<SyncMsg>,
         config: &Config,
     ) -> Self {
-        let queue = AsyncWriteAdaptiveQueue::new(
+        /*let queue = AsyncWriteAdaptiveQueue::new(
             &kv_engine,
             &raft_engine,
             config.store_batch_system.io_queue_size + 1,
@@ -487,36 +486,66 @@ where
             config.store_batch_system.io_queue_adaptive_gain,
             config.store_batch_system.io_queue_sample_quantile,
             config.store_batch_system.io_adaptive_size,
+        );*/
+        let batch = AsyncWriteBatch::new(
+            kv_engine.write_batch_with_cap(32 * 1024),
+            raft_engine.log_batch(128 * 1024),
         );
         Self {
             store_id,
             tag,
             kv_engine,
             raft_engine,
-            router,
             receiver,
-            queue,
-            trans,
+            sync_sender,
+            batch,
             perf_context_statistics: PerfContextStatistics::new(config.perf_level),
+            trigger_write_size: config.trigger_write_size.0 as usize,
             io_max_wait_us: config.store_batch_system.io_max_wait_us as i64,
         }
     }
 
     fn run(&mut self) {
-        let mut msgs = vec![];
         loop {
             let loop_begin = UtilInstant::now();
 
-            if !self.queue.has_task() {
-                let msg = match self.receiver.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => return,
-                };
-                msgs.push(msg);
-            }
+            let mut msg_vec = match self.receiver.recv() {
+                Ok(msg_vec) => msg_vec,
+                Err(_) => return,
+            };
             STORE_WRITE_TASK_GEN_DURATION_HISTOGRAM.observe(duration_to_sec(loop_begin.elapsed()));
 
             let begin = UtilInstant::now();
+            loop {
+                for msg in msg_vec {
+                    match msg {
+                        AsyncWriteMsg::Shutdown => return,
+                        AsyncWriteMsg::WriteTask(task) => {
+                            self.batch.add_write_task(task);
+                        }
+                    }
+                }
+                if self.batch.get_raft_size() >= self.trigger_write_size {
+                    break;
+                }
+                msg_vec = match self.receiver.try_recv() {
+                    Ok(msg_vec) => msg_vec,
+                    Err(_) => break,
+                };
+            }
+            if self.batch.is_empty() {
+                continue;
+            }
+            STORE_WRITE_HANDLE_MSG_DURATION_HISTOGRAM.observe(duration_to_sec(begin.elapsed()));
+            STORE_WRITE_TIME_TRIGGER_SIZE_HISTOGRAM.observe(self.batch.get_raft_size() as f64);
+
+            self.sync_write();
+            assert!(self.batch.is_empty());
+
+            STORE_WRITE_LOOP_DURATION_HISTOGRAM
+                .observe(duration_to_sec(loop_begin.elapsed()) as f64);
+
+            /*let begin = UtilInstant::now();
             let len = self.receiver.len();
             for _ in 0..len {
                 msgs.push(self.receiver.try_recv().unwrap());
@@ -534,7 +563,7 @@ where
                     }
                 }
             }
-            STORE_WRITE_HANDLE_MSG_DURATION_HISTOGRAM.observe(duration_to_sec(begin.elapsed()));
+
 
             if !self.queue.has_task() {
                 continue;
@@ -553,57 +582,284 @@ where
             self.queue.push_back_done_task(task);
 
             STORE_WRITE_LOOP_DURATION_HISTOGRAM
-                .observe(duration_to_sec(loop_begin.elapsed()) as f64);
+                .observe(duration_to_sec(loop_begin.elapsed()) as f64);*/
         }
     }
 
-    fn sync_write(&mut self, batch: &mut AsyncWriteBatch<EK, ER>) {
-        batch.before_write_to_db();
+    fn sync_write(&mut self) {
+        self.batch.before_write_to_db();
 
         self.perf_context_statistics.start();
         fail_point!("raft_before_save");
-        if !batch.kv_wb.is_empty() {
+        if !self.batch.kv_wb.is_empty() {
             let now = UtilInstant::now();
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(true);
             self.kv_engine
-                .write_opt(&batch.kv_wb, &write_opts)
+                .write_opt(&self.batch.kv_wb, &write_opts)
                 .unwrap_or_else(|e| {
                     panic!("{} failed to write to kv engine: {:?}", self.tag, e);
                 });
-            if batch.kv_wb.data_size() > KV_WB_SHRINK_SIZE {
-                batch.kv_wb = self.kv_engine.write_batch_with_cap(4 * 1024);
+            if self.batch.kv_wb.data_size() > KV_WB_SHRINK_SIZE {
+                self.batch.kv_wb = self.kv_engine.write_batch_with_cap(32 * 1024);
             }
 
-            STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
+            STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
         }
-        batch.after_write_to_kv_db();
+        self.batch.after_write_to_kv_db();
         fail_point!("raft_between_save");
-        if !batch.raft_wb.is_empty() {
+
+        let write_size = self.batch.raft_wb.persist_size();
+        if !self.batch.raft_wb.is_empty() {
             fail_point!("raft_before_save_on_store_1", self.store_id == 1, |_| {});
             let now = UtilInstant::now();
             self.raft_engine
-                .consume_and_shrink(&mut batch.raft_wb, true, RAFT_WB_SHRINK_SIZE, 4 * 1024)
+                .consume_and_shrink(
+                    &mut self.batch.raft_wb,
+                    false,
+                    RAFT_WB_SHRINK_SIZE,
+                    128 * 1024,
+                )
                 .unwrap_or_else(|e| {
                     panic!("{} failed to write to raft engine: {:?}", self.tag, e);
                 });
 
-            STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
+            STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
         }
         report_perf_context!(
             self.perf_context_statistics,
             STORE_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
         );
-        batch.after_write_to_db();
+        self.batch.after_write_to_db();
 
+        let unsynced_readies = std::mem::take(&mut self.batch.unsynced_readies);
+        let mut messages = Vec::with_capacity(self.batch.tasks.len());
+        for task in &mut self.batch.tasks {
+            messages.push((std::mem::take(&mut task.messages), task.msg_seq_id));
+        }
+        let sync_task = SyncTask {
+            write_size,
+            unsynced_readies,
+            messages,
+        };
+        self.sync_sender.send(SyncMsg::Task(sync_task)).unwrap();
+
+        self.batch.clear();
+
+        fail_point!("raft_after_save");
+    }
+}
+
+pub struct AsyncWriters<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    workers: Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>>,
+    handlers: Vec<JoinHandle<()>>,
+    sync_sender: Option<Sender<SyncMsg>>,
+    sync_handler: Option<JoinHandle<()>>,
+}
+
+impl<EK, ER> AsyncWriters<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    pub fn new() -> Self {
+        Self {
+            workers: vec![],
+            handlers: vec![],
+            sync_sender: None,
+            sync_handler: None,
+        }
+    }
+
+    pub fn senders(&self) -> &Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>> {
+        &self.workers
+    }
+
+    pub fn spawn<T: Transport + 'static>(
+        &mut self,
+        store_id: u64,
+        kv_engine: &EK,
+        raft_engine: &ER,
+        router: &RaftRouter<EK, ER>,
+        trans: &T,
+        config: &Config,
+    ) -> Result<()> {
+        let (sync_tx, sync_rx) = channel();
+        self.sync_sender = Some(sync_tx.clone());
+        let mut syncer = Syncer::new(sync_rx, raft_engine, trans.clone(), router.clone(), config);
+        let t = thread::Builder::new()
+            .name(thd_name!("syncer"))
+            .spawn(move || {
+                syncer.run();
+            })?;
+        self.sync_handler = Some(t);
+        for i in 0..config.store_batch_system.io_pool_size {
+            let tag = format!("store-writer-{}", i);
+            let (tx, rx) = channel();
+            let mut worker = AsyncWriteWorker::new(
+                store_id,
+                tag.clone(),
+                kv_engine.clone(),
+                raft_engine.clone(),
+                rx,
+                sync_tx.clone(),
+                config,
+            );
+            let t = thread::Builder::new().name(thd_name!(tag)).spawn(move || {
+                worker.run();
+            })?;
+            self.workers.push(tx);
+            self.handlers.push(t);
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) {
+        assert_eq!(self.workers.len(), self.handlers.len());
+        for worker in &self.workers {
+            worker.send(vec![AsyncWriteMsg::Shutdown]).unwrap();
+        }
+        for handler in self.handlers.drain(..) {
+            handler.join().unwrap();
+        }
+        // Since worker thread may send msg to sync thread, worker thread should be shut down first
+        self.sync_sender
+            .take()
+            .unwrap()
+            .send(SyncMsg::Shutdown)
+            .unwrap();
+        self.sync_handler.take().unwrap().join().unwrap();
+    }
+}
+
+struct SyncTask {
+    write_size: usize,
+    unsynced_readies: HashMap<u64, UnsyncedReady>,
+    messages: Vec<(Vec<RaftMessage>, usize)>,
+}
+
+enum SyncMsg {
+    Task(SyncTask),
+    Shutdown,
+}
+
+struct Syncer<EK, ER, T>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+    T: Transport,
+{
+    receiver: Receiver<SyncMsg>,
+    raft_engine: ER,
+    trans: T,
+    router: RaftRouter<EK, ER>,
+    trigger_sync_adaptive_time_us: u64,
+    trigger_sync_time_us: u64,
+    trigger_sync_size: usize,
+}
+
+impl<EK, ER, T> Syncer<EK, ER, T>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+    T: Transport,
+{
+    fn new(
+        receiver: Receiver<SyncMsg>,
+        raft_engine: &ER,
+        trans: T,
+        router: RaftRouter<EK, ER>,
+        config: &Config,
+    ) -> Self {
+        Self {
+            receiver,
+            raft_engine: raft_engine.clone(),
+            trans,
+            router,
+            trigger_sync_adaptive_time_us: config.trigger_sync_adaptive_time_us,
+            trigger_sync_time_us: config.trigger_sync_time_us,
+            trigger_sync_size: config.trigger_sync_size.0 as usize,
+        }
+    }
+
+    fn run(&mut self) {
+        let mut msgs = vec![];
+        loop {
+            //let loop_begin = UtilInstant::now();
+
+            let mut msg = match self.receiver.recv() {
+                Ok(msg) => msg,
+                Err(_) => return,
+            };
+            let begin = UtilInstant::now();
+            let mut total_size = 0;
+
+            loop {
+                match msg {
+                    SyncMsg::Shutdown => return,
+                    SyncMsg::Task(task) => {
+                        total_size += task.write_size;
+                        msgs.push(task);
+                    }
+                }
+                if total_size >= self.trigger_sync_size {
+                    STORE_TRIGGER_SYNC_COUNT.size.inc_by(1);
+                    break;
+                }
+                if begin.elapsed() >= Duration::from_micros(self.trigger_sync_time_us) {
+                    STORE_TRIGGER_SYNC_COUNT.timeout.inc_by(1);
+                    break;
+                }
+                msg = match self
+                    .receiver
+                    .recv_timeout(Duration::from_micros(self.trigger_sync_adaptive_time_us))
+                {
+                    Ok(msg_vec) => msg_vec,
+                    Err(e) => {
+                        if e == RecvTimeoutError::Timeout {
+                            STORE_TRIGGER_SYNC_COUNT.adaptive_timeout.inc_by(1);
+                        }
+                        break;
+                    }
+                };
+            }
+
+            if msgs.is_empty() {
+                continue;
+            }
+
+            STORE_TRIGGER_SYNC_DURATION.observe(duration_to_sec(begin.elapsed()));
+            STORE_TRIGGER_SYNC_SIZE.observe(total_size as f64);
+            STORE_TRIGGER_SYNC_COUNT.total.inc_by(1);
+
+            let begin = UtilInstant::now();
+            self.raft_engine.sync().unwrap_or_else(|e| {
+                panic!("syncer failed to sync raft db: {:?}", e);
+            });
+            STORE_SYNC_DURATION.observe(duration_to_sec(begin.elapsed()));
+
+            let begin = UtilInstant::now();
+            for task in msgs.drain(..) {
+                self.after_sync(task);
+            }
+            STORE_AFTER_SYNC_DURATION.observe(duration_to_sec(begin.elapsed()));
+        }
+    }
+
+    fn after_sync(&mut self, mut task: SyncTask) {
         let send_begin = UtilInstant::now();
-        for task in &mut batch.tasks {
-            for msg in task.messages.drain(..) {
+        for msg_vec in &mut task.messages {
+            let seq_id = msg_vec.1;
+            for msg in msg_vec.0.drain(..) {
                 let region_id = msg.get_region_id();
                 let from_peer_id = msg.get_from_peer().get_id();
                 let to_peer_id = msg.get_to_peer().get_id();
                 let to_store_id = msg.get_to_peer().get_store_id();
-                if let Err(e) = self.trans.send(Some(task.msg_seq_id), msg) {
+                if let Err(e) = self.trans.send(Some(seq_id), msg) {
                     warn!(
                         "failed to send msg to other peer in async-writer";
                         "region_id" => region_id,
@@ -621,76 +877,9 @@ where
         STORE_WRITE_SEND_DURATION_HISTOGRAM.observe(duration_to_sec(send_begin.elapsed()));
 
         let callback_begin = UtilInstant::now();
-        for (region_id, r) in &batch.unsynced_readies {
+        for (region_id, r) in &task.unsynced_readies {
             r.flush(*region_id, &self.router);
         }
         STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(callback_begin.elapsed()));
-
-        fail_point!("raft_after_save");
-    }
-}
-
-pub struct AsyncWriters<EK, ER> 
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    writers: Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>>,
-    handlers: Vec<JoinHandle<()>>,
-}
-
-impl<EK, ER> AsyncWriters<EK, ER> 
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    pub fn new() -> Self {
-        Self {
-            writers: vec![],
-            handlers: vec![],
-        }
-    }
-
-    pub fn senders(&self) -> &Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>> {
-        &self.writers
-    }
-
-    pub fn spawn<T: Transport + 'static>(
-        &mut self,
-        store_id: u64,
-        kv_engine: &EK,
-        raft_engine: &ER,
-        router: &RaftRouter<EK, ER>,
-        trans: &T,
-        config: &Config,
-    ) -> Result<()> {
-        for i in 0..config.store_batch_system.io_pool_size {
-            let tag = format!("store-writer-{}", i);
-            let (tx, rx) = unbounded();
-            let mut worker = AsyncWriteWorker::new(
-                store_id,
-                tag.clone(),
-                kv_engine.clone(),
-                raft_engine.clone(),
-                router.clone(),
-                rx,
-                trans.clone(),
-                config,
-            );
-            let t = thread::Builder::new().name(thd_name!(tag)).spawn(move || {
-                worker.run();
-            })?;
-            self.writers.push(tx);
-            self.handlers.push(t);
-        }
-        Ok(())
-    }
-
-    pub fn shutdown(&mut self) {
-        assert_eq!(self.writers.len(), self.handlers.len());
-        for (i, handler) in self.handlers.drain(..).enumerate() {
-            self.writers[i].send(vec![AsyncWriteMsg::Shutdown]).unwrap();
-            handler.join().unwrap();
-        }
     }
 }
