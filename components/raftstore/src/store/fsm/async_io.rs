@@ -1,8 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::marker::PhantomData;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::{collections::VecDeque, time::Instant};
 
@@ -15,6 +14,7 @@ use crate::store::util::PerfContextStatistics;
 use crate::store::PeerMsg;
 use crate::{observe_perf_context_type, report_perf_context, Result};
 
+use crossbeam::channel::{unbounded, Receiver as CBReceiver, RecvTimeoutError, Sender as CBSender};
 use engine_rocks::{PerfContext, PerfLevel};
 use engine_traits::{KvEngine, Mutable, RaftEngine, RaftLogBatch, WriteBatch, WriteOptions};
 use error_code::ErrorCodeExt;
@@ -455,7 +455,7 @@ where
     kv_engine: EK,
     raft_engine: ER,
     receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
-    sync_sender: Sender<SyncMsg>,
+    sync_sender: CBSender<SyncMsg>,
     //queue: AsyncWriteAdaptiveQueue<EK, ER>,
     batch: AsyncWriteBatch<EK, ER>,
     perf_context_statistics: PerfContextStatistics,
@@ -474,7 +474,7 @@ where
         kv_engine: EK,
         raft_engine: ER,
         receiver: Receiver<Vec<AsyncWriteMsg<EK, ER>>>,
-        sync_sender: Sender<SyncMsg>,
+        sync_sender: CBSender<SyncMsg>,
         config: &Config,
     ) -> Self {
         /*let queue = AsyncWriteAdaptiveQueue::new(
@@ -657,7 +657,7 @@ where
 {
     workers: Vec<Sender<Vec<AsyncWriteMsg<EK, ER>>>>,
     handlers: Vec<JoinHandle<()>>,
-    sync_sender: Option<Sender<SyncMsg>>,
+    sync_sender: Option<CBSender<SyncMsg>>,
     sync_handler: Option<JoinHandle<()>>,
 }
 
@@ -688,7 +688,7 @@ where
         trans: &T,
         config: &Config,
     ) -> Result<()> {
-        let (sync_tx, sync_rx) = channel();
+        let (sync_tx, sync_rx) = unbounded();
         self.sync_sender = Some(sync_tx.clone());
         let mut syncer = Syncer::new(sync_rx, raft_engine, trans.clone(), router.clone(), config);
         let t = thread::Builder::new()
@@ -753,7 +753,7 @@ where
     ER: RaftEngine,
     T: Transport,
 {
-    receiver: Receiver<SyncMsg>,
+    receiver: CBReceiver<SyncMsg>,
     raft_engine: ER,
     trans: T,
     router: RaftRouter<EK, ER>,
@@ -769,7 +769,7 @@ where
     T: Transport,
 {
     fn new(
-        receiver: Receiver<SyncMsg>,
+        receiver: CBReceiver<SyncMsg>,
         raft_engine: &ER,
         trans: T,
         router: RaftRouter<EK, ER>,
