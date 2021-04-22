@@ -28,6 +28,8 @@ with_prefix!(prefix_store "store-");
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     #[config(skip)]
+    pub trigger_ready_size: ReadableSize,
+    #[config(skip)]
     pub trigger_sync_adaptive_time_us: u64,
     #[config(skip)]
     pub trigger_sync_time_us: u64,
@@ -210,6 +212,7 @@ impl Default for Config {
     fn default() -> Config {
         let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         Config {
+            trigger_ready_size: ReadableSize::kb(8),
             trigger_sync_adaptive_time_us: 50,
             trigger_sync_time_us: 1000,
             trigger_sync_size: ReadableSize::kb(128),

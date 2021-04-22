@@ -3112,7 +3112,7 @@ dependencies = [
 [[package]]
 name = "raft"
 version = "0.6.0-alpha"
-source = "git+https://github.com/gengliqi/raft-rs?branch=get-msg-early#2ac59b8b75dc208e3484dcf3eb2bc9314520b368"
+source = "git+https://github.com/gengliqi/raft-rs?branch=get-msg-early#f39df512c79f74f6b3bf156d1cd1625bc3dce681"
 dependencies = [
  "fxhash",
  "getset",
@@ -3144,7 +3144,7 @@ dependencies = [
 [[package]]
 name = "raft-proto"
 version = "0.6.0-alpha"
-source = "git+https://github.com/gengliqi/raft-rs?branch=get-msg-early#2ac59b8b75dc208e3484dcf3eb2bc9314520b368"
+source = "git+https://github.com/gengliqi/raft-rs?branch=get-msg-early#f39df512c79f74f6b3bf156d1cd1625bc3dce681"
 dependencies = [
  "lazy_static",
  "prost 0.7.0",

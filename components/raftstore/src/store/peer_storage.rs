@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{cmp, error, u64};
@@ -1055,10 +1055,6 @@ where
             cache.append(&self.tag, &entries);
         }
 
-        task.size += entries
-            .iter()
-            .map(|e| e.compute_size() as usize)
-            .sum::<usize>();
         task.entries = entries;
         task.cut_logs = Some((last_index + 1, prev_last_index));
 
@@ -1410,6 +1406,7 @@ where
         let mut write_task = AsyncWriteTask::new(region_id);
 
         if !ready.entries().is_empty() {
+            write_task.size += ready.entries_size();
             self.append(&mut ctx, ready.take_entries(), &mut write_task);
         }
 
@@ -1457,8 +1454,7 @@ where
             if let Err(e) = sender.send(AsyncWriteMsg::WriteTask(write_task)) {
                 panic!("{} failed to send write msg, err: {:?}", self.tag, e);
             }
-            STORE_SEND_WRITE_DURATION_HISTOGRAM
-                .observe(duration_to_sec(now.elapsed()) as f64);
+            STORE_SEND_WRITE_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
         }
 
         Ok(ctx)
