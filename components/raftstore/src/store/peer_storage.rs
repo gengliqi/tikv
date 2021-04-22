@@ -1451,6 +1451,7 @@ where
         write_task.msg_seq_id = msg_seq_id;
 
         if !write_task.is_empty() {
+            STORE_SEND_WRITE_SIZE.observe(write_task.size as f64);
             let now = Instant::now();
             let sender = ready_ctx.async_write_sender(async_writer_id);
             if let Err(e) = sender.send(AsyncWriteMsg::WriteTask(write_task)) {

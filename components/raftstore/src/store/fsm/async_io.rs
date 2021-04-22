@@ -852,10 +852,13 @@ where
                 match msg {
                     SyncMsg::Shutdown => return,
                     SyncMsg::Task(task) => {
+                        total_size += task.write_size;
                         self.after_sync(task);
                     }
                 }
             }
+            STORE_REALLY_SYNC_SIZE.observe(total_size as f64);
+            self.trans.flush();
             STORE_AFTER_SYNC_DURATION.observe(duration_to_sec(begin.elapsed()));
         }
     }
@@ -883,7 +886,7 @@ where
                 }
             }
         }
-        self.trans.flush();
+        self.trans.try_flush();
         STORE_WRITE_SEND_DURATION_HISTOGRAM.observe(duration_to_sec(send_begin.elapsed()));
 
         let callback_begin = UtilInstant::now();

@@ -191,6 +191,12 @@ make_auto_flush_static_metric! {
 }
 
 lazy_static! {
+    pub static ref STORE_REALLY_SYNC_SIZE: Histogram =
+        register_histogram!(
+            "tikv_raftstore_really_sync_size",
+            "TODO",
+            exponential_buckets(0.5, 2.0, 20).unwrap()
+        ).unwrap();
     pub static ref STORE_AFTER_SYNC_DURATION: Histogram =
         register_histogram!(
             "tikv_raftstore_raftdb_after_sync_duration_secs",
@@ -223,7 +229,12 @@ lazy_static! {
         ).unwrap();
     pub static ref STORE_TRIGGER_SYNC_COUNT: RaftTriggerSyncVec =
         auto_flush_from!(STORE_TRIGGER_SYNC_COUNT_VEC, RaftTriggerSyncVec);
-
+    pub static ref STORE_SEND_WRITE_SIZE: Histogram =
+        register_histogram!(
+            "tikv_raftstore_send_write_size",
+            "TODO",
+            exponential_buckets(0.5, 2.0, 20).unwrap()
+        ).unwrap();
     pub static ref STORE_SEND_WRITE_DURATION_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_store_send_write_duration_secs",
