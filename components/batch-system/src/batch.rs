@@ -310,10 +310,12 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 let len = self.handler.handle_normal(p);
                 if p.is_stopped() {
                     reschedule_fsms.push((i, ReschedulePolicy::Remove));
+                } else if !p.async_io_stopped() {
+                    // Do nothing
                 } else if p.get_priority() != self.handler.get_priority() {
                     reschedule_fsms.push((i, ReschedulePolicy::Schedule));
                 } else {
-                    if batch.timers[i].elapsed() >= self.reschedule_duration {
+                    /*if batch.timers[i].elapsed() >= self.reschedule_duration {
                         hot_fsm_count += 1;
                         // We should only reschedule a half of the hot regions, otherwise,
                         // it's possible all the hot regions are fetched in a batch the
@@ -322,7 +324,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                             reschedule_fsms.push((i, ReschedulePolicy::Schedule));
                             continue;
                         }
-                    }
+                    }*/
                     if let Some(l) = len {
                         reschedule_fsms.push((i, ReschedulePolicy::Release(l)));
                     }
@@ -342,6 +344,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
                 if batch.normals[fsm_cnt].is_stopped() {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Remove));
+                } else if !batch.normals[fsm_cnt].async_io_stopped() {
+                    // Do nothing
                 } else if let Some(l) = len {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
                 }
@@ -367,7 +371,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 pub trait HandlerBuilder<N, C> {
     type Handler: PollHandler<N, C>;
 
-    fn build(&mut self, priority: Priority) -> Self::Handler;
+    fn build(&mut self, id: usize, priority: Priority) -> Self::Handler;
 }
 
 /// A system that can poll FSMs concurrently and in batch.
@@ -396,12 +400,12 @@ where
         &self.router
     }
 
-    fn start_poller<B>(&mut self, name: String, priority: Priority, builder: &mut B)
+    fn start_poller<B>(&mut self, id: usize, name: String, priority: Priority, builder: &mut B)
     where
         B: HandlerBuilder<N, C>,
         B::Handler: Send + 'static,
     {
-        let handler = builder.build(priority);
+        let handler = builder.build(id, priority);
         let receiver = match priority {
             Priority::Normal => self.receiver.clone(),
             Priority::Low => self.low_receiver.clone(),
@@ -433,6 +437,7 @@ where
     {
         for i in 0..self.pool_size {
             self.start_poller(
+                i,
                 thd_name!(format!("{}-{}", name_prefix, i)),
                 Priority::Normal,
                 &mut builder,
@@ -440,6 +445,7 @@ where
         }
         for i in 0..self.low_priority_pool_size {
             self.start_poller(
+                i,
                 thd_name!(format!("{}-low-{}", name_prefix, i)),
                 Priority::Low,
                 &mut builder,

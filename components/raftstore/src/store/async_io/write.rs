@@ -1,6 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -175,7 +176,7 @@ where
 }
 
 /// AsyncWriteBatch is used for combining several AsyncWriteTask into one.
-struct AsyncWriteBatch<EK, ER>
+pub struct AsyncWriteBatch<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
@@ -211,7 +212,7 @@ where
     }
 
     /// Add write task to this batch
-    fn add_write_task(&mut self, mut task: AsyncWriteTask<EK, ER>) {
+    pub fn add_write_task(&mut self, mut task: AsyncWriteTask<EK, ER>) {
         if let Err(e) = task.valid() {
             panic!("task is not valid: {:?}", e);
         }
@@ -239,6 +240,10 @@ where
             }
         }
         self.tasks.push(task);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
     }
 
     fn clear(&mut self) {
@@ -299,6 +304,59 @@ where
     }
 }
 
+pub struct AsyncFlipWriteBatch<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    flip: bool,
+    batchs: [Option<AsyncWriteBatch<EK, ER>>; 2],
+    stopped: bool,
+}
+
+impl<EK, ER> AsyncFlipWriteBatch<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    fn new(kv_engine: &EK, raft_engine: &ER, waterfall_metrics: bool) -> Self {
+        Self {
+            flip: false,
+            batchs: [
+                Some(AsyncWriteBatch::new(
+                    kv_engine.write_batch(),
+                    raft_engine.log_batch(256 * 1024),
+                    waterfall_metrics,
+                )),
+                Some(AsyncWriteBatch::new(
+                    kv_engine.write_batch(),
+                    raft_engine.log_batch(256 * 1024),
+                    waterfall_metrics,
+                )),
+            ],
+            stopped: false,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batchs[self.flip as usize].as_ref().unwrap().is_empty()
+    }
+
+    pub fn get(&mut self) -> &mut AsyncWriteBatch<EK, ER> {
+        self.batchs[self.flip as usize].as_mut().unwrap()
+    }
+
+    fn flip(&mut self) -> AsyncWriteBatch<EK, ER> {
+        self.flip = !self.flip;
+        self.batchs[!self.flip as usize].take().unwrap()
+    }
+
+    fn bring_back(&mut self, batch: AsyncWriteBatch<EK, ER>) {
+        assert!(self.batchs[!self.flip as usize].is_none());
+        self.batchs[!self.flip as usize] = Some(batch);
+    }
+}
+
 #[allow(dead_code)]
 struct AsyncWriteWorker<EK, ER, T, N>
 where
@@ -311,10 +369,9 @@ where
     tag: String,
     kv_engine: EK,
     raft_engine: ER,
-    receiver: Receiver<AsyncWriteMsg<EK, ER>>,
     notifier: N,
     trans: T,
-    wb: AsyncWriteBatch<EK, ER>,
+    flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
     raft_write_size_limit: usize,
     message_metrics: RaftSendMessageMetrics,
     perf_context: EK::PerfContext,
@@ -332,16 +389,11 @@ where
         tag: String,
         kv_engine: EK,
         raft_engine: ER,
-        receiver: Receiver<AsyncWriteMsg<EK, ER>>,
         notifier: N,
         trans: T,
+        flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
         config: &Config,
     ) -> Self {
-        let wb = AsyncWriteBatch::new(
-            kv_engine.write_batch(),
-            raft_engine.log_batch(16 * 1024),
-            config.store_waterfall_metrics,
-        );
         let perf_context =
             kv_engine.get_perf_context(config.perf_level, PerfContextKind::RaftstoreStore);
         Self {
@@ -349,10 +401,9 @@ where
             tag,
             kv_engine,
             raft_engine,
-            receiver,
             notifier,
             trans,
-            wb,
+            flip_wb,
             raft_write_size_limit: config.raft_write_size_limit.0 as usize,
             message_metrics: Default::default(),
             perf_context,
@@ -360,6 +411,28 @@ where
     }
 
     fn run(&mut self) {
+        loop {
+            let mut flip_wb = self.flip_wb.0.lock().unwrap();
+            while !flip_wb.is_empty() && !flip_wb.stopped {
+                flip_wb = self.flip_wb.1.wait(flip_wb).unwrap();
+            }
+            if flip_wb.stopped {
+                break;
+            }
+            let mut wb = flip_wb.flip();
+            drop(flip_wb);
+            STORE_WRITE_TRIGGER_SIZE_HISTOGRAM.observe(wb.get_raft_size() as f64);
+
+            self.sync_write(&mut wb);
+
+            {
+                let mut flip_wb = self.flip_wb.0.lock().unwrap();
+                flip_wb.bring_back(wb);
+            }
+        }
+    }
+
+    /*fn run(&mut self) {
         let mut stopped = false;
         while !stopped {
             let loop_begin = Instant::now();
@@ -411,40 +484,40 @@ where
             STORE_WRITE_LOOP_DURATION_HISTOGRAM
                 .observe(duration_to_sec(handle_begin.elapsed()) as f64);
         }
-    }
+    }*/
 
-    fn sync_write(&mut self) {
+    fn sync_write(&mut self, wb: &mut AsyncWriteBatch<EK, ER>) {
         let mut now = Instant::now();
-        self.wb.before_write_to_db(now);
+        wb.before_write_to_db(now);
 
         fail_point!("raft_before_save");
 
-        if !self.wb.kv_wb.is_empty() {
+        if !wb.kv_wb.is_empty() {
             let now = Instant::now();
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(true);
-            self.wb.kv_wb.write_opt(&write_opts).unwrap_or_else(|e| {
+            wb.kv_wb.write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("{} failed to write to kv engine: {:?}", self.tag, e);
             });
-            if self.wb.kv_wb.data_size() > KV_WB_SHRINK_SIZE {
-                self.wb.kv_wb = self.kv_engine.write_batch_with_cap(4 * 1024);
+            if wb.kv_wb.data_size() > KV_WB_SHRINK_SIZE {
+                wb.kv_wb = self.kv_engine.write_batch_with_cap(4 * 1024);
             }
 
             STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
         }
 
         now = Instant::now();
-        self.wb.after_write_to_kv_db(now);
+        wb.after_write_to_kv_db(now);
 
         fail_point!("raft_between_save");
 
-        if !self.wb.raft_wb.is_empty() {
+        if !wb.raft_wb.is_empty() {
             fail_point!("raft_before_save_on_store_1", self.store_id == 1, |_| {});
 
             self.perf_context.start_observe();
             let now = Instant::now();
             self.raft_engine
-                .consume_and_shrink(&mut self.wb.raft_wb, true, RAFT_WB_SHRINK_SIZE, 16 * 1024)
+                .consume_and_shrink(&mut wb.raft_wb, true, RAFT_WB_SHRINK_SIZE, 16 * 1024)
                 .unwrap_or_else(|e| {
                     panic!("{} failed to write to raft engine: {:?}", self.tag, e);
                 });
@@ -454,13 +527,13 @@ where
         }
 
         now = Instant::now();
-        self.wb.after_write_to_db(now);
+        wb.after_write_to_db(now);
 
         fail_point!("raft_before_follower_send");
 
         now = Instant::now();
         let mut unreachable_peers = HashSet::default();
-        for task in &mut self.wb.tasks {
+        for task in &mut wb.tasks {
             for msg in task.messages.drain(..) {
                 let msg_type = msg.get_message().get_msg_type();
                 let to_peer_id = msg.get_to_peer().get_id();
@@ -495,14 +568,14 @@ where
         STORE_WRITE_SEND_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
 
         now = Instant::now();
-        for (region_id, (peer_id, ready_number)) in &self.wb.readies {
+        for (region_id, (peer_id, ready_number)) in &wb.readies {
             self.notifier
                 .notify_persisted(*region_id, *peer_id, *ready_number, now);
         }
         STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
 
-        self.wb.flush_metrics();
-        self.wb.clear();
+        wb.flush_metrics();
+        wb.clear();
 
         fail_point!("raft_after_save");
     }
@@ -513,7 +586,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    writers: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    flip_wbs: Vec<Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>>,
     handlers: Vec<JoinHandle<()>>,
 }
 
@@ -524,13 +597,13 @@ where
 {
     pub fn new() -> Self {
         Self {
-            writers: vec![],
+            flip_wbs: vec![],
             handlers: vec![],
         }
     }
 
-    pub fn senders(&self) -> &Vec<Sender<AsyncWriteMsg<EK, ER>>> {
-        &self.writers
+    pub fn flip_wbs(&self) -> &Vec<Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>> {
+        &self.flip_wbs
     }
 
     pub fn spawn<T: Transport + 'static, N: Notifier>(
@@ -542,32 +615,43 @@ where
         trans: &T,
         config: &Config,
     ) -> Result<()> {
-        for i in 0..config.store_io_pool_size {
+        for i in 0..config.store_batch_system.pool_size {
             let tag = format!("store-writer-{}", i);
-            let (tx, rx) = channel();
+            let flip_wb = Arc::new((
+                Mutex::new(AsyncFlipWriteBatch::new(
+                    kv_engine,
+                    raft_engine,
+                    config.store_waterfall_metrics,
+                )),
+                Condvar::new(),
+            ));
             let mut worker = AsyncWriteWorker::new(
                 store_id,
                 tag.clone(),
                 kv_engine.clone(),
                 raft_engine.clone(),
-                rx,
                 notifier.clone(),
                 trans.clone(),
+                flip_wb.clone(),
                 config,
             );
             let t = thread::Builder::new().name(thd_name!(tag)).spawn(move || {
                 worker.run();
             })?;
-            self.writers.push(tx);
+            self.flip_wbs.push(flip_wb);
             self.handlers.push(t);
         }
         Ok(())
     }
 
     pub fn shutdown(&mut self) {
-        assert_eq!(self.writers.len(), self.handlers.len());
+        assert_eq!(self.flip_wbs.len(), self.handlers.len());
         for (i, handler) in self.handlers.drain(..).enumerate() {
-            self.writers[i].send(AsyncWriteMsg::Shutdown).unwrap();
+            {
+                let mut flip_wb = self.flip_wbs[i].0.lock().unwrap();
+                flip_wb.stopped = true;
+                self.flip_wbs[i].1.notify_one();
+            }
             handler.join().unwrap();
         }
     }

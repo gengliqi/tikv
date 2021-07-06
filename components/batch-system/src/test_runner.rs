@@ -140,7 +140,7 @@ impl Builder {
 impl HandlerBuilder<Runner, Runner> for Builder {
     type Handler = Handler;
 
-    fn build(&mut self, priority: Priority) -> Handler {
+    fn build(&mut self, _id: usize, priority: Priority) -> Handler {
         Handler {
             local: HandleMetrics::default(),
             metrics: self.metrics.clone(),

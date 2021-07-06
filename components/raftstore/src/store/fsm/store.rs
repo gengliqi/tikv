@@ -6,7 +6,7 @@ use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::u64;
 
@@ -85,7 +85,7 @@ pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 const ENTRY_CACHE_EVICT_TICK_DURATION: Duration = Duration::from_secs(1);
 
-use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriters};
+use crate::store::async_io::write::{AsyncFlipWriteBatch, AsyncWriteMsg, AsyncWriters};
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -381,7 +381,7 @@ where
     pub perf_context: EK::PerfContext,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
-    pub async_write_senders: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    pub async_flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
     pub is_disk_full: bool,
 }
 
@@ -836,7 +836,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     pub engines: Engines<EK, ER>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     feature_gate: FeatureGate,
-    async_write_senders: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    async_flip_wbs: Vec<Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1015,7 +1015,7 @@ where
 {
     type Handler = RaftPoller<EK, ER, T>;
 
-    fn build(&mut self, _: Priority) -> RaftPoller<EK, ER, T> {
+    fn build(&mut self, id: usize, _: Priority) -> RaftPoller<EK, ER, T> {
         let mut ctx = PollContext {
             cfg: self.cfg.value().clone(),
             store: self.store.clone(),
@@ -1051,7 +1051,7 @@ where
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
             feature_gate: self.feature_gate.clone(),
-            async_write_senders: self.async_write_senders.clone(),
+            async_flip_wb: self.async_flip_wbs[id].clone(),
             is_disk_full: false,
         };
         ctx.update_ticks_timeout();
@@ -1200,7 +1200,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             store_meta,
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             feature_gate: pd_client.feature_gate().clone(),
-            async_write_senders: self.async_writers.senders().clone(),
+            async_flip_wbs: self.async_writers.flip_wbs().clone(),
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();

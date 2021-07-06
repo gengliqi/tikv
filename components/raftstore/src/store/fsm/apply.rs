@@ -3772,7 +3772,7 @@ where
 {
     type Handler = ApplyPoller<EK, W>;
 
-    fn build(&mut self, priority: Priority) -> ApplyPoller<EK, W> {
+    fn build(&mut self, _id: usize, priority: Priority) -> ApplyPoller<EK, W> {
         let cfg = self.cfg.value();
         ApplyPoller {
             msg_buf: Vec::with_capacity(cfg.messages_per_tick),

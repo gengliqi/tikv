@@ -1975,10 +1975,9 @@ where
         }
 
         let has_new_entries = !ready.entries().is_empty();
-        let async_write_sender = &ctx.async_write_senders[self.async_writer_id];
         let ready_res = match self.mut_store().handle_raft_ready(
             &mut ready,
-            async_write_sender,
+            &ctx.async_flip_wb,
             destroy_regions,
             persisted_msgs,
             proposal_times,

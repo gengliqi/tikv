@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{cmp, error, mem, u64};
 
@@ -33,6 +33,7 @@ use tikv_alloc::trace::TraceEvent;
 use tikv_util::worker::Scheduler;
 use tikv_util::{box_err, box_try, debug, defer, error, info, warn};
 
+use super::async_io::write::AsyncFlipWriteBatch;
 use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
@@ -1468,7 +1469,7 @@ where
     pub fn handle_raft_ready(
         &mut self,
         ready: &mut Ready,
-        async_write_sender: &Sender<AsyncWriteMsg<EK, ER>>,
+        async_flip_wb: &Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
         destroy_regions: Vec<metapb::Region>,
         mut msgs: Vec<RaftMessage>,
         proposal_times: Vec<Instant>,
@@ -1543,10 +1544,11 @@ where
 
         if write_task.has_data() {
             write_task.messages = msgs;
-            if let Err(e) = async_write_sender.send(AsyncWriteMsg::WriteTask(write_task)) {
-                // IO threads are destroyed after store threads during shutdown.
-                panic!("{} failed to send write msg, err: {:?}", self.tag, e);
-            }
+            let mut flip_wb = async_flip_wb.0.lock().unwrap();
+            let mut wb = flip_wb.get();
+            wb.add_write_task(write_task);
+            drop(flip_wb);
+            async_flip_wb.1.notify_one();
         } else {
             res = HandleReadyResult::NoIOTask { msgs };
         }

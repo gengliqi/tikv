@@ -499,6 +499,10 @@ where
 {
     type Message = PeerMsg<EK>;
 
+    fn async_io_stopped(&self) -> bool {
+        !self.peer.has_unpersisted_ready()
+    }
+
     #[inline]
     fn is_stopped(&self) -> bool {
         self.stopped
