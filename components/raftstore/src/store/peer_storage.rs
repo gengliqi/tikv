@@ -1545,7 +1545,7 @@ where
         if write_task.has_data() {
             write_task.messages = msgs;
             let mut flip_wb = async_flip_wb.0.lock().unwrap();
-            let mut wb = flip_wb.get();
+            let wb = flip_wb.get();
             wb.add_write_task(write_task);
             drop(flip_wb);
             async_flip_wb.1.notify_one();

@@ -413,7 +413,7 @@ where
     fn run(&mut self) {
         loop {
             let mut flip_wb = self.flip_wb.0.lock().unwrap();
-            while !flip_wb.is_empty() && !flip_wb.stopped {
+            while flip_wb.is_empty() && !flip_wb.stopped {
                 flip_wb = self.flip_wb.1.wait(flip_wb).unwrap();
             }
             if flip_wb.stopped {
