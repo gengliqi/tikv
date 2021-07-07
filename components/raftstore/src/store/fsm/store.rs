@@ -759,7 +759,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             |_| unreachable!()
         );
 
-        let len = std::cmp::min(len, self.messages_per_tick);
+        let len = std::cmp::min(len, self.messages_per_tick) + 1;
         while self.peer_msg_buf.len() < len {
             match peer.receiver.try_recv() {
                 // TODO: we may need a way to optimize the message copy.

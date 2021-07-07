@@ -3695,7 +3695,7 @@ where
             normal.delegate.id() == 1003,
             |_| { None }
         );
-        let len = cmp::min(len, self.messages_per_tick);
+        let len = cmp::min(len, self.messages_per_tick) + 1;
         while self.msg_buf.len() < len {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
