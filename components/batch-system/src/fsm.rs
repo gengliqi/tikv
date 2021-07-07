@@ -35,10 +35,6 @@ pub trait FsmScheduler {
 pub trait Fsm {
     type Message: Send;
 
-    fn async_io_stopped(&self) -> bool {
-        true
-    }
-
     fn is_stopped(&self) -> bool;
 
     /// Set a mailbox to Fsm, which should be used to send message to itself.
@@ -58,6 +54,10 @@ pub trait Fsm {
 
     fn get_priority(&self) -> Priority {
         Priority::Normal
+    }
+
+    fn get_id(&self) -> usize {
+        0
     }
 }
 

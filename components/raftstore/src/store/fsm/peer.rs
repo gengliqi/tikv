@@ -499,10 +499,6 @@ where
 {
     type Message = PeerMsg<EK>;
 
-    fn async_io_stopped(&self) -> bool {
-        !self.peer.has_unpersisted_ready()
-    }
-
     #[inline]
     fn is_stopped(&self) -> bool {
         self.stopped
@@ -525,6 +521,11 @@ where
         Self: Sized,
     {
         self.mailbox.take()
+    }
+
+    #[inline]
+    fn get_id(&self) -> usize {
+        seahash::hash(self.region_id().as_ne_bytes()) as usize
     }
 }
 

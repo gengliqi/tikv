@@ -523,6 +523,11 @@ where
     fn is_stopped(&self) -> bool {
         self.store.stopped
     }
+
+    #[inline]
+    fn get_id(&self) -> usize {
+        rand::random()
+    }
 }
 
 struct StoreFsmDelegate<'a, EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'static> {

@@ -32,7 +32,7 @@ enum FsmTypes<N, C> {
 macro_rules! impl_sched {
     ($name:ident, $ty:path, Fsm = $fsm:tt) => {
         pub struct $name<N, C> {
-            sender: channel::Sender<FsmTypes<N, C>>,
+            senders: Vec<channel::Sender<FsmTypes<N, C>>>,
             low_sender: channel::Sender<FsmTypes<N, C>>,
         }
 
@@ -40,7 +40,7 @@ macro_rules! impl_sched {
             #[inline]
             fn clone(&self) -> $name<N, C> {
                 $name {
-                    sender: self.sender.clone(),
+                    senders: self.senders.clone(),
                     low_sender: self.low_sender.clone(),
                 }
             }
@@ -55,7 +55,7 @@ macro_rules! impl_sched {
             #[inline]
             fn schedule(&self, fsm: Box<Self::Fsm>) {
                 let sender = match fsm.get_priority() {
-                    Priority::Normal => &self.sender,
+                    Priority::Normal => &self.senders[fsm.get_id() % self.senders.len()],
                     Priority::Low => &self.low_sender,
                 };
                 match sender.send($ty(fsm)) {
@@ -70,7 +70,9 @@ macro_rules! impl_sched {
                 // TODO: close it explicitly once it's supported.
                 // Magic number, actually any number greater than poll pool size works.
                 for _ in 0..100 {
-                    let _ = self.sender.send(FsmTypes::Empty);
+                    for s in &self.senders {
+                        let _ = s.send(FsmTypes::Empty);
+                    }
                     let _ = self.low_sender.send(FsmTypes::Empty);
                 }
             }
@@ -310,8 +312,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 let len = self.handler.handle_normal(p);
                 if p.is_stopped() {
                     reschedule_fsms.push((i, ReschedulePolicy::Remove));
-                } else if !p.async_io_stopped() {
-                    // Do nothing
                 } else if p.get_priority() != self.handler.get_priority() {
                     reschedule_fsms.push((i, ReschedulePolicy::Schedule));
                 } else {
@@ -344,8 +344,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
                 if batch.normals[fsm_cnt].is_stopped() {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Remove));
-                } else if !batch.normals[fsm_cnt].async_io_stopped() {
-                    // Do nothing
                 } else if let Some(l) = len {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
                 }
@@ -382,7 +380,7 @@ pub trait HandlerBuilder<N, C> {
 pub struct BatchSystem<N: Fsm, C: Fsm> {
     name_prefix: Option<String>,
     router: BatchRouter<N, C>,
-    receiver: channel::Receiver<FsmTypes<N, C>>,
+    receivers: Vec<channel::Receiver<FsmTypes<N, C>>>,
     low_receiver: channel::Receiver<FsmTypes<N, C>>,
     pool_size: usize,
     max_batch_size: usize,
@@ -407,7 +405,7 @@ where
     {
         let handler = builder.build(id, priority);
         let receiver = match priority {
-            Priority::Normal => self.receiver.clone(),
+            Priority::Normal => self.receivers[id].clone(),
             Priority::Low => self.low_receiver.clone(),
         };
         let mut poller = Poller {
@@ -489,22 +487,28 @@ pub fn create_system<N: Fsm, C: Fsm>(
 ) -> (BatchRouter<N, C>, BatchSystem<N, C>) {
     let state_cnt = Arc::new(AtomicUsize::new(0));
     let control_box = BasicMailbox::new(sender, controller, state_cnt.clone());
+    let mut senders = Vec::with_capacity(cfg.pool_size);
+    let mut receivers = Vec::with_capacity(cfg.pool_size);
+    for _ in 0..cfg.pool_size {
+        let (tx, rx) = channel::unbounded();
+        senders.push(tx);
+        receivers.push(rx);
+    }
     let (tx, rx) = channel::unbounded();
-    let (tx2, rx2) = channel::unbounded();
     let normal_scheduler = NormalScheduler {
-        sender: tx.clone(),
-        low_sender: tx2.clone(),
+        senders: senders.clone(),
+        low_sender: tx.clone(),
     };
     let control_scheduler = ControlScheduler {
-        sender: tx,
-        low_sender: tx2,
+        senders,
+        low_sender: tx,
     };
     let router = Router::new(control_box, normal_scheduler, control_scheduler, state_cnt);
     let system = BatchSystem {
         name_prefix: None,
         router: router.clone(),
-        receiver: rx,
-        low_receiver: rx2,
+        receivers,
+        low_receiver: rx,
         pool_size: cfg.pool_size,
         max_batch_size: cfg.max_batch_size(),
         reschedule_duration: cfg.reschedule_duration.0,

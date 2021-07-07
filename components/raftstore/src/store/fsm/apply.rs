@@ -3582,6 +3582,11 @@ where
     fn get_priority(&self) -> Priority {
         self.delegate.priority
     }
+
+    #[inline]
+    fn get_id(&self) -> usize {
+        seahash::hash(self.delegate.region_id().as_ne_bytes()) as usize
+    }
 }
 
 impl<EK> Drop for ApplyFsm<EK>
