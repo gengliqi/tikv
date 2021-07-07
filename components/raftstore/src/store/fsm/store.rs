@@ -744,7 +744,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         expected_msg_count
     }
 
-    fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>) -> Option<usize> {
+    fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>, len: usize) -> Option<usize> {
         let mut expected_msg_count = None;
 
         fail_point!(
@@ -759,7 +759,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             |_| unreachable!()
         );
 
-        while self.peer_msg_buf.len() < self.messages_per_tick {
+        let len = std::cmp::min(len, self.messages_per_tick);
+        while self.peer_msg_buf.len() < len {
             match peer.receiver.try_recv() {
                 // TODO: we may need a way to optimize the message copy.
                 Ok(msg) => {

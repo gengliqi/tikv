@@ -46,6 +46,10 @@ impl Fsm for Runner {
     fn get_priority(&self) -> Priority {
         self.priority
     }
+
+    fn get_len(&self) -> usize {
+        recv.len()
+    }
 }
 
 impl Runner {
@@ -113,7 +117,7 @@ impl PollHandler<Runner, Runner> for Handler {
         self.handle(control)
     }
 
-    fn handle_normal(&mut self, normal: &mut Runner) -> Option<usize> {
+    fn handle_normal(&mut self, normal: &mut Runner, _len: usize) -> Option<usize> {
         self.local.normal += 1;
         self.handle(normal)
     }

@@ -527,6 +527,11 @@ where
     fn get_id(&self) -> usize {
         seahash::hash(self.region_id().as_ne_bytes()) as usize
     }
+
+    #[inline]
+    fn get_len(&self) -> usize {
+        self.receiver.len()
+    }
 }
 
 pub struct PeerFsmDelegate<'a, EK, ER, T: 'static>

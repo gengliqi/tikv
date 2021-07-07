@@ -3587,6 +3587,11 @@ where
     fn get_id(&self) -> usize {
         seahash::hash(self.delegate.region_id().as_ne_bytes()) as usize
     }
+
+    #[inline]
+    fn get_len(&self) -> usize {
+        self.receiver.len()
+    }
 }
 
 impl<EK> Drop for ApplyFsm<EK>
@@ -3658,7 +3663,7 @@ where
         unimplemented!()
     }
 
-    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
+    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>, len: usize) -> Option<usize> {
         let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
@@ -3690,7 +3695,8 @@ where
             normal.delegate.id() == 1003,
             |_| { None }
         );
-        while self.msg_buf.len() < self.messages_per_tick {
+        let len = cmp::min(len, self.messages_per_tick);
+        while self.msg_buf.len() < len {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
                 Err(TryRecvError::Empty) => {

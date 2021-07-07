@@ -234,7 +234,7 @@ pub trait PollHandler<N, C> {
     /// This function is called when handling readiness for normal FSM.
     ///
     /// The returned value is handled in the same way as `handle_control`.
-    fn handle_normal(&mut self, normal: &mut N) -> Option<usize>;
+    fn handle_normal(&mut self, normal: &mut N, len: usize) -> Option<usize>;
 
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
@@ -286,6 +286,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
     fn poll(&mut self) {
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut reschedule_fsms = Vec::with_capacity(self.max_batch_size);
+        let mut msg_lens = Vec::with_capacity(self.max_batch_size);
 
         // Fetch batch after every round is finished. It's helpful to protect regions
         // from becoming hungry if some regions are hot points. Since we fetch new fsm every time
@@ -298,6 +299,14 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             let max_batch_size = std::cmp::max(self.max_batch_size, batch.normals.len());
             self.handler.begin(max_batch_size);
 
+            while run && batch.normals.len() < max_batch_size {
+                if let Ok(fsm) = self.fsm_receiver.try_recv() {
+                    run = batch.push(fsm);
+                } else {
+                    break;
+                }
+            }
+
             if batch.control.is_some() {
                 let len = self.handler.handle_control(batch.control.as_mut().unwrap());
                 if batch.control.as_ref().unwrap().is_stopped() {
@@ -307,9 +316,13 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 }
             }
 
+            for p in batch.normals.iter_mut() {
+                msg_lens.push(p.get_len());
+            }
+
             let mut hot_fsm_count = 0;
             for (i, p) in batch.normals.iter_mut().enumerate() {
-                let len = self.handler.handle_normal(p);
+                let len = self.handler.handle_normal(p, msg_lens[i]);
                 if p.is_stopped() {
                     reschedule_fsms.push((i, ReschedulePolicy::Remove));
                 } else if p.get_priority() != self.handler.get_priority() {
@@ -330,25 +343,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     }
                 }
             }
-            let mut fsm_cnt = batch.normals.len();
-            while batch.normals.len() < max_batch_size {
-                if let Ok(fsm) = self.fsm_receiver.try_recv() {
-                    run = batch.push(fsm);
-                }
-                // If we receive a ControlFsm, break this cycle and call `end`. Because ControlFsm
-                // may change state of the handler, we shall deal with it immediately after
-                // calling `begin` of `Handler`.
-                if !run || fsm_cnt >= batch.normals.len() {
-                    break;
-                }
-                let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
-                if batch.normals[fsm_cnt].is_stopped() {
-                    reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Remove));
-                } else if let Some(l) = len {
-                    reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
-                }
-                fsm_cnt += 1;
-            }
+            msg_lens.clear();
+
             self.handler.end(&mut batch.normals);
 
             // Because release use `swap_remove` internally, so using pop here

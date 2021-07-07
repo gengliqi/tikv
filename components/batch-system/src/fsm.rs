@@ -59,6 +59,10 @@ pub trait Fsm {
     fn get_id(&self) -> usize {
         0
     }
+
+    fn get_len(&self) -> usize {
+        0
+    }
 }
 
 pub struct FsmState<N> {
