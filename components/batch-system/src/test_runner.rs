@@ -117,7 +117,7 @@ impl PollHandler<Runner, Runner> for Handler {
         self.handle(control)
     }
 
-    fn handle_normal(&mut self, normal: &mut Runner, _len: usize) -> Option<usize> {
+    fn handle_normal(&mut self, normal: &mut Runner) -> Option<usize> {
         self.local.normal += 1;
         self.handle(normal)
     }

@@ -234,7 +234,7 @@ pub trait PollHandler<N, C> {
     /// This function is called when handling readiness for normal FSM.
     ///
     /// The returned value is handled in the same way as `handle_control`.
-    fn handle_normal(&mut self, normal: &mut N, len: usize) -> Option<usize>;
+    fn handle_normal(&mut self, normal: &mut N) -> Option<usize>;
 
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
@@ -286,7 +286,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
     fn poll(&mut self) {
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut reschedule_fsms = Vec::with_capacity(self.max_batch_size);
-        let mut msg_lens = Vec::with_capacity(self.max_batch_size);
 
         // Fetch batch after every round is finished. It's helpful to protect regions
         // from becoming hungry if some regions are hot points. Since we fetch new fsm every time
@@ -316,13 +315,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 }
             }
 
-            for p in batch.normals.iter_mut() {
-                msg_lens.push(p.get_len());
-            }
-
             let mut hot_fsm_count = 0;
             for (i, p) in batch.normals.iter_mut().enumerate() {
-                let len = self.handler.handle_normal(p, msg_lens[i]);
+                let len = self.handler.handle_normal(p);
                 if p.is_stopped() {
                     reschedule_fsms.push((i, ReschedulePolicy::Remove));
                 } else if p.get_priority() != self.handler.get_priority() {
@@ -343,7 +338,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     }
                 }
             }
-            msg_lens.clear();
 
             self.handler.end(&mut batch.normals);
 

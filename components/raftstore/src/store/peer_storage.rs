@@ -38,7 +38,7 @@ use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 
-use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriteTask};
+use crate::store::async_io::write::AsyncWriteTask;
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -1546,9 +1546,12 @@ where
             write_task.messages = msgs;
             let mut flip_wb = async_flip_wb.0.lock().unwrap();
             let wb = flip_wb.get();
+            let is_empty = wb.is_empty();
             wb.add_write_task(write_task);
             drop(flip_wb);
-            async_flip_wb.1.notify_one();
+            if is_empty {
+                async_flip_wb.1.notify_one();
+            }
         } else {
             res = HandleReadyResult::NoIOTask { msgs };
         }

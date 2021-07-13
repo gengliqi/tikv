@@ -165,16 +165,6 @@ where
     }
 }
 
-/// Message that can be sent to AsyncWriteWorker
-pub enum AsyncWriteMsg<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    WriteTask(AsyncWriteTask<EK, ER>),
-    Shutdown,
-}
-
 /// AsyncWriteBatch is used for combining several AsyncWriteTask into one.
 pub struct AsyncWriteBatch<EK, ER>
 where
@@ -242,7 +232,7 @@ where
         self.tasks.push(task);
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
@@ -309,8 +299,8 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    flip: bool,
-    batchs: [Option<AsyncWriteBatch<EK, ER>>; 2],
+    current: usize,
+    flip_batchs: [Option<AsyncWriteBatch<EK, ER>>; 2],
     stopped: bool,
 }
 
@@ -321,8 +311,8 @@ where
 {
     fn new(kv_engine: &EK, raft_engine: &ER, waterfall_metrics: bool) -> Self {
         Self {
-            flip: false,
-            batchs: [
+            current: 0,
+            flip_batchs: [
                 Some(AsyncWriteBatch::new(
                     kv_engine.write_batch(),
                     raft_engine.log_batch(256 * 1024),
@@ -338,22 +328,19 @@ where
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.batchs[self.flip as usize].as_ref().unwrap().is_empty()
-    }
-
+    /// Get the current writebatch
     pub fn get(&mut self) -> &mut AsyncWriteBatch<EK, ER> {
-        self.batchs[self.flip as usize].as_mut().unwrap()
+        self.flip_batchs[self.current].as_mut().unwrap()
     }
 
-    fn flip(&mut self) -> AsyncWriteBatch<EK, ER> {
-        self.flip = !self.flip;
-        self.batchs[!self.flip as usize].take().unwrap()
+    fn flip_and_take(&mut self) -> AsyncWriteBatch<EK, ER> {
+        self.current ^= 1;
+        self.flip_batchs[self.current ^ 1].take().unwrap()
     }
 
-    fn bring_back(&mut self, batch: AsyncWriteBatch<EK, ER>) {
-        assert!(self.batchs[!self.flip as usize].is_none());
-        self.batchs[!self.flip as usize] = Some(batch);
+    fn put_back(&mut self, batch: AsyncWriteBatch<EK, ER>) {
+        assert!(self.flip_batchs[self.current ^ 1].is_none());
+        self.flip_batchs[self.current ^ 1] = Some(batch);
     }
 }
 
@@ -411,24 +398,26 @@ where
     }
 
     fn run(&mut self) {
+        let mut last_wb = None;
         loop {
             let mut flip_wb = self.flip_wb.0.lock().unwrap();
-            while flip_wb.is_empty() && !flip_wb.stopped {
+            while flip_wb.get().is_empty() && !flip_wb.stopped {
                 flip_wb = self.flip_wb.1.wait(flip_wb).unwrap();
             }
             if flip_wb.stopped {
                 break;
             }
-            let mut wb = flip_wb.flip();
+            if let Some(wb) = last_wb.take() {
+                flip_wb.put_back(wb);
+            }
+            let mut wb = flip_wb.flip_and_take();
             drop(flip_wb);
+
             STORE_WRITE_TRIGGER_SIZE_HISTOGRAM.observe(wb.get_raft_size() as f64);
 
             self.sync_write(&mut wb);
 
-            {
-                let mut flip_wb = self.flip_wb.0.lock().unwrap();
-                flip_wb.bring_back(wb);
-            }
+            last_wb = Some(wb);
         }
     }
 

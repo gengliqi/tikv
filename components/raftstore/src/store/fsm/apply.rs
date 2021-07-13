@@ -3663,7 +3663,7 @@ where
         unimplemented!()
     }
 
-    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>, len: usize) -> Option<usize> {
+    fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
         let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
@@ -3695,8 +3695,7 @@ where
             normal.delegate.id() == 1003,
             |_| { None }
         );
-        let len = cmp::min(len, self.messages_per_tick) + 1;
-        while self.msg_buf.len() < len {
+        while self.msg_buf.len() < self.messages_per_tick {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
                 Err(TryRecvError::Empty) => {

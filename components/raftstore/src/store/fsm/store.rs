@@ -85,7 +85,7 @@ pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 const ENTRY_CACHE_EVICT_TICK_DURATION: Duration = Duration::from_secs(1);
 
-use crate::store::async_io::write::{AsyncFlipWriteBatch, AsyncWriteMsg, AsyncWriters};
+use crate::store::async_io::write::{AsyncFlipWriteBatch, AsyncWriters};
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -340,6 +340,7 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
+    pub id: usize,
     pub cfg: Config,
     pub store: metapb::Store,
     pub pd_scheduler: FutureScheduler<PdTask<EK>>,
@@ -744,7 +745,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         expected_msg_count
     }
 
-    fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>, len: usize) -> Option<usize> {
+    fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>) -> Option<usize> {
         let mut expected_msg_count = None;
 
         fail_point!(
@@ -759,8 +760,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             |_| unreachable!()
         );
 
-        let len = std::cmp::min(len, self.messages_per_tick) + 1;
-        while self.peer_msg_buf.len() < len {
+        while self.peer_msg_buf.len() < self.messages_per_tick {
             match peer.receiver.try_recv() {
                 // TODO: we may need a way to optimize the message copy.
                 Ok(msg) => {
@@ -1023,6 +1023,7 @@ where
 
     fn build(&mut self, id: usize, _: Priority) -> RaftPoller<EK, ER, T> {
         let mut ctx = PollContext {
+            id,
             cfg: self.cfg.value().clone(),
             store: self.store.clone(),
             pd_scheduler: self.pd_scheduler.clone(),
