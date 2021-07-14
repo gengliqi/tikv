@@ -195,19 +195,19 @@ impl TestAsyncWriteWorker {
     }
 }
 
-struct TestAsyncWriters {
-    writers: AsyncWriters<KvTestEngine, KvTestEngine>,
+struct TestAsyncWriter {
+    writers: AsyncWriter<KvTestEngine, KvTestEngine>,
     msg_rx: Receiver<RaftMessage>,
     notify_rx: Receiver<(u64, (u64, u64))>,
 }
 
-impl TestAsyncWriters {
+impl TestAsyncWriter {
     fn new(cfg: &Config, kv_engine: &KvTestEngine, raft_engine: &KvTestEngine) -> Self {
         let (msg_tx, msg_rx) = channel();
         let trans = TestTransport { tx: msg_tx };
         let (notify_tx, notify_rx) = channel();
         let notifier = TestNotifier { tx: notify_tx };
-        let mut writers = AsyncWriters::new();
+        let mut writers = AsyncWriter::new();
         writers
             .spawn(1, kv_engine, raft_engine, &notifier, &trans, &cfg)
             .unwrap();
@@ -316,7 +316,7 @@ fn test_basic_flow() {
     let (_dir, raft_engine) = create_tmp_engine("async-io-basic-raft");
     let mut cfg = Config::default();
     cfg.store_io_pool_size = 2;
-    let mut t = TestAsyncWriters::new(&cfg, &kv_engine, &raft_engine);
+    let mut t = TestAsyncWriter::new(&cfg, &kv_engine, &raft_engine);
 
     let mut task_1 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 10);
     task_1.kv_wb = Some(kv_engine.write_batch());

@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::u64;
 
@@ -47,6 +48,7 @@ use tikv_util::{is_zero_duration, sys as sys_util, Either, RingQueue};
 
 use crate::coprocessor::split_observer::SplitObserver;
 use crate::coprocessor::{BoxAdminObserver, CoprocessorHost, RegionChangeEvent};
+use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriter};
 use crate::store::config::Config;
 use crate::store::fsm::metrics::*;
 use crate::store::fsm::peer::{
@@ -83,8 +85,6 @@ type Key = Vec<u8>;
 pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 const ENTRY_CACHE_EVICT_TICK_DURATION: Duration = Duration::from_secs(1);
-
-use crate::store::async_io::write::{AsyncFlipWriteBatch, AsyncWriters};
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -339,7 +339,6 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub id: usize,
     pub cfg: Config,
     pub store: metapb::Store,
     pub pd_scheduler: FutureScheduler<PdTask<EK>>,
@@ -381,8 +380,8 @@ where
     pub perf_context: EK::PerfContext,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
-    pub async_flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
     pub is_disk_full: bool,
+    pub async_batch_sender: Sender<AsyncWriteMsg<EK, ER>>,
 }
 
 impl<EK, ER, T> PollContext<EK, ER, T>
@@ -813,10 +812,6 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             self.poll_ctx.trans.flush();
         }
     }
-
-    fn on_schedule(&mut self, peer: &mut PeerFsm<EK, ER>) {
-        peer.peer.on_schedule(&mut self.poll_ctx);
-    }
 }
 
 pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
@@ -840,7 +835,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     pub engines: Engines<EK, ER>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     feature_gate: FeatureGate,
-    async_flip_wbs: Vec<Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>>,
+    async_batch_sender: Sender<AsyncWriteMsg<EK, ER>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1019,9 +1014,8 @@ where
 {
     type Handler = RaftPoller<EK, ER, T>;
 
-    fn build(&mut self, id: usize, _: Priority) -> RaftPoller<EK, ER, T> {
+    fn build(&mut self, _: Priority) -> RaftPoller<EK, ER, T> {
         let mut ctx = PollContext {
-            id,
             cfg: self.cfg.value().clone(),
             store: self.store.clone(),
             pd_scheduler: self.pd_scheduler.clone(),
@@ -1056,8 +1050,8 @@ where
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
             feature_gate: self.feature_gate.clone(),
-            async_flip_wb: self.async_flip_wbs[id].clone(),
             is_disk_full: false,
+            async_batch_sender: self.async_batch_sender.clone(),
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
@@ -1095,7 +1089,7 @@ pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
     workers: Option<Workers<EK>>,
-    async_writers: AsyncWriters<EK, ER>,
+    async_writer: Option<AsyncWriter<EK, ER>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
@@ -1175,14 +1169,14 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             .background_worker
             .start("consistency-check", consistency_check_runner);
 
-        self.async_writers.spawn(
+        self.async_writer = Some(AsyncWriter::new(
             meta.get_id(),
             &engines.kv,
             &engines.raft,
             &self.router,
             &trans,
             &cfg.value(),
-        )?;
+        )?);
 
         let mut builder = RaftPollerBuilder {
             cfg,
@@ -1205,7 +1199,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             store_meta,
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             feature_gate: pd_client.feature_gate().clone(),
-            async_flip_wbs: self.async_writers.flip_wbs().clone(),
+            async_batch_sender: self.async_writer.as_ref().unwrap().batch_sender().clone(),
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();
@@ -1328,7 +1322,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         self.apply_system.shutdown();
         fail_point!("after_shutdown_apply");
         self.system.shutdown();
-        self.async_writers.shutdown();
+        self.async_writer.take().unwrap().shutdown();
         if let Some(h) = handle {
             h.join().unwrap();
         }
@@ -1353,7 +1347,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
         apply_router,
         apply_system,
         router: raft_router.clone(),
-        async_writers: AsyncWriters::new(),
+        async_writer: None,
     };
     (raft_router, system)
 }

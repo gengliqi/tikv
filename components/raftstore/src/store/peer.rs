@@ -40,7 +40,6 @@ use uuid::Uuid;
 
 use crate::coprocessor::{CoprocessorHost, RegionChangeEvent};
 use crate::errors::RAFTSTORE_IS_BUSY;
-use crate::store::async_io::write::AsyncWriteTask;
 use crate::store::fsm::apply::CatchUpLogs;
 use crate::store::fsm::store::PollContext;
 use crate::store::fsm::{apply, Apply, ApplyMetrics, ApplyTask, CollectedReady, Proposal};
@@ -558,15 +557,6 @@ where
     unpersisted_message_count: usize,
     persisted_number: u64,
     snap_ctx: Option<SnapshotContext>,
-    /// If this peer is scheduled to another thread(i.e. `persist_thread_id` != `PollContext.id`)
-    /// and there are some unpersisted write tasks, the latter write tasks will be pushed into
-    /// `pending_write_tasks`.
-    persist_thread_id: usize,
-    /// The pending write tasks can be added to the writebatch of current store thread all
-    /// previous write tasks whose ready number are less than or equal to `last_ready_number`
-    /// have been persisted.
-    /// (last_ready_number, async_write_tasks)
-    pending_write_tasks: Option<(u64, Vec<(AsyncWriteTask<EK, ER>, Instant)>)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -670,8 +660,6 @@ where
             unpersisted_message_count: 0,
             persisted_number: 0,
             snap_ctx: None,
-            persist_thread_id: 0,
-            pending_write_tasks: None,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1983,8 +1971,9 @@ where
         }
 
         let has_new_entries = !ready.entries().is_empty();
-        let (ready_res, write_task) = match self.mut_store().handle_raft_ready(
+        let ready_res = match self.mut_store().handle_raft_ready(
             &mut ready,
+            &ctx.async_batch_sender,
             destroy_regions,
             persisted_msgs,
             proposal_times,
@@ -1996,32 +1985,6 @@ where
                 panic!("{} failed to handle raft ready: {:?}", self.tag, e)
             }
         };
-
-        match &ready_res {
-            HandleReadyResult::SendIOTask | HandleReadyResult::Snapshot { .. } => {
-                if self.unpersisted_readies.is_empty() || self.persist_thread_id == ctx.id {
-                    let mut flip_wb = ctx.async_flip_wb.0.lock().unwrap();
-                    let wb = flip_wb.get();
-                    let is_empty = wb.is_empty();
-                    wb.add_write_task(write_task);
-                    drop(flip_wb);
-                    if is_empty {
-                        ctx.async_flip_wb.1.notify_one();
-                    }
-                    self.persist_thread_id = ctx.id;
-                } else {
-                    if let Some((_, write_tasks)) = self.pending_write_tasks.as_mut() {
-                        write_tasks.push((write_task, Instant::now()));
-                    } else {
-                        self.pending_write_tasks = Some((
-                            self.unpersisted_readies.back().unwrap().0,
-                            vec![(write_task, Instant::now())],
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
 
         Some(CollectedReady::new(ready_res, ready, has_new_entries))
     }
@@ -2120,13 +2083,6 @@ where
                     ));
                     self.maybe_renew_leader_lease(propose_time, ctx, None);
                     lease_to_be_updated = false;
-                }
-            }
-            if let Some((term, scheduled_ts)) = self.proposals.find_scheduled_ts(entry.get_index())
-            {
-                if term == entry.get_term() {
-                    STORE_SCHEDULE_COMMIT_DURATION_HISTOGRAM
-                        .observe(duration_to_sec(scheduled_ts.elapsed()));
                 }
             }
 
@@ -2243,13 +2199,6 @@ where
         self.report_know_persist_duration(pre_persist_index, &mut ctx.raft_metrics);
         self.report_know_commit_duration(pre_commit_index, &mut ctx.raft_metrics);
 
-        if let Some((ready_number, _)) = self.pending_write_tasks.as_ref() {
-            if persisted_number >= *ready_number {
-                let tasks = self.pending_write_tasks.take().unwrap();
-                self.write_tasks(ctx, tasks.1);
-            }
-        }
-
         if self.snap_ctx.is_some() && self.unpersisted_readies.is_empty() {
             // Since the snapshot must belong to the last ready, so if `unpersisted_readies`
             // is empty, it means this persisted number is the last one.
@@ -2299,37 +2248,8 @@ where
         persist_res
     }
 
-    pub fn write_tasks<T>(
-        &mut self,
-        ctx: &mut PollContext<EK, ER, T>,
-        tasks: Vec<(AsyncWriteTask<EK, ER>, Instant)>,
-    ) {
-        let now = Instant::now();
-        let mut flip_wb = ctx.async_flip_wb.0.lock().unwrap();
-        let wb = flip_wb.get();
-        let is_empty = wb.is_empty();
-        for (task, time) in tasks {
-            wb.add_write_task(task);
-            ctx.raft_metrics
-                .wait_previous_persist
-                .observe(duration_to_sec(now - time));
-        }
-        drop(flip_wb);
-        if is_empty {
-            ctx.async_flip_wb.1.notify_one();
-        }
-        self.persist_thread_id = ctx.id;
-    }
-
     pub fn has_unpersisted_ready(&self) -> bool {
         !self.unpersisted_readies.is_empty()
-    }
-
-    pub fn on_schedule<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) {
-        if self.persist_thread_id == ctx.id && self.pending_write_tasks.is_some() {
-            let tasks = self.pending_write_tasks.take().unwrap();
-            self.write_tasks(ctx, tasks.1);
-        }
     }
 
     fn response_read<T>(

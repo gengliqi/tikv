@@ -37,7 +37,7 @@ use super::metrics::*;
 use super::worker::RegionTask;
 use super::{SnapEntry, SnapKey, SnapManager, SnapshotStatistics};
 
-use crate::store::async_io::write::AsyncWriteTask;
+use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriteTask};
 
 // When we create a region peer, we should initialize its log term/index > 0,
 // so that we can force the follower peer to sync the snapshot first.
@@ -1468,10 +1468,11 @@ where
     pub fn handle_raft_ready(
         &mut self,
         ready: &mut Ready,
+        async_write_sender: &Sender<AsyncWriteMsg<EK, ER>>,
         destroy_regions: Vec<metapb::Region>,
         mut msgs: Vec<RaftMessage>,
         proposal_times: Vec<Instant>,
-    ) -> Result<(HandleReadyResult, AsyncWriteTask<EK, ER>)> {
+    ) -> Result<HandleReadyResult> {
         let region_id = self.get_region_id();
         let mut ctx = InvokeContext::new(self);
 
@@ -1542,11 +1543,15 @@ where
 
         if write_task.has_data() {
             write_task.messages = msgs;
+            if let Err(e) = async_write_sender.send(AsyncWriteMsg::WriteTask(write_task)) {
+                // io thread is destroyed after store threads during shutdown
+                panic!("{} failed to send write msg, err: {:?}", self.tag, e);
+            }
         } else {
             res = HandleReadyResult::NoIOTask { msgs };
         }
 
-        Ok((res, write_task))
+        Ok(res)
     }
 
     pub fn persist_snapshot(&mut self, res: &PersistSnapshotResult) {
