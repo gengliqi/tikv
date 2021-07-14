@@ -11,12 +11,33 @@ pub struct Config {
     pub pool_size: usize,
     pub reschedule_duration: ReadableDuration,
     pub low_priority_pool_size: usize,
+    pub min_release_count: usize,
 }
 
 impl Config {
     pub fn max_batch_size(&self) -> usize {
         // `Config::validate` is not called for test so the `max_batch_size` is None.
         self.max_batch_size.unwrap_or(256)
+    }
+
+    pub fn store() -> Config {
+        Config {
+            max_batch_size: None,
+            pool_size: 2,
+            reschedule_duration: ReadableDuration::secs(5),
+            low_priority_pool_size: 0,
+            min_release_count: 10,
+        }
+    }
+
+    pub fn apply() -> Config {
+        Config {
+            max_batch_size: None,
+            pool_size: 2,
+            reschedule_duration: ReadableDuration::secs(5),
+            low_priority_pool_size: 1,
+            min_release_count: 0,
+        }
     }
 }
 
@@ -27,6 +48,7 @@ impl Default for Config {
             pool_size: 2,
             reschedule_duration: ReadableDuration::secs(5),
             low_priority_pool_size: 1,
+            min_release_count: 0,
         }
     }
 }

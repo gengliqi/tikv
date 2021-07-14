@@ -46,10 +46,6 @@ impl Fsm for Runner {
     fn get_priority(&self) -> Priority {
         self.priority
     }
-
-    fn get_len(&self) -> usize {
-        recv.len()
-    }
 }
 
 impl Runner {

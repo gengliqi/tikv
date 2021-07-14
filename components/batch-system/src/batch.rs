@@ -32,7 +32,7 @@ enum FsmTypes<N, C> {
 macro_rules! impl_sched {
     ($name:ident, $ty:path, Fsm = $fsm:tt) => {
         pub struct $name<N, C> {
-            senders: Vec<channel::Sender<FsmTypes<N, C>>>,
+            sender: channel::Sender<FsmTypes<N, C>>,
             low_sender: channel::Sender<FsmTypes<N, C>>,
         }
 
@@ -40,7 +40,7 @@ macro_rules! impl_sched {
             #[inline]
             fn clone(&self) -> $name<N, C> {
                 $name {
-                    senders: self.senders.clone(),
+                    sender: self.sender.clone(),
                     low_sender: self.low_sender.clone(),
                 }
             }
@@ -55,7 +55,7 @@ macro_rules! impl_sched {
             #[inline]
             fn schedule(&self, fsm: Box<Self::Fsm>) {
                 let sender = match fsm.get_priority() {
-                    Priority::Normal => &self.senders[fsm.get_id() % self.senders.len()],
+                    Priority::Normal => &self.sender,
                     Priority::Low => &self.low_sender,
                 };
                 match sender.send($ty(fsm)) {
@@ -70,9 +70,7 @@ macro_rules! impl_sched {
                 // TODO: close it explicitly once it's supported.
                 // Magic number, actually any number greater than poll pool size works.
                 for _ in 0..100 {
-                    for s in &self.senders {
-                        let _ = s.send(FsmTypes::Empty);
-                    }
+                    let _ = self.sender.send(FsmTypes::Empty);
                     let _ = self.low_sender.send(FsmTypes::Empty);
                 }
             }
@@ -87,7 +85,7 @@ impl_sched!(ControlScheduler, FsmTypes::Control, Fsm = C);
 #[allow(clippy::vec_box)]
 pub struct Batch<N, C> {
     normals: Vec<Box<N>>,
-    timers: Vec<Instant>,
+    timers: Vec<(Instant, usize)>,
     control: Option<Box<C>>,
 }
 
@@ -101,11 +99,16 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
         }
     }
 
-    fn push(&mut self, fsm: FsmTypes<N, C>) -> bool {
+    fn push<Handler: PollHandler<N, C>>(
+        &mut self,
+        fsm: FsmTypes<N, C>,
+        handler: &mut Handler,
+    ) -> bool {
         match fsm {
-            FsmTypes::Normal(n) => {
+            FsmTypes::Normal(mut n) => {
+                handler.on_schedule(&mut n);
                 self.normals.push(n);
-                self.timers.push(Instant::now_coarse());
+                self.timers.push((Instant::now_coarse(), 0));
             }
             FsmTypes::Control(c) => {
                 assert!(self.control.is_none());
@@ -246,6 +249,9 @@ pub trait PollHandler<N, C> {
     fn get_priority(&self) -> Priority {
         Priority::Normal
     }
+
+    /// This function is called when normal FSM is scheduled to the current thread.
+    fn on_schedule(&mut self, _normal: &mut N) {}
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
@@ -255,6 +261,7 @@ struct Poller<N: Fsm, C: Fsm, Handler> {
     handler: Handler,
     max_batch_size: usize,
     reschedule_duration: Duration,
+    min_release_count: usize,
 }
 
 enum ReschedulePolicy {
@@ -270,13 +277,13 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         if let Ok(fsm) = self.fsm_receiver.try_recv() {
-            return batch.push(fsm);
+            return batch.push(fsm, &mut self.handler);
         }
 
         if batch.is_empty() {
             self.handler.pause();
             if let Ok(fsm) = self.fsm_receiver.recv() {
-                return batch.push(fsm);
+                return batch.push(fsm, &mut self.handler);
             }
         }
         !batch.is_empty()
@@ -298,14 +305,6 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             let max_batch_size = std::cmp::max(self.max_batch_size, batch.normals.len());
             self.handler.begin(max_batch_size);
 
-            while run && batch.normals.len() < max_batch_size {
-                if let Ok(fsm) = self.fsm_receiver.try_recv() {
-                    run = batch.push(fsm);
-                } else {
-                    break;
-                }
-            }
-
             if batch.control.is_some() {
                 let len = self.handler.handle_control(batch.control.as_mut().unwrap());
                 if batch.control.as_ref().unwrap().is_stopped() {
@@ -323,7 +322,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 } else if p.get_priority() != self.handler.get_priority() {
                     reschedule_fsms.push((i, ReschedulePolicy::Schedule));
                 } else {
-                    /*if batch.timers[i].elapsed() >= self.reschedule_duration {
+                    if batch.timers[i].0.elapsed() >= self.reschedule_duration {
                         hot_fsm_count += 1;
                         // We should only reschedule a half of the hot regions, otherwise,
                         // it's possible all the hot regions are fetched in a batch the
@@ -332,13 +331,42 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                             reschedule_fsms.push((i, ReschedulePolicy::Schedule));
                             continue;
                         }
-                    }*/
+                    }
                     if let Some(l) = len {
-                        reschedule_fsms.push((i, ReschedulePolicy::Release(l)));
+                        batch.timers[i].1 += 1;
+                        if batch.timers[i].1 > self.min_release_count {
+                            batch.timers[i].1 = 0;
+                            reschedule_fsms.push((i, ReschedulePolicy::Release(l)));
+                        }
+                    } else {
+                        batch.timers[i].1 = 0;
                     }
                 }
             }
 
+            let mut fsm_cnt = batch.normals.len();
+            while batch.normals.len() < max_batch_size {
+                if let Ok(fsm) = self.fsm_receiver.try_recv() {
+                    run = batch.push(fsm, &mut self.handler);
+                }
+                // If we receive a ControlFsm, break this cycle and call `end`. Because ControlFsm
+                // may change state of the handler, we shall deal with it immediately after
+                // calling `begin` of `Handler`.
+                if !run || fsm_cnt >= batch.normals.len() {
+                    break;
+                }
+                let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
+                if batch.normals[fsm_cnt].is_stopped() {
+                    reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Remove));
+                } else if let Some(l) = len {
+                    batch.timers[fsm_cnt].1 += 1;
+                    if batch.timers[fsm_cnt].1 > self.min_release_count {
+                        batch.timers[fsm_cnt].1 = 0;
+                        reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
+                    }
+                }
+                fsm_cnt += 1;
+            }
             self.handler.end(&mut batch.normals);
 
             // Because release use `swap_remove` internally, so using pop here
@@ -370,13 +398,14 @@ pub trait HandlerBuilder<N, C> {
 pub struct BatchSystem<N: Fsm, C: Fsm> {
     name_prefix: Option<String>,
     router: BatchRouter<N, C>,
-    receivers: Vec<channel::Receiver<FsmTypes<N, C>>>,
+    receiver: channel::Receiver<FsmTypes<N, C>>,
     low_receiver: channel::Receiver<FsmTypes<N, C>>,
     pool_size: usize,
     max_batch_size: usize,
     workers: Vec<JoinHandle<()>>,
     reschedule_duration: Duration,
     low_priority_pool_size: usize,
+    min_release_count: usize,
 }
 
 impl<N, C> BatchSystem<N, C>
@@ -395,7 +424,7 @@ where
     {
         let handler = builder.build(id, priority);
         let receiver = match priority {
-            Priority::Normal => self.receivers[id].clone(),
+            Priority::Normal => self.receiver.clone(),
             Priority::Low => self.low_receiver.clone(),
         };
         let mut poller = Poller {
@@ -404,6 +433,7 @@ where
             handler,
             max_batch_size: self.max_batch_size,
             reschedule_duration: self.reschedule_duration,
+            min_release_count: self.min_release_count,
         };
         let props = tikv_util::thread_group::current_properties();
         let t = thread::Builder::new()
@@ -477,33 +507,28 @@ pub fn create_system<N: Fsm, C: Fsm>(
 ) -> (BatchRouter<N, C>, BatchSystem<N, C>) {
     let state_cnt = Arc::new(AtomicUsize::new(0));
     let control_box = BasicMailbox::new(sender, controller, state_cnt.clone());
-    let mut senders = Vec::with_capacity(cfg.pool_size);
-    let mut receivers = Vec::with_capacity(cfg.pool_size);
-    for _ in 0..cfg.pool_size {
-        let (tx, rx) = channel::unbounded();
-        senders.push(tx);
-        receivers.push(rx);
-    }
     let (tx, rx) = channel::unbounded();
+    let (tx2, rx2) = channel::unbounded();
     let normal_scheduler = NormalScheduler {
-        senders: senders.clone(),
-        low_sender: tx.clone(),
+        sender: tx.clone(),
+        low_sender: tx2.clone(),
     };
     let control_scheduler = ControlScheduler {
-        senders,
-        low_sender: tx,
+        sender: tx,
+        low_sender: tx2,
     };
     let router = Router::new(control_box, normal_scheduler, control_scheduler, state_cnt);
     let system = BatchSystem {
         name_prefix: None,
         router: router.clone(),
-        receivers,
-        low_receiver: rx,
+        receiver: rx,
+        low_receiver: rx2,
         pool_size: cfg.pool_size,
         max_batch_size: cfg.max_batch_size(),
         reschedule_duration: cfg.reschedule_duration.0,
         workers: vec![],
         low_priority_pool_size: cfg.low_priority_pool_size,
+        min_release_count: cfg.min_release_count,
     };
     (router, system)
 }

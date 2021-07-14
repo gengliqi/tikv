@@ -139,11 +139,11 @@ fn test_serde_custom_tikv_config() {
         address: "".to_string(),
         job: "tikv_1".to_owned(),
     };
-    let mut apply_batch_system = BatchSystemConfig::default();
+    let mut apply_batch_system = BatchSystemConfig::apply();
     apply_batch_system.max_batch_size = Some(22);
     apply_batch_system.pool_size = 4;
     apply_batch_system.reschedule_duration = ReadableDuration::secs(3);
-    let mut store_batch_system = BatchSystemConfig::default();
+    let mut store_batch_system = BatchSystemConfig::store();
     store_batch_system.max_batch_size = Some(21);
     store_batch_system.pool_size = 3;
     store_batch_system.reschedule_duration = ReadableDuration::secs(2);

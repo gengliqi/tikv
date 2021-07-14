@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::u64;
@@ -524,11 +523,6 @@ where
     fn is_stopped(&self) -> bool {
         self.store.stopped
     }
-
-    #[inline]
-    fn get_id(&self) -> usize {
-        rand::random()
-    }
 }
 
 struct StoreFsmDelegate<'a, EK: KvEngine + 'static, ER: RaftEngine + 'static, T: 'static> {
@@ -818,6 +812,10 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         if self.poll_ctx.trans.need_flush() {
             self.poll_ctx.trans.flush();
         }
+    }
+
+    fn on_schedule(&mut self, peer: &mut PeerFsm<EK, ER>) {
+        peer.peer.on_schedule(&mut self.poll_ctx);
     }
 }
 
