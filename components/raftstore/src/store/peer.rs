@@ -2177,7 +2177,7 @@ where
                 committed_entries,
                 cbs,
             );
-            apply.on_schedule();
+            apply.on_schedule(&mut ctx.raft_metrics);
             self.mut_store().trace_cached_entries(apply.entries.clone());
             if needs_evict_entry_cache() {
                 // Compact all cached entries instead of half evict.

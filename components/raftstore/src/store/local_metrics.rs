@@ -388,6 +388,7 @@ pub struct RaftMetrics {
     pub know_commit: LocalHistogram,
     pub know_commit_not_persist: LocalHistogram,
     pub wait_previous_persist: LocalHistogram,
+    pub store_time: LocalHistogram,
 }
 
 impl RaftMetrics {
@@ -412,6 +413,7 @@ impl RaftMetrics {
             know_commit: STORE_KNOW_COMMIT_DURATION_HISTOGRAM.local(),
             know_commit_not_persist: STORE_KNOW_COMMIT_NOT_PERSIST_DURATION_HISTOGRAM.local(),
             wait_previous_persist: STORE_WAIT_PREVIOUS_PERSIST_DURATION_HISTOGRAM.local(),
+            store_time: STORE_TIME_HISTOGRAM.local(),
         }
     }
     /// Flushs all metrics
@@ -433,6 +435,7 @@ impl RaftMetrics {
             self.know_commit_not_persist.flush();
         }
         self.wait_previous_persist.flush();
+        self.store_time.flush();
         let mut missing = self.leader_missing.lock().unwrap();
         LEADER_MISSING.set(missing.len() as i64);
         missing.clear();
