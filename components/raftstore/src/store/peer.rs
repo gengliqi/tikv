@@ -557,6 +557,7 @@ where
     unpersisted_message_count: usize,
     persisted_number: u64,
     snap_ctx: Option<SnapshotContext>,
+    persist_random_id: usize,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -660,6 +661,7 @@ where
             unpersisted_message_count: 0,
             persisted_number: 0,
             snap_ctx: None,
+            persist_random_id: 0,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1971,9 +1973,13 @@ where
         }
 
         let has_new_entries = !ready.entries().is_empty();
+        if !self.has_unpersisted_ready() {
+            self.persist_random_id = rand::random::<usize>() % ctx.async_batch_senders.len();
+        }
+        let async_batch_sender = &ctx.async_batch_senders[self.persist_random_id];
         let ready_res = match self.mut_store().handle_raft_ready(
             &mut ready,
-            &ctx.async_batch_sender,
+            &async_batch_sender,
             destroy_regions,
             persisted_msgs,
             proposal_times,

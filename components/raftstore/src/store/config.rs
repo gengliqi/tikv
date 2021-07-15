@@ -452,6 +452,9 @@ impl Config {
         } else {
             self.store_batch_system.max_batch_size = Some(1024);
         }
+        if self.store_io_pool_size == 0 {
+            return Err(box_err!("store-io-pool-size should be greater than 0"));
+        }
         if self.future_poll_size == 0 {
             return Err(box_err!("future-poll-size should be greater than 0."));
         }

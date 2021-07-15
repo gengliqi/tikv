@@ -1,5 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::mem;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -175,11 +176,12 @@ where
     pub raft_wb: ER::LogBatch,
     // region_id -> (peer_id, ready_number)
     pub readies: HashMap<u64, (u64, u64)>,
-    pub last_readies: HashMap<u64, (u64, u64)>,
+    last_readies: HashMap<u64, (u64, u64)>,
     // Write raft state once for a region everytime writing to disk
     pub raft_states: HashMap<u64, RaftLocalState>,
     pub state_size: usize,
     pub tasks: Vec<AsyncWriteTask<EK, ER>>,
+    last_tasks: Vec<AsyncWriteTask<EK, ER>>,
     metrics: AsyncWriteMetrics,
     waterfall_metrics: bool,
 }
@@ -197,6 +199,7 @@ where
             last_readies: HashMap::default(),
             raft_states: HashMap::default(),
             tasks: vec![],
+            last_tasks: vec![],
             state_size: 0,
             metrics: Default::default(),
             waterfall_metrics,
@@ -217,7 +220,7 @@ where
             self.raft_wb.merge(raft_wb);
         }
 
-        let entries = std::mem::take(&mut task.entries);
+        let entries = mem::take(&mut task.entries);
         self.raft_wb.append(task.region_id, entries).unwrap();
         if let Some((from, to)) = task.cut_logs {
             self.raft_wb.cut_logs(task.region_id, from, to);
@@ -228,7 +231,7 @@ where
                 .insert(task.region_id, raft_state)
                 .is_none()
             {
-                self.state_size += std::mem::size_of::<RaftLocalState>();
+                self.state_size += mem::size_of::<RaftLocalState>();
             }
         }
         self.tasks.push(task);
@@ -254,7 +257,7 @@ where
 
     fn before_write_to_db(&mut self, now: Instant) {
         // Put raft state to raft writebatch
-        let raft_states = std::mem::take(&mut self.raft_states);
+        let raft_states = mem::take(&mut self.raft_states);
         for (region_id, state) in raft_states {
             self.raft_wb.put_raft_state(region_id, &state).unwrap();
         }
@@ -347,40 +350,31 @@ where
 }
 
 #[allow(dead_code)]
-struct AsyncWriteWorker<EK, ER, T, N>
+struct AsyncWriteWorker<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
-    T: Transport,
-    N: Notifier,
 {
     store_id: u64,
     tag: String,
     kv_engine: EK,
     raft_engine: ER,
-    notifier: N,
-    trans: T,
     flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
     sender: Sender<AsyncWriteMsg<EK, ER>>,
     raft_write_size_limit: usize,
-    message_metrics: RaftSendMessageMetrics,
     perf_context: EK::PerfContext,
 }
 
-impl<EK, ER, T, N> AsyncWriteWorker<EK, ER, T, N>
+impl<EK, ER> AsyncWriteWorker<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
-    T: Transport,
-    N: Notifier,
 {
     fn new(
         store_id: u64,
         tag: String,
         kv_engine: EK,
         raft_engine: ER,
-        notifier: N,
-        trans: T,
         flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
         sender: Sender<AsyncWriteMsg<EK, ER>>,
         config: &Config,
@@ -392,12 +386,9 @@ where
             tag,
             kv_engine,
             raft_engine,
-            notifier,
-            trans,
             flip_wb,
             sender,
             raft_write_size_limit: config.raft_write_size_limit.0 as usize,
-            message_metrics: Default::default(),
             perf_context,
         }
     }
@@ -419,8 +410,9 @@ where
             self.sync_write(&mut wb);
 
             assert!(wb.last_readies.is_empty());
-            wb.last_readies = std::mem::take(&mut wb.readies);
-            let tasks = std::mem::take(&mut wb.tasks);
+            wb.last_readies = mem::take(&mut wb.readies);
+            assert!(wb.last_tasks.is_empty());
+            wb.last_tasks = mem::take(&mut wb.tasks);
             wb.clear();
 
             {
@@ -429,9 +421,7 @@ where
             }
 
             // io thread is destroyed after batch thread during shutdown
-            self.sender.send(AsyncWriteMsg::NotifyPersisted).unwrap();
-
-            self.send_msg(tasks);
+            self.sender.send(AsyncWriteMsg::Persisted).unwrap();
         }
     }
 
@@ -536,6 +526,123 @@ where
 
         fail_point!("raft_after_save");
     }
+}
+
+pub enum AsyncWriteMsg<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    WriteTask(AsyncWriteTask<EK, ER>),
+    Persisted,
+    Shutdown,
+}
+
+struct AsyncBatchWorker<EK, ER, N, T>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+    N: Notifier,
+    T: Transport,
+{
+    flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
+    receiver: Receiver<AsyncWriteMsg<EK, ER>>,
+    notifier: N,
+    trans: T,
+    message_metrics: RaftSendMessageMetrics,
+}
+
+impl<EK, ER, N, T> AsyncBatchWorker<EK, ER, N, T>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+    N: Notifier,
+    T: Transport,
+{
+    fn new(
+        flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
+        receiver: Receiver<AsyncWriteMsg<EK, ER>>,
+        notifier: N,
+        trans: T,
+    ) -> Self {
+        Self {
+            flip_wb,
+            receiver,
+            notifier,
+            trans,
+            message_metrics: Default::default(),
+        }
+    }
+
+    fn run(&mut self) {
+        loop {
+            let msg = match self.receiver.recv() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            match msg {
+                AsyncWriteMsg::Shutdown => return,
+                AsyncWriteMsg::WriteTask(task) => {
+                    STORE_WRITE_TASK_WAIT_DURATION_HISTOGRAM
+                        .observe(duration_to_sec(task.send_time.elapsed()));
+                    let mut flip_wb = self.flip_wb.0.lock().unwrap();
+                    let wb = flip_wb.get();
+                    let is_empty = wb.is_empty();
+                    wb.add_write_task(task);
+                    let last_tasks = if !wb.last_tasks.is_empty() {
+                        Some(mem::take(&mut wb.last_tasks))
+                    } else {
+                        None
+                    };
+                    let last_readies = if !wb.last_readies.is_empty() {
+                        Some(mem::take(&mut wb.last_readies))
+                    } else {
+                        None
+                    };
+                    drop(flip_wb);
+                    if is_empty {
+                        self.flip_wb.1.notify_one();
+                    }
+                    if let Some(tasks) = last_tasks {
+                        self.send_msg(tasks);
+                    }
+                    if let Some(readies) = last_readies {
+                        self.notify_persisted(readies);
+                    }
+                }
+                AsyncWriteMsg::Persisted => {
+                    let mut flip_wb = self.flip_wb.0.lock().unwrap();
+                    let wb = flip_wb.get();
+                    let last_tasks = if !wb.last_tasks.is_empty() {
+                        Some(mem::take(&mut wb.last_tasks))
+                    } else {
+                        None
+                    };
+                    let last_readies = if !wb.last_readies.is_empty() {
+                        Some(mem::take(&mut wb.last_readies))
+                    } else {
+                        None
+                    };
+                    drop(flip_wb);
+                    if let Some(tasks) = last_tasks {
+                        self.send_msg(tasks);
+                    }
+                    if let Some(readies) = last_readies {
+                        self.notify_persisted(readies);
+                    }
+                }
+            }
+        }
+    }
+
+    fn notify_persisted(&mut self, readies: HashMap<u64, (u64, u64)>) {
+        let now = Instant::now();
+        for (region_id, (peer_id, ready_number)) in readies {
+            self.notifier
+                .notify_persisted(region_id, peer_id, ready_number, now);
+        }
+        STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
+    }
 
     fn send_msg(&mut self, tasks: Vec<AsyncWriteTask<EK, ER>>) {
         fail_point!("raft_before_follower_send");
@@ -578,109 +685,15 @@ where
     }
 }
 
-pub enum AsyncWriteMsg<EK, ER>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-{
-    WriteTask(AsyncWriteTask<EK, ER>),
-    NotifyPersisted,
-    Shutdown,
-}
-
-struct AsyncBatchWorker<EK, ER, N>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-    N: Notifier,
-{
-    flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
-    receiver: Receiver<AsyncWriteMsg<EK, ER>>,
-    notifier: N,
-}
-
-impl<EK, ER, N> AsyncBatchWorker<EK, ER, N>
-where
-    EK: KvEngine,
-    ER: RaftEngine,
-    N: Notifier,
-{
-    fn new(
-        flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
-        receiver: Receiver<AsyncWriteMsg<EK, ER>>,
-        notifier: N,
-    ) -> Self {
-        Self {
-            flip_wb,
-            receiver,
-            notifier,
-        }
-    }
-
-    fn run(&mut self) {
-        loop {
-            let msg = match self.receiver.recv() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            match msg {
-                AsyncWriteMsg::Shutdown => return,
-                AsyncWriteMsg::WriteTask(task) => {
-                    STORE_WRITE_TASK_WAIT_DURATION_HISTOGRAM
-                        .observe(duration_to_sec(task.send_time.elapsed()));
-                    let mut flip_wb = self.flip_wb.0.lock().unwrap();
-                    let wb = flip_wb.get();
-                    let is_empty = wb.is_empty();
-                    wb.add_write_task(task);
-                    let last_readies = if !wb.last_readies.is_empty() {
-                        Some(std::mem::take(&mut wb.last_readies))
-                    } else {
-                        None
-                    };
-                    drop(flip_wb);
-                    if is_empty {
-                        self.flip_wb.1.notify_one();
-                    }
-                    if let Some(readies) = last_readies {
-                        self.notify_persisted(readies);
-                    }
-                }
-                AsyncWriteMsg::NotifyPersisted => {
-                    let mut flip_wb = self.flip_wb.0.lock().unwrap();
-                    let wb = flip_wb.get();
-                    let last_readies = if !wb.last_readies.is_empty() {
-                        Some(std::mem::take(&mut wb.last_readies))
-                    } else {
-                        None
-                    };
-                    drop(flip_wb);
-                    if let Some(readies) = last_readies {
-                        self.notify_persisted(readies);
-                    }
-                }
-            }
-        }
-    }
-
-    fn notify_persisted(&mut self, readies: HashMap<u64, (u64, u64)>) {
-        let now = Instant::now();
-        for (region_id, (peer_id, ready_number)) in readies {
-            self.notifier
-                .notify_persisted(region_id, peer_id, ready_number, now);
-        }
-        STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()));
-    }
-}
-
 pub struct AsyncWriter<EK, ER>
 where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
-    io_handler: Option<JoinHandle<()>>,
-    batch_sender: Sender<AsyncWriteMsg<EK, ER>>,
-    batch_handler: Option<JoinHandle<()>>,
+    flip_wbs: Vec<Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>>,
+    io_handlers: Vec<JoinHandle<()>>,
+    batch_senders: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    batch_handlers: Vec<JoinHandle<()>>,
 }
 
 impl<EK, ER> AsyncWriter<EK, ER>
@@ -688,66 +701,89 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new<N: Notifier, T: Transport + 'static>(
+    pub fn new() -> Self {
+        Self {
+            flip_wbs: vec![],
+            io_handlers: vec![],
+            batch_senders: vec![],
+            batch_handlers: vec![],
+        }
+    }
+
+    pub fn spawn<N: Notifier, T: Transport + 'static>(
+        &mut self,
         store_id: u64,
         kv_engine: &EK,
         raft_engine: &ER,
         notifier: &N,
         trans: &T,
         config: &Config,
-    ) -> Result<AsyncWriter<EK, ER>> {
-        let (tx, rx) = channel();
-        let tag = format!("store-writer");
-        let flip_wb = Arc::new((
-            Mutex::new(AsyncFlipWriteBatch::new(
-                kv_engine,
-                raft_engine,
-                config.store_waterfall_metrics,
-            )),
-            Condvar::new(),
-        ));
-        let mut batch_worker = AsyncBatchWorker::new(flip_wb.clone(), rx, notifier.clone());
-        let batch_handler = thread::Builder::new()
-            .name(thd_name!("store-batcher"))
-            .spawn(move || {
-                batch_worker.run();
-            })?;
-        let mut io_worker = AsyncWriteWorker::new(
-            store_id,
-            tag.clone(),
-            kv_engine.clone(),
-            raft_engine.clone(),
-            notifier.clone(),
-            trans.clone(),
-            flip_wb.clone(),
-            tx.clone(),
-            config,
-        );
-        let io_handler = thread::Builder::new()
-            .name(thd_name!("store-writer"))
-            .spawn(move || {
-                io_worker.run();
-            })?;
-        Ok(AsyncWriter {
-            flip_wb,
-            io_handler: Some(io_handler),
-            batch_sender: tx,
-            batch_handler: Some(batch_handler),
-        })
+    ) -> Result<()> {
+        for i in 0..config.store_io_pool_size {
+            let io_tag = format!("store-writer-{}", i);
+            let batch_tag = format!("store-batcher-{}", i);
+            let (tx, rx) = channel();
+            let flip_wb = Arc::new((
+                Mutex::new(AsyncFlipWriteBatch::new(
+                    kv_engine,
+                    raft_engine,
+                    config.store_waterfall_metrics,
+                )),
+                Condvar::new(),
+            ));
+            let mut io_worker = AsyncWriteWorker::new(
+                store_id,
+                io_tag.clone(),
+                kv_engine.clone(),
+                raft_engine.clone(),
+                flip_wb.clone(),
+                tx.clone(),
+                config,
+            );
+            let io_handler = thread::Builder::new()
+                .name(thd_name!(io_tag))
+                .spawn(move || {
+                    io_worker.run();
+                })?;
+            let mut batch_worker =
+                AsyncBatchWorker::new(flip_wb.clone(), rx, notifier.clone(), trans.clone());
+            let batch_handler =
+                thread::Builder::new()
+                    .name(thd_name!(batch_tag))
+                    .spawn(move || {
+                        batch_worker.run();
+                    })?;
+
+            self.flip_wbs.push(flip_wb);
+            self.io_handlers.push(io_handler);
+            self.batch_senders.push(tx);
+            self.batch_handlers.push(batch_handler);
+        }
+        Ok(())
     }
 
-    pub fn batch_sender(&self) -> &Sender<AsyncWriteMsg<EK, ER>> {
-        &self.batch_sender
+    pub fn batch_senders(&self) -> &Vec<Sender<AsyncWriteMsg<EK, ER>>> {
+        &self.batch_senders
     }
 
     pub fn shutdown(&mut self) {
-        let mut flip_wb = self.flip_wb.0.lock().unwrap();
-        flip_wb.stopped = true;
-        self.flip_wb.1.notify_one();
-        self.io_handler.take().unwrap().join().unwrap();
-
-        self.batch_sender.send(AsyncWriteMsg::Shutdown).unwrap();
-        self.batch_handler.take().unwrap().join().unwrap();
+        assert_eq!(self.flip_wbs.len(), self.io_handlers.len());
+        assert_eq!(self.io_handlers.len(), self.batch_senders.len());
+        assert_eq!(self.batch_senders.len(), self.batch_handlers.len());
+        for flip_wb in &self.flip_wbs {
+            let mut wb = flip_wb.0.lock().unwrap();
+            wb.stopped = true;
+            flip_wb.1.notify_one();
+        }
+        for handler in self.io_handlers.drain(..) {
+            handler.join().unwrap();
+        }
+        for sender in &self.batch_senders {
+            sender.send(AsyncWriteMsg::Shutdown).unwrap();
+        }
+        for handler in self.batch_handlers.drain(..) {
+            handler.join().unwrap();
+        }
     }
 }
 
