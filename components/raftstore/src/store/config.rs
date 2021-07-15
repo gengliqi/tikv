@@ -263,7 +263,7 @@ impl Default for Config {
             local_read_batch_size: 1024,
             apply_batch_system: BatchSystemConfig::default(),
             store_batch_system: BatchSystemConfig::default(),
-            store_io_pool_size: 2,
+            store_io_pool_size: 1,
             future_poll_size: 1,
             hibernate_regions: true,
             dev_assert: false,
