@@ -176,14 +176,15 @@ where
     pub raft_wb: ER::LogBatch,
     // region_id -> (peer_id, ready_number)
     pub readies: HashMap<u64, (u64, u64)>,
-    last_readies: HashMap<u64, (u64, u64)>,
     // Write raft state once for a region everytime writing to disk
     pub raft_states: HashMap<u64, RaftLocalState>,
     pub state_size: usize,
     pub tasks: Vec<AsyncWriteTask<EK, ER>>,
-    last_tasks: Vec<AsyncWriteTask<EK, ER>>,
     metrics: AsyncWriteMetrics,
     waterfall_metrics: bool,
+    has_last_data: bool,
+    last_tasks: Vec<AsyncWriteTask<EK, ER>>,
+    last_readies: HashMap<u64, (u64, u64)>,
 }
 
 impl<EK, ER> AsyncWriteBatch<EK, ER>
@@ -196,13 +197,14 @@ where
             kv_wb,
             raft_wb,
             readies: HashMap::default(),
-            last_readies: HashMap::default(),
             raft_states: HashMap::default(),
             tasks: vec![],
-            last_tasks: vec![],
             state_size: 0,
             metrics: Default::default(),
             waterfall_metrics,
+            has_last_data: false,
+            last_tasks: vec![],
+            last_readies: HashMap::default(),
         }
     }
 
@@ -251,11 +253,35 @@ where
     }
 
     #[inline]
+    fn save_last_data(&mut self) {
+        // The last data must be taken out before the writebatch being taken to persist
+        assert!(self.last_tasks.is_empty());
+        self.last_tasks = mem::take(&mut self.tasks);
+        assert!(self.last_readies.is_empty());
+        self.last_readies = mem::take(&mut self.readies);
+        self.has_last_data = true;
+    }
+
+    #[inline]
+    fn take_last_data(
+        &mut self,
+    ) -> Option<(Vec<AsyncWriteTask<EK, ER>>, HashMap<u64, (u64, u64)>)> {
+        if !self.has_last_data {
+            return None;
+        }
+        self.has_last_data = false;
+        Some((
+            mem::take(&mut self.last_tasks),
+            mem::take(&mut self.last_readies),
+        ))
+    }
+
+    #[inline]
     fn get_raft_size(&self) -> usize {
         self.state_size + self.raft_wb.persist_size()
     }
 
-    fn before_write_to_db(&mut self, now: Instant) {
+    fn before_write_to_db(&mut self) {
         // Put raft state to raft writebatch
         let raft_states = mem::take(&mut self.raft_states);
         for (region_id, state) in raft_states {
@@ -263,6 +289,7 @@ where
         }
         self.state_size = 0;
         if self.waterfall_metrics {
+            let now = Instant::now();
             for task in &self.tasks {
                 for ts in &task.proposal_times {
                     self.metrics.to_write.observe(duration_to_sec(now - *ts));
@@ -271,8 +298,9 @@ where
         }
     }
 
-    fn after_write_to_kv_db(&mut self, now: Instant) {
+    fn after_write_to_kv_db(&mut self) {
         if self.waterfall_metrics {
+            let now = Instant::now();
             for task in &self.tasks {
                 for ts in &task.proposal_times {
                     self.metrics.kvdb_end.observe(duration_to_sec(now - *ts));
@@ -281,8 +309,9 @@ where
         }
     }
 
-    fn after_write_to_db(&mut self, now: Instant) {
+    fn after_write_to_db(&mut self) {
         if self.waterfall_metrics {
+            let now = Instant::now();
             for task in &self.tasks {
                 for ts in &task.proposal_times {
                     self.metrics.write_end.observe(duration_to_sec(now - *ts))
@@ -304,9 +333,9 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
+    stopped: bool,
     current: usize,
     flip_batchs: [Option<AsyncWriteBatch<EK, ER>>; 2],
-    stopped: bool,
 }
 
 impl<EK, ER> AsyncFlipWriteBatch<EK, ER>
@@ -316,6 +345,7 @@ where
 {
     fn new(kv_engine: &EK, raft_engine: &ER, waterfall_metrics: bool) -> Self {
         Self {
+            stopped: false,
             current: 0,
             flip_batchs: [
                 Some(AsyncWriteBatch::new(
@@ -329,13 +359,15 @@ where
                     waterfall_metrics,
                 )),
             ],
-            stopped: false,
         }
     }
 
-    /// Get the current writebatch
-    pub fn get(&mut self) -> &mut AsyncWriteBatch<EK, ER> {
+    fn get(&mut self) -> &mut AsyncWriteBatch<EK, ER> {
         self.flip_batchs[self.current].as_mut().unwrap()
+    }
+
+    fn get_another(&mut self) -> Option<&mut AsyncWriteBatch<EK, ER>> {
+        self.flip_batchs[self.current ^ 1].as_mut()
     }
 
     fn flip_and_take(&mut self) -> AsyncWriteBatch<EK, ER> {
@@ -361,7 +393,6 @@ where
     raft_engine: ER,
     flip_wb: Arc<(Mutex<AsyncFlipWriteBatch<EK, ER>>, Condvar)>,
     sender: Sender<AsyncWriteMsg<EK, ER>>,
-    raft_write_size_limit: usize,
     perf_context: EK::PerfContext,
 }
 
@@ -388,7 +419,6 @@ where
             raft_engine,
             flip_wb,
             sender,
-            raft_write_size_limit: config.raft_write_size_limit.0 as usize,
             perf_context,
         }
     }
@@ -409,10 +439,7 @@ where
 
             self.sync_write(&mut wb);
 
-            assert!(wb.last_readies.is_empty());
-            wb.last_readies = mem::take(&mut wb.readies);
-            assert!(wb.last_tasks.is_empty());
-            wb.last_tasks = mem::take(&mut wb.tasks);
+            wb.save_last_data();
             wb.clear();
 
             {
@@ -480,8 +507,7 @@ where
     }*/
 
     fn sync_write(&mut self, wb: &mut AsyncWriteBatch<EK, ER>) {
-        let mut now = Instant::now();
-        wb.before_write_to_db(now);
+        wb.before_write_to_db();
 
         fail_point!("raft_before_save");
 
@@ -499,8 +525,7 @@ where
             STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
         }
 
-        now = Instant::now();
-        wb.after_write_to_kv_db(now);
+        wb.after_write_to_kv_db();
 
         fail_point!("raft_between_save");
 
@@ -519,8 +544,7 @@ where
             STORE_WRITE_RAFTDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
         }
 
-        now = Instant::now();
-        wb.after_write_to_db(now);
+        wb.after_write_to_db();
 
         wb.flush_metrics();
 
@@ -589,49 +613,35 @@ where
                     let wb = flip_wb.get();
                     let is_empty = wb.is_empty();
                     wb.add_write_task(task);
-                    let last_tasks = if !wb.last_tasks.is_empty() {
-                        Some(mem::take(&mut wb.last_tasks))
-                    } else {
-                        None
-                    };
-                    let last_readies = if !wb.last_readies.is_empty() {
-                        Some(mem::take(&mut wb.last_readies))
-                    } else {
-                        None
-                    };
+                    let last_data_1 = wb.take_last_data();
+                    let last_data_2 = flip_wb.get_another().map_or(None, |wb| wb.take_last_data());
                     drop(flip_wb);
                     if is_empty {
                         self.flip_wb.1.notify_one();
                     }
-                    if let Some(tasks) = last_tasks {
-                        self.send_msg(tasks);
-                    }
-                    if let Some(readies) = last_readies {
-                        self.notify_persisted(readies);
-                    }
+                    self.handle_last_data(last_data_1);
+                    self.handle_last_data(last_data_2);
                 }
                 AsyncWriteMsg::Persisted => {
                     let mut flip_wb = self.flip_wb.0.lock().unwrap();
-                    let wb = flip_wb.get();
-                    let last_tasks = if !wb.last_tasks.is_empty() {
-                        Some(mem::take(&mut wb.last_tasks))
-                    } else {
-                        None
-                    };
-                    let last_readies = if !wb.last_readies.is_empty() {
-                        Some(mem::take(&mut wb.last_readies))
-                    } else {
-                        None
-                    };
+                    let last_data_1 = flip_wb.get().take_last_data();
+                    let last_data_2 = flip_wb.get_another().map_or(None, |wb| wb.take_last_data());
                     drop(flip_wb);
-                    if let Some(tasks) = last_tasks {
-                        self.send_msg(tasks);
-                    }
-                    if let Some(readies) = last_readies {
-                        self.notify_persisted(readies);
-                    }
+                    self.handle_last_data(last_data_1);
+                    self.handle_last_data(last_data_2);
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn handle_last_data(
+        &mut self,
+        last_data: Option<(Vec<AsyncWriteTask<EK, ER>>, HashMap<u64, (u64, u64)>)>,
+    ) {
+        if let Some((tasks, readies)) = last_data {
+            self.send_msg(tasks);
+            self.notify_persisted(readies);
         }
     }
 

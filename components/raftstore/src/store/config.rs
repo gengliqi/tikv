@@ -185,10 +185,6 @@ pub struct Config {
     #[online_config(skip)]
     pub trigger_ready_size: ReadableSize,
 
-    // When the size of raft db writebatch exceeds this value, write will be triggered.
-    #[online_config(skip)]
-    pub raft_write_size_limit: ReadableSize,
-
     #[online_config(skip)]
     pub store_waterfall_metrics: bool,
 
@@ -275,7 +271,6 @@ impl Default for Config {
             perf_level: PerfLevel::Disable,
             cmd_batch: true,
             trigger_ready_size: ReadableSize::mb(1),
-            raft_write_size_limit: ReadableSize::mb(1),
             store_waterfall_metrics: false,
 
             // They are preserved for compatibility check.
@@ -651,9 +646,6 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["trigger_ready_size"])
             .set(self.trigger_ready_size.0 as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["raft_write_size_limit"])
-            .set(self.raft_write_size_limit.0 as f64);
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["store_waterfall_metrics"])
             .set((self.store_waterfall_metrics as i32).into());
