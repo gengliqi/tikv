@@ -1173,14 +1173,8 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             .background_worker
             .start("consistency-check", consistency_check_runner);
 
-        self.store_writers.spawn(
-            meta.get_id(),
-            &engines.kv,
-            &engines.raft,
-            &self.router,
-            &trans,
-            &cfg.value(),
-        )?;
+        self.store_writers
+            .spawn(meta.get_id(), &engines, &self.router, &trans, &cfg.value())?;
 
         let mut builder = RaftPollerBuilder {
             cfg,

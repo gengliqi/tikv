@@ -18,7 +18,8 @@ use crate::Result;
 use collections::{HashMap, HashSet};
 use crossbeam::utils::CachePadded;
 use engine_traits::{
-    KvEngine, PerfContext, PerfContextKind, RaftEngine, RaftLogBatch, WriteBatch, WriteOptions,
+    Engines, KvEngine, PerfContext, PerfContextKind, RaftEngine, RaftLogBatch, WriteBatch,
+    WriteOptions,
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
@@ -306,8 +307,7 @@ where
     store_id: u64,
     tag: String,
     worker_id: usize,
-    kv_engine: EK,
-    raft_engine: ER,
+    engines: Engines<EK, ER>,
     receiver: Receiver<WriteMsg<EK, ER>>,
     notifier: N,
     trans: T,
@@ -337,8 +337,7 @@ where
         store_id: u64,
         tag: String,
         worker_id: usize,
-        kv_engine: EK,
-        raft_engine: ER,
+        engines: Engines<EK, ER>,
         receiver: Receiver<WriteMsg<EK, ER>>,
         notifier: N,
         trans: T,
@@ -346,15 +345,16 @@ where
         sync_sender: Sender<SyncMsg>,
         config: &Config,
     ) -> Self {
-        let batch = WriteTaskBatch::new(kv_engine.write_batch(), raft_engine.log_batch(16 * 1024));
-        let perf_context =
-            kv_engine.get_perf_context(config.perf_level, PerfContextKind::RaftstoreStore);
+        let batch =
+            WriteTaskBatch::new(engines.kv.write_batch(), engines.raft.log_batch(16 * 1024));
+        let perf_context = engines
+            .kv
+            .get_perf_context(config.perf_level, PerfContextKind::RaftstoreStore);
         Self {
             store_id,
             tag,
             worker_id,
-            kv_engine,
-            raft_engine,
+            engines,
             receiver,
             notifier,
             trans,
@@ -454,7 +454,7 @@ where
                 panic!("{} failed to write to kv engine: {:?}", self.tag, e);
             });
             if self.batch.kv_wb.data_size() > KV_WB_SHRINK_SIZE {
-                self.batch.kv_wb = self.kv_engine.write_batch_with_cap(4 * 1024);
+                self.batch.kv_wb = self.engines.kv.write_batch_with_cap(4 * 1024);
             }
             STORE_WRITE_KVDB_DURATION_HISTOGRAM.observe(duration_to_sec(now.elapsed()) as f64);
         }
@@ -468,7 +468,8 @@ where
 
             let now = Instant::now();
             self.perf_context.start_observe();
-            self.raft_engine
+            self.engines
+                .raft
                 .consume_and_shrink(
                     &mut self.batch.raft_wb,
                     false,
@@ -679,8 +680,7 @@ where
     pub fn spawn<T: Transport + 'static, N: Notifier>(
         &mut self,
         store_id: u64,
-        kv_engine: &EK,
-        raft_engine: &ER,
+        engines: &Engines<EK, ER>,
         notifier: &N,
         trans: &T,
         config: &Config,
@@ -695,8 +695,7 @@ where
                 store_id,
                 tag.clone(),
                 i,
-                kv_engine.clone(),
-                raft_engine.clone(),
+                engines.clone(),
                 rx,
                 notifier.clone(),
                 trans.clone(),
@@ -712,7 +711,7 @@ where
             self.handlers.push(t);
         }
         let mut syncer = SyncWorker::new(
-            raft_engine.clone(),
+            engines.raft.clone(),
             sync_receiver,
             self.writers.clone(),
             global_persisted_ids,
@@ -740,6 +739,33 @@ where
             .send(SyncMsg::Shutdown)
             .unwrap();
         self.sync_handler.take().unwrap().join().unwrap();
+    }
+}
+
+/// Used for test to write task to kv db and raft db.
+#[allow(dead_code)]
+pub fn write_to_db_for_test<EK, ER>(engines: &Engines<EK, ER>, task: WriteTask<EK, ER>)
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    let mut batch = WriteTaskBatch::new(engines.kv.write_batch(), engines.raft.log_batch(64));
+    batch.add_write_task(task);
+    batch.before_write_to_db(&StoreWriteMetrics::new(false));
+    if !batch.kv_wb.is_empty() {
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        batch.kv_wb.write_opt(&write_opts).unwrap_or_else(|e| {
+            panic!("test failed to write to kv engine: {:?}", e);
+        });
+    }
+    if !batch.raft_wb.is_empty() {
+        engines
+            .raft
+            .consume_and_shrink(&mut batch.raft_wb, false, RAFT_WB_SHRINK_SIZE, 64)
+            .unwrap_or_else(|e| {
+                panic!("test failed to write to raft engine: {:?}", e);
+            });
     }
 }
 
