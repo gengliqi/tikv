@@ -85,7 +85,7 @@ pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 const ENTRY_CACHE_EVICT_TICK_DURATION: Duration = Duration::from_secs(1);
 
-use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriters};
+use crate::store::async_io::write::{StoreWriters, WriteMsg};
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -382,7 +382,7 @@ where
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
     pub is_disk_full: bool,
-    pub async_write_senders: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    pub write_senders: Vec<Sender<WriteMsg<EK, ER>>>,
     pub io_reschedule_concurrent_count: Arc<AtomicUsize>,
 }
 
@@ -837,7 +837,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     pub engines: Engines<EK, ER>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
     feature_gate: FeatureGate,
-    async_write_senders: Vec<Sender<AsyncWriteMsg<EK, ER>>>,
+    write_senders: Vec<Sender<WriteMsg<EK, ER>>>,
     io_reschedule_concurrent_count: Arc<AtomicUsize>,
 }
 
@@ -1054,7 +1054,7 @@ where
             node_start_time: Some(TiInstant::now_coarse()),
             feature_gate: self.feature_gate.clone(),
             is_disk_full: false,
-            async_write_senders: self.async_write_senders.clone(),
+            write_senders: self.write_senders.clone(),
             io_reschedule_concurrent_count: self.io_reschedule_concurrent_count.clone(),
         };
         ctx.update_ticks_timeout();
@@ -1093,7 +1093,7 @@ pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
     workers: Option<Workers<EK>>,
-    async_writers: AsyncWriters<EK, ER>,
+    store_writers: StoreWriters<EK, ER>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
@@ -1173,7 +1173,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             .background_worker
             .start("consistency-check", consistency_check_runner);
 
-        self.async_writers.spawn(
+        self.store_writers.spawn(
             meta.get_id(),
             &engines.kv,
             &engines.raft,
@@ -1203,7 +1203,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             store_meta,
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             feature_gate: pd_client.feature_gate().clone(),
-            async_write_senders: self.async_writers.senders().clone(),
+            write_senders: self.store_writers.senders().clone(),
             io_reschedule_concurrent_count: Arc::new(AtomicUsize::new(0)),
         };
         let region_peers = builder.init()?;
@@ -1327,7 +1327,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         self.apply_system.shutdown();
         fail_point!("after_shutdown_apply");
         self.system.shutdown();
-        self.async_writers.shutdown();
+        self.store_writers.shutdown();
         if let Some(h) = handle {
             h.join().unwrap();
         }
@@ -1352,7 +1352,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
         apply_router,
         apply_system,
         router: raft_router.clone(),
-        async_writers: AsyncWriters::new(),
+        store_writers: StoreWriters::new(),
     };
     (raft_router, system)
 }

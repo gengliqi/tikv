@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::coprocessor::{CoprocessorHost, RegionChangeEvent};
 use crate::errors::RAFTSTORE_IS_BUSY;
-use crate::store::async_io::write::{AsyncWriteMsg, AsyncWriteTask};
+use crate::store::async_io::write::{WriteMsg, WriteTask};
 use crate::store::fsm::apply::CatchUpLogs;
 use crate::store::fsm::store::PollContext;
 use crate::store::fsm::{apply, Apply, ApplyMetrics, ApplyTask, CollectedReady, Proposal};
@@ -558,9 +558,11 @@ where
     unpersisted_message_count: usize,
     persisted_number: u64,
     snap_ctx: Option<SnapshotContext>,
-    /// The choose id of async writer thread.
-    async_writer_id: Option<(usize, UtilInstant, usize)>,
-    pending_write_tasks: Option<(Vec<AsyncWriteTask<EK, ER>>, u64)>,
+    /// (chosen id of writer thread, last chosen time, reschedule retry count)
+    current_writer_id: Option<(usize, UtilInstant, usize)>,
+    /// Used for rescheduling to another write thread.
+    /// (pending write tasks, the last unpersisted ready number since rescheduling)
+    pending_write_tasks: Option<(Vec<WriteTask<EK, ER>>, u64)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -664,7 +666,7 @@ where
             unpersisted_message_count: 0,
             persisted_number: 0,
             snap_ctx: None,
-            async_writer_id: None,
+            current_writer_id: None,
             pending_write_tasks: None,
         };
 
@@ -1219,7 +1221,7 @@ where
         let has_snap_task = self.get_store().has_gen_snap_task();
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.step(m)?;
-        self.report_know_commit_duration(pre_commit_index, &mut ctx.raft_metrics);
+        self.report_know_commit_duration(pre_commit_index, &ctx.raft_metrics);
 
         let mut for_balance = false;
         if !has_snap_task && self.get_store().has_gen_snap_task() {
@@ -1241,7 +1243,7 @@ where
         Ok(())
     }
 
-    fn report_know_persist_duration(&self, pre_persist_index: u64, metrics: &mut RaftMetrics) {
+    fn report_know_persist_duration(&self, pre_persist_index: u64, metrics: &RaftMetrics) {
         if !metrics.waterfall_metrics {
             return;
         }
@@ -1265,7 +1267,7 @@ where
         }
     }
 
-    fn report_know_commit_duration(&self, pre_commit_index: u64, metrics: &mut RaftMetrics) {
+    fn report_know_commit_duration(&self, pre_commit_index: u64, metrics: &RaftMetrics) {
         if !metrics.waterfall_metrics {
             return;
         }
@@ -1977,7 +1979,7 @@ where
         }
 
         let has_new_entries = !ready.entries().is_empty();
-        let (ready_res, write_task) = match self.mut_store().handle_raft_ready(
+        let (ready_res, task) = match self.mut_store().handle_raft_ready(
             &mut ready,
             destroy_regions,
             persisted_msgs,
@@ -1995,18 +1997,12 @@ where
             HandleReadyResult::SendIOTask | HandleReadyResult::Snapshot { .. } => {
                 match self.should_send_write_task(ctx) {
                     None => {
-                        self.pending_write_tasks
-                            .as_mut()
-                            .unwrap()
-                            .0
-                            .push(write_task);
+                        self.pending_write_tasks.as_mut().unwrap().0.push(task);
                         STORE_IO_RESCHEDULE_PENDING_TASK_TOTAL_GAUGE.inc();
                     }
                     Some(id) => {
-                        if let Err(e) =
-                            ctx.async_write_senders[id].send(AsyncWriteMsg::WriteTask(write_task))
-                        {
-                            // IO threads are destroyed after store threads during shutdown.
+                        if let Err(e) = ctx.write_senders[id].send(WriteMsg::WriteTask(task)) {
+                            // Write threads are destroyed after store threads during shutdown.
                             panic!("{} failed to send write msg, err: {:?}", self.tag, e);
                         }
                     }
@@ -2028,11 +2024,11 @@ where
         let now = UtilInstant::now_coarse();
         if !self.has_unpersisted_ready() {
             let new_id = rand::random::<usize>() % ctx.cfg.store_io_pool_size;
-            self.async_writer_id = Some((new_id, now, 0));
+            self.current_writer_id = Some((new_id, now, 0));
             return Some(new_id);
         }
         // There are some unpersisted readies so `async_writer_id` must not be None
-        let (id, last_time, count) = self.async_writer_id.as_mut().unwrap();
+        let (id, last_time, count) = self.current_writer_id.as_mut().unwrap();
         // Whether the duration doesn't exceed the config value or not
         if now - *last_time
             < ctx.cfg.io_reschedule_hotpot_duration.0 + Duration::from_millis(*count as u64 * 10)
@@ -2266,7 +2262,7 @@ where
                 committed_entries,
                 cbs,
             );
-            apply.on_schedule();
+            apply.on_schedule(&ctx.raft_metrics);
             self.mut_store().trace_cached_entries(apply.entries.clone());
             if needs_evict_entry_cache() {
                 // Compact all cached entries instead of half evict.
@@ -2329,8 +2325,8 @@ where
         let pre_persist_index = self.raft_group.raft.raft_log.persisted;
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.on_persist_ready(persisted_number);
-        self.report_know_persist_duration(pre_persist_index, &mut ctx.raft_metrics);
-        self.report_know_commit_duration(pre_commit_index, &mut ctx.raft_metrics);
+        self.report_know_persist_duration(pre_persist_index, &ctx.raft_metrics);
+        self.report_know_commit_duration(pre_commit_index, &ctx.raft_metrics);
 
         if let Some((_, last_number)) = self.pending_write_tasks.as_ref() {
             if persisted_number >= *last_number {
@@ -2339,13 +2335,11 @@ where
                 STORE_IO_RESCHEDULE_REGION_TOTAL_GAUGE.dec();
                 let (tasks, _) = self.pending_write_tasks.take().unwrap();
                 let new_id = rand::random::<usize>() % ctx.cfg.store_io_pool_size;
-                self.async_writer_id = Some((new_id, UtilInstant::now_coarse(), 0));
+                self.current_writer_id = Some((new_id, UtilInstant::now_coarse(), 0));
                 STORE_IO_RESCHEDULE_PENDING_TASK_TOTAL_GAUGE.sub(tasks.len() as i64);
                 for task in tasks {
-                    if let Err(e) =
-                        ctx.async_write_senders[new_id].send(AsyncWriteMsg::WriteTask(task))
-                    {
-                        // IO threads are destroyed after store threads during shutdown.
+                    if let Err(e) = ctx.write_senders[new_id].send(WriteMsg::WriteTask(task)) {
+                        // Write threads are destroyed after store threads during shutdown.
                         panic!("{} failed to send write msg, err: {:?}", self.tag, e);
                     }
                 }

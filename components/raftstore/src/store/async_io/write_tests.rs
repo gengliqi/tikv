@@ -166,7 +166,7 @@ fn delete_kv(wb: &mut Option<RocksWriteBatch>, key: &[u8]) {
 }
 
 struct TestAsyncWriteWorker {
-    worker: AsyncWriteWorker<KvTestEngine, KvTestEngine, TestTransport, TestNotifier>,
+    worker: Worker<KvTestEngine, KvTestEngine, TestTransport, TestNotifier>,
     msg_rx: Receiver<RaftMessage>,
     notify_rx: Receiver<(u64, (u64, u64))>,
 }
@@ -179,9 +179,10 @@ impl TestAsyncWriteWorker {
         let (notify_tx, notify_rx) = channel();
         let notifier = TestNotifier { tx: notify_tx };
         Self {
-            worker: AsyncWriteWorker::new(
+            worker: Worker::new(
                 1,
                 "writer".to_string(),
+                0,
                 kv_engine.clone(),
                 raft_engine.clone(),
                 task_rx,
@@ -196,7 +197,7 @@ impl TestAsyncWriteWorker {
 }
 
 struct TestAsyncWriters {
-    writers: AsyncWriters<KvTestEngine, KvTestEngine>,
+    writers: StoreWriters<KvTestEngine, KvTestEngine>,
     msg_rx: Receiver<RaftMessage>,
     notify_rx: Receiver<(u64, (u64, u64))>,
 }
@@ -207,7 +208,7 @@ impl TestAsyncWriters {
         let trans = TestTransport { tx: msg_tx };
         let (notify_tx, notify_rx) = channel();
         let notifier = TestNotifier { tx: notify_tx };
-        let mut writers = AsyncWriters::new();
+        let mut writers = StoreWriters::new();
         writers
             .spawn(1, kv_engine, raft_engine, &notifier, &trans, &cfg)
             .unwrap();
@@ -218,7 +219,7 @@ impl TestAsyncWriters {
         }
     }
 
-    fn async_write_sender(&self, id: usize) -> &Sender<AsyncWriteMsg<KvTestEngine, KvTestEngine>> {
+    fn async_write_sender(&self, id: usize) -> &Sender<WriteMsg<KvTestEngine, KvTestEngine>> {
         &self.writers.senders()[id]
     }
 }
@@ -229,7 +230,7 @@ fn test_batch_write() {
     let (_dir, raft_engine) = create_tmp_engine("async-io-batch-raft");
     let mut t = TestAsyncWriteWorker::new(&Config::default(), &kv_engine, &raft_engine);
 
-    let mut task_1 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 10);
+    let mut task_1 = WriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 10);
     task_1.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_1.kv_wb, b"kv_k1", b"kv_v1");
     task_1.raft_wb = Some(raft_engine.write_batch());
@@ -243,9 +244,9 @@ fn test_batch_write() {
     task_1.raft_state = Some(new_raft_state(5, 123, 6, 8));
     task_1.messages.append(&mut vec![RaftMessage::default()]);
 
-    t.worker.wb.add_write_task(task_1);
+    t.worker.batch.add_write_task(task_1);
 
-    let mut task_2 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(2, 2, 15);
+    let mut task_2 = WriteTask::<KvTestEngine, KvTestEngine>::new(2, 2, 15);
     task_2.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_2.kv_wb, b"kv_k2", b"kv_v2");
     task_2.raft_wb = Some(raft_engine.write_batch());
@@ -258,9 +259,9 @@ fn test_batch_write() {
         .messages
         .append(&mut vec![RaftMessage::default(), RaftMessage::default()]);
 
-    t.worker.wb.add_write_task(task_2);
+    t.worker.batch.add_write_task(task_2);
 
-    let mut task_3 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 11);
+    let mut task_3 = WriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 11);
     task_3.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_3.kv_wb, b"kv_k3", b"kv_v3");
     task_3.raft_wb = Some(raft_engine.write_batch());
@@ -275,7 +276,7 @@ fn test_batch_write() {
         .messages
         .append(&mut vec![RaftMessage::default(), RaftMessage::default()]);
 
-    t.worker.wb.add_write_task(task_3);
+    t.worker.batch.add_write_task(task_3);
 
     t.worker.write_to_db();
 
@@ -318,7 +319,7 @@ fn test_basic_flow() {
     cfg.store_io_pool_size = 2;
     let mut t = TestAsyncWriters::new(&cfg, &kv_engine, &raft_engine);
 
-    let mut task_1 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 10);
+    let mut task_1 = WriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 10);
     task_1.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_1.kv_wb, b"kv_k1", b"kv_v1");
     task_1.raft_wb = Some(raft_engine.write_batch());
@@ -332,10 +333,10 @@ fn test_basic_flow() {
         .append(&mut vec![RaftMessage::default(), RaftMessage::default()]);
 
     t.async_write_sender(0)
-        .send(AsyncWriteMsg::WriteTask(task_1))
+        .send(WriteMsg::WriteTask(task_1))
         .unwrap();
 
-    let mut task_2 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(2, 2, 20);
+    let mut task_2 = WriteTask::<KvTestEngine, KvTestEngine>::new(2, 2, 20);
     task_2.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_2.kv_wb, b"kv_k2", b"kv_v2");
     task_2.raft_wb = Some(raft_engine.write_batch());
@@ -349,10 +350,10 @@ fn test_basic_flow() {
         .append(&mut vec![RaftMessage::default(), RaftMessage::default()]);
 
     t.async_write_sender(1)
-        .send(AsyncWriteMsg::WriteTask(task_2))
+        .send(WriteMsg::WriteTask(task_2))
         .unwrap();
 
-    let mut task_3 = AsyncWriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 15);
+    let mut task_3 = WriteTask::<KvTestEngine, KvTestEngine>::new(1, 1, 15);
     task_3.kv_wb = Some(kv_engine.write_batch());
     put_kv(&mut task_3.kv_wb, b"kv_k3", b"kv_v3");
     delete_kv(&mut task_3.kv_wb, b"kv_k1");
@@ -367,7 +368,7 @@ fn test_basic_flow() {
         .append(&mut vec![RaftMessage::default(), RaftMessage::default()]);
 
     t.async_write_sender(0)
-        .send(AsyncWriteMsg::WriteTask(task_3))
+        .send(WriteMsg::WriteTask(task_3))
         .unwrap();
 
     must_wait_same_notifies(vec![(1, (1, 15)), (2, (2, 20))], &t.notify_rx);
