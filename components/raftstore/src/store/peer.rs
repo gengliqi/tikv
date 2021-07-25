@@ -2118,10 +2118,15 @@ where
                     // we can safely consider it is persisted so the persisted msgs can be sent immediately.
                     self.persisted_number = ready.number();
                     self.send_raft_msg(&mut ctx.trans, msgs, &mut ctx.raft_metrics.send_message);
-                    // The light ready don't need to be handled because no data needs to be persisted.
-                    // On the other hand, if there are something need to be handled, they should be handled
-                    // after getting this ready.
-                    let _ = self.raft_group.advance_append(ready);
+                    // The commit index and messages of light ready should be empty because no data needs 
+                    // to be persisted. Only the committed entries may not be empty when the size is too
+                    // large to be fetched in the previous ready.
+                    let mut light_rd = self.raft_group.advance_append(ready);
+                    assert!(light_rd.commit_index().is_none());
+                    assert!(light_rd.messages().is_empty());
+                    if !light_rd.committed_entries().is_empty() {
+                        self.handle_raft_committed_entries(ctx, light_rd.take_committed_entries());
+                    }
                 }
             }
         }
