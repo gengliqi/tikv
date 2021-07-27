@@ -9,7 +9,7 @@ use std::{cmp, mem, u64, usize};
 
 use bitflags::bitflags;
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel::TrySendError;
+use crossbeam::channel::{Sender, TrySendError};
 use engine_traits::{Engines, KvEngine, RaftEngine, Snapshot, WriteBatch, WriteOptions};
 use error_code::ErrorCodeExt;
 use fail::fail_point;
@@ -2001,10 +2001,7 @@ where
                         STORE_IO_RESCHEDULE_PENDING_TASK_TOTAL_GAUGE.inc();
                     }
                     Some(id) => {
-                        if let Err(e) = ctx.write_senders[id].send(WriteMsg::WriteTask(task)) {
-                            // Write threads are destroyed after store threads during shutdown.
-                            panic!("{} failed to send write msg, err: {:?}", self.tag, e);
-                        }
+                        self.send_write_msg(&ctx.write_senders[id], WriteMsg::WriteTask(task));
                     }
                 }
             }
@@ -2014,7 +2011,7 @@ where
         Some(CollectedReady::new(ready_res, ready, has_new_entries))
     }
 
-    pub fn should_send_write_task<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) -> Option<usize> {
+    fn should_send_write_task<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) -> Option<usize> {
         if self.pending_write_tasks.is_some() {
             return None;
         }
@@ -2071,6 +2068,23 @@ where
         }
     }
 
+    fn send_write_msg(&self, sender: &Sender<WriteMsg<EK, ER>>, msg: WriteMsg<EK, ER>) {
+        match sender.try_send(msg) {
+            Ok(()) => return,
+            Err(TrySendError::Full(msg)) => {
+                // TODO: add metrics
+                if let Err(_) = sender.send(msg) {
+                    // Write threads are destroyed after store threads during shutdown.
+                    panic!("{} failed to send write msg, err: disconnected", self.tag);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Write threads are destroyed after store threads during shutdown.
+                panic!("{} failed to send write msg, err: disconnected", self.tag);
+            }
+        }
+    }
+
     pub fn post_raft_ready_append<T: Transport>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
@@ -2118,7 +2132,7 @@ where
                     // we can safely consider it is persisted so the persisted msgs can be sent immediately.
                     self.persisted_number = ready.number();
                     self.send_raft_msg(&mut ctx.trans, msgs, &mut ctx.raft_metrics.send_message);
-                    // The commit index and messages of light ready should be empty because no data needs 
+                    // The commit index and messages of light ready should be empty because no data needs
                     // to be persisted. Only the committed entries may not be empty when the size is too
                     // large to be fetched in the previous ready.
                     let mut light_rd = self.raft_group.advance_append(ready);
@@ -2337,16 +2351,18 @@ where
             if persisted_number >= *last_number {
                 ctx.io_reschedule_concurrent_count
                     .fetch_sub(1, Ordering::SeqCst);
+
                 STORE_IO_RESCHEDULE_REGION_TOTAL_GAUGE.dec();
-                let (tasks, _) = self.pending_write_tasks.take().unwrap();
+
                 let new_id = rand::random::<usize>() % ctx.cfg.store_io_pool_size;
                 self.current_writer_id = Some((new_id, UtilInstant::now_coarse(), 0));
+
+                let (tasks, _) = self.pending_write_tasks.take().unwrap();
+
                 STORE_IO_RESCHEDULE_PENDING_TASK_TOTAL_GAUGE.sub(tasks.len() as i64);
+
                 for task in tasks {
-                    if let Err(e) = ctx.write_senders[new_id].send(WriteMsg::WriteTask(task)) {
-                        // Write threads are destroyed after store threads during shutdown.
-                        panic!("{} failed to send write msg, err: {:?}", self.tag, e);
-                    }
+                    self.send_write_msg(&ctx.write_senders[new_id], WriteMsg::WriteTask(task));
                 }
             }
         }

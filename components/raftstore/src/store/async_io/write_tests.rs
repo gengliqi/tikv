@@ -1,5 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use crate::store::{Config, Transport};
@@ -154,9 +155,9 @@ fn must_wait_same_notifies(
         }
 
         if timer.elapsed() > Duration::from_secs(5) {
-            panic!("wait some notifies after 3 seconds")
+            panic!("wait some notifies after 5 seconds")
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -189,12 +190,12 @@ struct TestWorker {
 
 impl TestWorker {
     fn new(cfg: &Config, engines: &Engines<KvTestEngine, KvTestEngine>) -> Self {
-        let (_, task_rx) = channel();
-        let (msg_tx, msg_rx) = channel();
+        let (_, task_rx) = unbounded();
+        let (msg_tx, msg_rx) = unbounded();
         let trans = TestTransport { tx: msg_tx };
-        let (notify_tx, notify_rx) = channel();
+        let (notify_tx, notify_rx) = unbounded();
         let notifier = TestNotifier { tx: notify_tx };
-        let (sync_sender, sync_receiver) = channel();
+        let (sync_sender, sync_receiver) = unbounded();
         Self {
             worker: Worker::new(
                 1,
@@ -215,6 +216,72 @@ impl TestWorker {
     }
 }
 
+struct TestEngineSync(Arc<AtomicUsize>);
+
+impl EngineSync for TestEngineSync {
+    fn sync(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct TestSyncWorker {
+    worker: Option<SyncWorker<KvTestEngine, KvTestEngine, TestEngineSync>>,
+    sender: Sender<SyncMsg>,
+    write_receivers: Vec<Receiver<WriteMsg<KvTestEngine, KvTestEngine>>>,
+    global_persisted_ids: Vec<Arc<CachePadded<AtomicU64>>>,
+    sync_cnt: Arc<AtomicUsize>,
+}
+
+impl TestSyncWorker {
+    fn new(cfg: &Config) -> Self {
+        let (mut write_senders, mut write_receivers) = (vec![], vec![]);
+        let (sender, receiver) = unbounded();
+        let mut global_persisted_ids = vec![];
+        for _ in 0..cfg.store_io_pool_size {
+            let (tx, rx) = unbounded();
+            write_senders.push(tx);
+            write_receivers.push(rx);
+            global_persisted_ids.push(Arc::new(CachePadded::new(AtomicU64::new(0))));
+        }
+        let sync_cnt = Arc::new(AtomicUsize::new(0));
+        Self {
+            worker: Some(SyncWorker::new(
+                TestEngineSync(sync_cnt.clone()),
+                receiver,
+                write_senders,
+                global_persisted_ids.clone(),
+            )),
+            sender,
+            write_receivers,
+            global_persisted_ids,
+            sync_cnt,
+        }
+    }
+
+    fn wait_for_sync(&self) {}
+
+    fn must_have_persisted_msg(&self, worker_id: usize) {
+        let mut res = true;
+        while let Ok(m) = self.write_receivers[worker_id].try_recv() {
+            if let WriteMsg::Persisted = m {
+                res = true;
+            } else {
+                panic!("write msg {:?} is not persisted msg", m);
+            }
+        }
+        if !res {
+            panic!("no persisted msg");
+        }
+    }
+
+    fn must_same_persisted_id(&self, worker_id: usize, persisted_id: u64) {
+        assert_eq!(
+            self.global_persisted_ids[worker_id].load(Ordering::SeqCst),
+            persisted_id
+        );
+    }
+}
+
 struct TestWriters {
     writers: StoreWriters<KvTestEngine, KvTestEngine>,
     msg_rx: Receiver<RaftMessage>,
@@ -223,9 +290,9 @@ struct TestWriters {
 
 impl TestWriters {
     fn new(cfg: &Config, engines: &Engines<KvTestEngine, KvTestEngine>) -> Self {
-        let (msg_tx, msg_rx) = channel();
+        let (msg_tx, msg_rx) = unbounded();
         let trans = TestTransport { tx: msg_tx };
-        let (notify_tx, notify_rx) = channel();
+        let (notify_tx, notify_rx) = unbounded();
         let notifier = TestNotifier { tx: notify_tx };
         let mut writers = StoreWriters::new();
         writers.spawn(1, &engines, &notifier, &trans, &cfg).unwrap();
@@ -340,6 +407,50 @@ fn test_worker() {
     );
 
     must_have_same_count_msg(5, &t.msg_rx);
+}
+
+#[test]
+fn test_sync_worker() {
+    let mut cfg = Config::default();
+    cfg.store_io_pool_size = 3;
+    let mut t = TestSyncWorker::new(&cfg);
+    let msg = [(0, 1), (0, 2), (1, 3), (1, 4)];
+    for (a, b) in msg.iter() {
+        t.sender
+            .send(SyncMsg::Sync {
+                worker_id: *a,
+                unpersisted_id: *b,
+            })
+            .unwrap();
+    }
+
+    let mut worker = t.worker.take().unwrap();
+    let handler = thread::spawn(move || {
+        worker.run();
+    });
+
+    let timer = Instant::now();
+    loop {
+        if t.sync_cnt.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        if timer.elapsed() > Duration::from_secs(5) {
+            panic!("wait sync after 5 seconds")
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Wait for notifying after sync
+    thread::sleep(Duration::from_millis(50));
+    t.must_have_persisted_msg(0);
+    t.must_have_persisted_msg(1);
+    t.must_have_persisted_msg(2);
+    t.must_same_persisted_id(0, 2);
+    t.must_same_persisted_id(1, 4);
+    t.must_same_persisted_id(2, 0);
+
+    t.sender.send(SyncMsg::Shutdown).unwrap();
+    handler.join().unwrap();
 }
 
 #[test]
