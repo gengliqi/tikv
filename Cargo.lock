@@ -3334,7 +3334,7 @@ dependencies = [
 [[package]]
 name = "raft"
 version = "0.6.0"
-source = "git+https://github.com/tikv/raft-rs?branch=master#e6d28ef0f509c072e13288409835d5764a3b175e"
+source = "git+https://github.com/gengliqi/raft-rs?branch=demo-apply-unpersisted-log#13adf2ae1cc2398aa37bfae1357957157ff03362"
 dependencies = [
  "bytes 1.0.1",
  "fxhash",
@@ -3372,7 +3372,7 @@ dependencies = [
 [[package]]
 name = "raft-proto"
 version = "0.6.0"
-source = "git+https://github.com/tikv/raft-rs?branch=master#e6d28ef0f509c072e13288409835d5764a3b175e"
+source = "git+https://github.com/gengliqi/raft-rs?branch=demo-apply-unpersisted-log#13adf2ae1cc2398aa37bfae1357957157ff03362"
 dependencies = [
  "bytes 1.0.1",
  "lazy_static",
