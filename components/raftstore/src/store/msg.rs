@@ -14,7 +14,7 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::replication_modepb::ReplicationStatus;
 use kvproto::{import_sstpb::SstMeta, kvrpcpb::DiskFullOpt};
 use raft::SnapshotStatus;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::store::fsm::apply::TaskRes as ApplyTaskRes;
 use crate::store::fsm::apply::{CatchUpLogs, ChangeObserver};
@@ -100,7 +100,7 @@ where
             cb,
             proposed_cb,
             committed_cb,
-            request_times: SmallVec::new(),
+            request_times: smallvec![Instant::now()],
         }
     }
 
@@ -420,7 +420,7 @@ impl<EK: KvEngine> fmt::Debug for CasualMessage<EK> {
 }
 
 /// control options for raftcmd.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RaftCmdExtraOpts {
     pub deadline: Option<Deadline>,
     pub disk_full_opt: DiskFullOpt,

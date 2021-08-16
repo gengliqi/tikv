@@ -32,7 +32,7 @@ use kvproto::replication_modepb::{DrAutoSyncState, ReplicationMode};
 use protobuf::Message;
 use raft::eraftpb::{ConfChangeType, MessageType};
 use raft::{self, Progress, ReadState, Ready, SnapshotStatus, StateRole, INVALID_INDEX, NO_LIMIT};
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 use tikv_alloc::trace::TraceEvent;
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
 use tikv_util::sys::disk::DiskUsage;
@@ -143,7 +143,7 @@ where
     raft_entry_max_size: f64,
     batch_req_size: u32,
     request: Option<RaftCmdRequest>,
-    callbacks: Vec<(Callback<E::Snapshot>, usize, TiInstant)>,
+    callbacks: Vec<(Callback<E::Snapshot>, usize)>,
 }
 
 impl<EK, ER> Drop for PeerFsm<EK, ER>
@@ -388,7 +388,6 @@ where
     fn add(&mut self, cmd: RaftCommand<E::Snapshot>, req_size: u32) {
         let req_num = cmd.request.get_requests().len();
         let RaftCommand {
-            send_time,
             mut request,
             callback,
             ..
@@ -401,7 +400,7 @@ where
         } else {
             self.request = Some(request);
         };
-        self.callbacks.push((callback, req_num, send_time));
+        self.callbacks.push((callback, req_num));
         self.batch_req_size += req_size;
     }
 
@@ -419,20 +418,15 @@ where
         false
     }
 
-    fn build(&mut self, metric: &mut RaftMetrics) -> Option<RaftCommand<E::Snapshot>> {
+    fn build(
+        &mut self,
+        metric: &mut RaftMetrics,
+    ) -> Option<(RaftCmdRequest, Callback<E::Snapshot>)> {
         if let Some(req) = self.request.take() {
             self.batch_req_size = 0;
             if self.callbacks.len() == 1 {
-                let (mut cb, _, send_time) = self.callbacks.pop().unwrap();
-                if let Callback::Write { request_times, .. } = &mut cb {
-                    if metric.waterfall_metrics {
-                        metric
-                            .batch_wait
-                            .observe(send_time.saturating_elapsed_secs());
-                    }
-                    *request_times = smallvec![send_time];
-                }
-                return Some(RaftCommand::new(req, cb));
+                let (cb, _) = self.callbacks.pop().unwrap();
+                return Some((req, cb));
             }
             metric.propose.batch += self.callbacks.len() - 1;
             let mut cbs = std::mem::take(&mut self.callbacks);
@@ -475,17 +469,11 @@ where
                 }))
             };
 
-            let now = TiInstant::now();
             let times: SmallVec<[TiInstant; 4]> = cbs
                 .iter_mut()
                 .filter_map(|cb| {
-                    if let Callback::Write { .. } = &mut cb.0 {
-                        if metric.waterfall_metrics {
-                            metric
-                                .batch_wait
-                                .observe(duration_to_sec(now.saturating_duration_since(cb.2)));
-                        }
-                        Some(cb.2)
+                    if let Callback::Write { request_times, .. } = &mut cb.0 {
+                        Some(request_times[0])
                     } else {
                         None
                     }
@@ -496,7 +484,7 @@ where
                 Box::new(move |resp| {
                     let mut last_index = 0;
                     let has_error = resp.response.get_header().has_error();
-                    for (cb, req_num, _) in cbs {
+                    for (cb, req_num) in cbs {
                         let next_index = last_index + req_num;
                         let mut cmd_resp = RaftCmdResponse::default();
                         cmd_resp.set_header(resp.response.get_header().clone());
@@ -517,7 +505,7 @@ where
                 *request_times = times;
             }
 
-            return Some(RaftCommand::new(req, cb));
+            return Some((req, cb));
         }
         None
     }
@@ -605,7 +593,9 @@ where
                         // Avoid to merge requests with different `DiskFullOpt`s into one,
                         // so that normal writes can be rejected when proposing if the
                         // store's disk is full.
-                        && cmd.extra_opts.disk_full_opt == DiskFullOpt::NotAllowedOnFull
+                        && ((self.ctx.self_disk_usage == DiskUsage::Normal
+                            && !self.fsm.peer.disk_full_peers.majority())
+                            || cmd.extra_opts.disk_full_opt == DiskFullOpt::NotAllowedOnFull)
                     {
                         self.fsm.batch_req_builder.add(cmd, req_size);
                         if self.fsm.batch_req_builder.should_finish() {
@@ -664,8 +654,10 @@ where
     }
 
     fn propose_batch_raft_command(&mut self) {
-        if let Some(cmd) = self.fsm.batch_req_builder.build(&mut self.ctx.raft_metrics) {
-            self.propose_raft_command(cmd.request, cmd.callback, DiskFullOpt::NotAllowedOnFull)
+        if let Some((request, callback)) =
+            self.fsm.batch_req_builder.build(&mut self.ctx.raft_metrics)
+        {
+            self.propose_raft_command(request, callback, DiskFullOpt::NotAllowedOnFull)
         }
     }
 
@@ -1245,6 +1237,12 @@ where
             return;
         }
 
+        // Keep ticking if there are disk full peers for the Region.
+        if !self.fsm.peer.disk_full_peers.is_empty() {
+            self.register_raft_base_tick();
+            return;
+        }
+
         debug!("stop ticking"; "region_id" => self.region_id(), "peer_id" => self.fsm.peer_id(), "res" => ?res);
         self.fsm.reset_hibernate_state(GroupState::Idle);
         // Followers will stop ticking at L789. Keep ticking for followers
@@ -1312,27 +1310,38 @@ where
     }
 
     fn handle_reported_disk_usage(&mut self, msg: &RaftMessage) {
-        let peer_id = msg.get_from_peer().get_id();
         let store_id = msg.get_from_peer().get_store_id();
-        let disk_full_peers = &mut self.fsm.peer.disk_full_peers;
-
-        if matches!(msg.disk_usage, DiskUsage::Normal) {
+        let peer_id = msg.get_from_peer().get_id();
+        let refill_disk_usages = if matches!(msg.disk_usage, DiskUsage::Normal) {
             self.ctx.store_disk_usages.remove(&store_id);
-            if disk_full_peers.any && disk_full_peers.peers.contains_key(&peer_id) {
-                disk_full_peers.peers = HashMap::default();
+            if !self.fsm.peer.is_leader() {
+                return;
             }
-            return;
-        }
-
-        self.ctx.store_disk_usages.insert(store_id, msg.disk_usage);
-        if !disk_full_peers.any {
-            disk_full_peers.any = true;
-        } else if disk_full_peers
-            .peers
-            .get(&peer_id)
-            .map_or(true, |x| x.0 != msg.disk_usage)
-        {
-            disk_full_peers.peers = HashMap::default();
+            self.fsm.peer.disk_full_peers.has(peer_id)
+        } else {
+            self.ctx.store_disk_usages.insert(store_id, msg.disk_usage);
+            if !self.fsm.peer.is_leader() {
+                return;
+            }
+            let disk_full_peers = &self.fsm.peer.disk_full_peers;
+            disk_full_peers.is_empty()
+                || disk_full_peers
+                    .get(peer_id)
+                    .map_or(true, |x| x != msg.disk_usage)
+        };
+        if refill_disk_usages {
+            let prev = self.fsm.peer.disk_full_peers.get(peer_id);
+            info!(
+                "reported disk usage changes {:?} -> {:?}", prev, msg.disk_usage;
+                "region_id" => self.fsm.region_id(),
+                "peer_id" => peer_id,
+            );
+            self.fsm.peer.refill_disk_full_peers(self.ctx);
+            debug!(
+                "raft message refills disk full peers to {:?}",
+                self.fsm.peer.disk_full_peers;
+                "region_id" => self.fsm.region_id(),
+            );
         }
     }
 
@@ -2311,6 +2320,15 @@ where
                 "region" => ?self.fsm.peer.region(),
             );
             self.fsm.peer.heartbeat_pd(self.ctx);
+
+            if !self.fsm.peer.disk_full_peers.is_empty() {
+                self.fsm.peer.refill_disk_full_peers(self.ctx);
+                debug!(
+                    "conf change refills disk full peers to {:?}",
+                    self.fsm.peer.disk_full_peers;
+                    "region_id" => self.fsm.region_id(),
+                );
+            }
 
             // Remove or demote leader will cause this raft group unavailable
             // until new leader elected, but we can't revert this operation
@@ -3516,6 +3534,18 @@ where
             return;
         }
 
+        if self.ctx.raft_metrics.waterfall_metrics {
+            if let Some(request_times) = cb.get_request_times() {
+                let now = TiInstant::now();
+                for t in request_times {
+                    self.ctx
+                        .raft_metrics
+                        .batch_wait
+                        .observe(duration_to_sec(now.saturating_duration_since(*t)));
+                }
+            }
+        }
+
         match self.pre_propose_raft_command(&msg) {
             Ok(Some(resp)) => {
                 cb.invoke_with_response(resp);
@@ -4587,17 +4617,17 @@ mod tests {
             let cmd = RaftCommand::new(req.clone(), cb);
             builder.add(cmd, 100);
         }
-        let mut cmd = builder.build(&mut metric).unwrap();
-        cmd.callback.invoke_proposed();
+        let (request, mut callback) = builder.build(&mut metric).unwrap();
+        callback.invoke_proposed();
         for flag in proposed_cbs_flags {
             assert!(flag.load(Ordering::Acquire));
         }
-        cmd.callback.invoke_committed();
+        callback.invoke_committed();
         for flag in committed_cbs_flags {
             assert!(flag.load(Ordering::Acquire));
         }
-        assert_eq!(10, cmd.request.get_requests().len());
-        cmd.callback.invoke_with_response(response);
+        assert_eq!(10, request.get_requests().len());
+        callback.invoke_with_response(response);
         for flag in cbs_flags {
             assert!(flag.load(Ordering::Acquire));
         }
