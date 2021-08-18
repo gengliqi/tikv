@@ -905,7 +905,8 @@ where
         let region_id = self.region_id();
         let msg =
             new_read_index_request(region_id, region_epoch.clone(), self.fsm.peer.peer.clone());
-        let apply_router = self.ctx.apply_router.clone();
+        //let apply_router = self.ctx.apply_router.clone();
+        let sender = self.ctx.apply_senders[self.fsm.peer.apply_chosen_id].clone();
         self.propose_raft_command(
             msg,
             Callback::Read(Box::new(move |resp| {
@@ -914,14 +915,22 @@ where
                     cb.invoke_read(resp);
                     return;
                 }
-                apply_router.schedule_task(
+                let _ = sender.send((
                     region_id,
                     ApplyTask::Change {
                         cmd,
                         region_epoch,
                         cb,
                     },
-                )
+                ));
+                /*apply_router.schedule_task(
+                    region_id,
+                    ApplyTask::Change {
+                        cmd,
+                        region_epoch,
+                        cb,
+                    },
+                )*/
             })),
             DiskFullOpt::NotAllowedOnFull,
         );
@@ -1270,6 +1279,7 @@ where
                 }
                 self.fsm.has_ready |= self.fsm.peer.post_apply(
                     self.ctx,
+                    res.first_index,
                     res.apply_state,
                     res.applied_index_term,
                     &res.metrics,
@@ -2593,6 +2603,8 @@ where
         if is_leader {
             self.on_split_region_check_tick();
         }
+        self.fsm.peer.activate(self.ctx);
+        self.fsm.peer.parallel_apply = true;
         fail_point!("after_split", self.ctx.store_id() == 3, |_| {});
     }
 

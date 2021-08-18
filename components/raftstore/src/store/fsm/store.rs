@@ -62,6 +62,7 @@ use crate::store::fsm::ApplyNotifier;
 use crate::store::fsm::ApplyTaskRes;
 use crate::store::fsm::{
     create_apply_batch_system, ApplyBatchSystem, ApplyPollerBuilder, ApplyRes, ApplyRouter,
+    ApplyTask,
 };
 use crate::store::local_metrics::RaftMetrics;
 use crate::store::memory::*;
@@ -89,6 +90,8 @@ const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 const ENTRY_CACHE_EVICT_TICK_DURATION: Duration = Duration::from_secs(1);
 
 use crate::store::async_io::write::{StoreWriters, WriteMsg};
+
+use super::apply::ApplySystem;
 
 pub struct StoreInfo<E> {
     pub engine: E,
@@ -396,6 +399,8 @@ where
     pub store_disk_usages: HashMap<u64, DiskUsage>,
     pub write_senders: Vec<Sender<WriteMsg<EK, ER>>>,
     pub io_reschedule_concurrent_count: Arc<AtomicUsize>,
+    pub apply_senders: Vec<Sender<(u64, ApplyTask<EK>)>>,
+    pub apply_round_robin: usize,
 }
 
 impl<EK, ER, T> PollContext<EK, ER, T>
@@ -865,6 +870,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     feature_gate: FeatureGate,
     write_senders: Vec<Sender<WriteMsg<EK, ER>>>,
     io_reschedule_concurrent_count: Arc<AtomicUsize>,
+    apply_senders: Vec<Sender<(u64, ApplyTask<EK>)>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1084,6 +1090,8 @@ where
             store_disk_usages: Default::default(),
             write_senders: self.write_senders.clone(),
             io_reschedule_concurrent_count: self.io_reschedule_concurrent_count.clone(),
+            apply_senders: self.apply_senders.clone(),
+            apply_round_robin: rand::random(),
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
@@ -1118,6 +1126,7 @@ pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
     system: BatchSystem<PeerFsm<EK, ER>, StoreFsm<EK>>,
     apply_router: ApplyRouter<EK>,
     apply_system: ApplyBatchSystem<EK>,
+    apply_system_2: ApplySystem<EK>,
     router: RaftRouter<EK, ER>,
     workers: Option<Workers<EK>>,
     store_writers: StoreWriters<EK, ER>,
@@ -1226,6 +1235,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             feature_gate: pd_client.feature_gate().clone(),
             write_senders: self.store_writers.senders().clone(),
             io_reschedule_concurrent_count: Arc::new(AtomicUsize::new(0)),
+            apply_senders: vec![],
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();
@@ -1257,7 +1267,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         &mut self,
         mut workers: Workers<EK>,
         region_peers: Vec<SenderFsmPair<EK, ER>>,
-        builder: RaftPollerBuilder<EK, ER, T>,
+        mut builder: RaftPollerBuilder<EK, ER, T>,
         auto_split_controller: AutoSplitController,
         concurrency_manager: ConcurrencyManager,
         snap_mgr: SnapManager,
@@ -1266,13 +1276,23 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         let cfg = builder.cfg.value().clone();
         let store = builder.store.clone();
 
-        let apply_poller_builder = ApplyPollerBuilder::<EK, W>::new(
+        /*let apply_poller_builder = ApplyPollerBuilder::<EK, W>::new(
             &builder,
             Box::new(self.router.clone()),
             self.apply_router.clone(),
         );
         self.apply_system
+            .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));*/
+
+        self.apply_system_2.spawn::<T, ER, W>(
+            &builder,
+            Box::new(self.router.clone()),
+            &self.apply_router,
+        )?;
+        self.apply_system_2
             .schedule_all(region_peers.iter().map(|pair| pair.1.get_peer()));
+
+        builder.apply_senders = self.apply_system_2.senders().clone();
 
         {
             let mut meta = builder.store_meta.lock().unwrap();
@@ -1314,8 +1334,8 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             })
             .unwrap();
 
-        self.apply_system
-            .spawn("apply".to_owned(), apply_poller_builder);
+        //self.apply_system
+        //    .spawn("apply".to_owned(), apply_poller_builder);
 
         let pd_runner = PdRunner::new(
             &cfg,
@@ -1349,6 +1369,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         workers.pd_worker.stop();
 
         self.apply_system.shutdown();
+        self.apply_system_2.shutdown();
         MEMTRACE_APPLY_ROUTER_ALIVE.trace(TraceEvent::Reset(0));
         MEMTRACE_APPLY_ROUTER_LEAK.trace(TraceEvent::Reset(0));
 
@@ -1379,6 +1400,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
         workers: None,
         apply_router,
         apply_system,
+        apply_system_2: ApplySystem::new(),
         router: raft_router.clone(),
         store_writers: StoreWriters::new(),
     };

@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -574,6 +574,9 @@ where
     persisted_number: u64,
     /// The context of applying snapshot.
     snap_ctx: Option<SnapshotContext>,
+    pub apply_chosen_id: usize,
+    pub parallel_apply: bool,
+    applied_state: BTreeMap<u64, (RaftApplyState, u64, ApplyMetrics)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -679,6 +682,9 @@ where
             unpersisted_message_count: 0,
             persisted_number: 0,
             snap_ctx: None,
+            apply_chosen_id: rand::random::<usize>() % cfg.apply_batch_system.pool_size,
+            parallel_apply: true,
+            applied_state: BTreeMap::new(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -746,8 +752,11 @@ where
     /// Register self to apply_scheduler so that the peer is then usable.
     /// Also trigger `RegionChangeEvent::Create` here.
     pub fn activate<T>(&self, ctx: &PollContext<EK, ER, T>) {
-        ctx.apply_router
-            .schedule_task(self.region_id, ApplyTask::register(self));
+        for sender in &ctx.apply_senders {
+            let _ = sender.send((self.region_id, ApplyTask::register(self)));
+        }
+        //ctx.apply_router
+        //    .schedule_task(self.region_id, ApplyTask::register(self));
 
         ctx.coprocessor_host.on_region_changed(
             self.region(),
@@ -1879,8 +1888,10 @@ where
             if let Some(gen_task) = self.mut_store().take_gen_snap_task() {
                 self.pending_request_snapshot_count
                     .fetch_add(1, Ordering::SeqCst);
-                ctx.apply_router
-                    .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
+                let _ = ctx.apply_senders[self.apply_chosen_id]
+                    .send((self.region_id, ApplyTask::Snapshot(gen_task)));
+                //ctx.apply_router
+                //    .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
             }
             return None;
         }
@@ -1982,8 +1993,10 @@ where
         if let Some(gen_task) = self.mut_store().take_gen_snap_task() {
             self.pending_request_snapshot_count
                 .fetch_add(1, Ordering::SeqCst);
-            ctx.apply_router
-                .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
+            let _ = ctx.apply_senders[self.apply_chosen_id]
+                .send((self.region_id, ApplyTask::Snapshot(gen_task)));
+            //ctx.apply_router
+            //    .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
         }
 
         let has_new_entries = !ready.entries().is_empty();
@@ -2149,6 +2162,7 @@ where
         }
         // Leader needs to update lease.
         let mut lease_to_be_updated = self.is_leader();
+        let mut has_conf_change = false;
         for entry in committed_entries.iter().rev() {
             // raft meta is very small, can be ignored.
             self.raft_log_size_hint += entry.get_data().len() as u64;
@@ -2162,6 +2176,16 @@ where
                     ));
                     self.maybe_renew_leader_lease(propose_time, ctx, None);
                     lease_to_be_updated = false;
+                }
+            }
+            if self.parallel_apply {
+                if entry.get_entry_type() == EntryType::EntryNormal {
+                    let ctx = ProposalContext::from_bytes(&entry.context);
+                    if ctx.contains(ProposalContext::SPLIT) {
+                        self.parallel_apply = false;
+                    }
+                } else {
+                    has_conf_change = true;
                 }
             }
 
@@ -2218,8 +2242,15 @@ where
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_cache(false);
             }
-            ctx.apply_router
-                .schedule_task(self.region_id, ApplyTask::apply(apply));
+            let id = if self.parallel_apply && !has_conf_change {
+                ctx.apply_round_robin += 1;
+                ctx.apply_round_robin % ctx.apply_senders.len()
+            } else {
+                self.apply_chosen_id
+            };
+            let _ = ctx.apply_senders[id].send((self.region_id, ApplyTask::apply(apply)));
+            //ctx.apply_router
+            //    .schedule_task(self.region_id, ApplyTask::apply(apply));
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }
@@ -2469,6 +2500,35 @@ where
     }
 
     pub fn post_apply<T>(
+        &mut self,
+        ctx: &mut PollContext<EK, ER, T>,
+        first_index: u64,
+        apply_state: RaftApplyState,
+        applied_index_term: u64,
+        apply_metrics: &ApplyMetrics,
+    ) -> bool {
+        if first_index == self.get_store().applied_index() + 1 {
+            let mut has_ready = false;
+            let mut applied_index = apply_state.get_applied_index();
+            has_ready |= self.post_apply_internal(ctx, apply_state, applied_index_term, apply_metrics);
+            while let Some(x) = self.applied_state.first_key_value() {
+                assert!(*x.0 >= applied_index + 1);
+                if *x.0 == applied_index + 1 {
+                    let (_, v) = self.applied_state.pop_first().unwrap();
+                    applied_index = v.0.get_applied_index();
+                    has_ready |= self.post_apply_internal(ctx, v.0, v.1, &v.2);
+                } else {
+                    break;
+                }
+            }
+            return has_ready;
+        }
+        assert!(self.applied_state.insert(first_index, (apply_state, applied_index_term, apply_metrics.clone())).is_none());
+
+        false
+    }
+
+    fn post_apply_internal<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         apply_state: RaftApplyState,

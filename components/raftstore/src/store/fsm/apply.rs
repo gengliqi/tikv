@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::vec::Drain;
 use std::{cmp, usize};
@@ -20,7 +21,9 @@ use batch_system::{
     BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler, Priority,
 };
 use collections::{HashMap, HashMapEntry, HashSet};
-use crossbeam::channel::{TryRecvError, TrySendError};
+use crossbeam::channel::{
+    unbounded, Receiver as CBReceiver, Sender as CBSender, TryRecvError, TrySendError,
+};
 use engine_traits::PerfContext;
 use engine_traits::PerfContextKind;
 use engine_traits::{
@@ -52,7 +55,7 @@ use tikv_util::memory::HeapSize;
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 use tikv_util::time::{duration_to_sec, Instant};
 use tikv_util::worker::Scheduler;
-use tikv_util::{box_err, box_try, debug, error, info, safe_panic, slow_log, warn};
+use tikv_util::{box_err, box_try, debug, error, info, safe_panic, slow_log, thd_name, warn};
 use tikv_util::{Either, MustConsumeVec};
 use time::Timespec;
 use uuid::Builder as UuidBuilder;
@@ -577,6 +580,7 @@ where
         &mut self,
         delegate: &mut ApplyDelegate<EK>,
         results: VecDeque<ExecResult<EK::Snapshot>>,
+        first_index: u64,
     ) {
         if !delegate.pending_remove {
             delegate.write_apply_state(self.kv_wb_mut());
@@ -584,6 +588,7 @@ where
         self.commit_opt(delegate, false);
         self.apply_res.push(ApplyRes {
             region_id: delegate.region_id(),
+            first_index,
             apply_state: delegate.apply_state.clone(),
             exec_res: results,
             metrics: delegate.metrics.clone(),
@@ -781,7 +786,7 @@ where
     /// All of the entries that need to continue to be applied after
     /// the source peer has applied its logs.
     pending_entries: Vec<Entry>,
-    /// All of messages that need to continue to be handled after
+    // All of messages that need to continue to be handled after
     /// the source peer has applied its logs and pending entries
     /// are all handled.
     pending_msgs: Vec<Msg<EK>>,
@@ -797,7 +802,6 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("YieldState")
             .field("pending_entries", &self.pending_entries.len())
-            .field("pending_msgs", &self.pending_msgs.len())
             .finish()
     }
 }
@@ -948,6 +952,7 @@ where
         if committed_entries_drainer.len() == 0 {
             return;
         }
+        let mut first_index = None;
         apply_ctx.prepare_for(self);
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
@@ -955,12 +960,13 @@ where
         apply_ctx.committed_count += committed_entries_drainer.len();
         let mut results = VecDeque::new();
         while let Some(entry) = committed_entries_drainer.next() {
+            first_index = Some(entry.get_index());
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
             }
 
-            let expect_index = self.apply_state.get_applied_index() + 1;
+            /*let expect_index = self.apply_state.get_applied_index() + 1;
             if expect_index != entry.get_index() {
                 panic!(
                     "{} expect index {}, but got {}",
@@ -968,7 +974,7 @@ where
                     expect_index,
                     entry.get_index()
                 );
-            }
+            }*/
 
             // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by `unimplemented!()`,
             // which can break compatibility (i.e. old version tikv running on data written by new version tikv),
@@ -991,7 +997,7 @@ where
                     // Note that current entry is skipped when yield.
                     pending_entries.push(entry);
                     pending_entries.extend(committed_entries_drainer);
-                    apply_ctx.finish_for(self, results);
+                    apply_ctx.finish_for(self, results, first_index.unwrap());
                     self.yield_state = Some(YieldState {
                         pending_entries,
                         pending_msgs: Vec::default(),
@@ -1004,7 +1010,7 @@ where
                 }
             }
         }
-        apply_ctx.finish_for(self, results);
+        apply_ctx.finish_for(self, results, first_index.unwrap());
 
         if self.pending_remove {
             self.destroy(apply_ctx);
@@ -1055,11 +1061,11 @@ where
                 || apply_ctx.kv_wb().should_write_to_engine()
             {
                 apply_ctx.commit(self);
-                if let Some(start) = self.handle_start.as_ref() {
+                /*if let Some(start) = self.handle_start.as_ref() {
                     if start.saturating_elapsed() >= apply_ctx.yield_duration {
                         return ApplyResult::Yield;
                     }
-                }
+                }*/
                 has_unflushed_data = false;
             }
             if self.priority != apply_ctx.priority {
@@ -1242,7 +1248,7 @@ where
                 // clear dirty values.
                 ctx.kv_wb_mut().rollback_to_save_point().unwrap();
                 match e {
-                    Error::EpochNotMatch(..) => debug!(
+                    Error::EpochNotMatch(..) => error!(
                         "epoch not match";
                         "region_id" => self.region_id(),
                         "peer_id" => self.id(),
@@ -2823,7 +2829,7 @@ pub fn compact_raft_log(
 ) -> Result<()> {
     debug!("{} compact log entries to prior to {}", tag, compact_index);
 
-    if compact_index <= state.get_truncated_state().get_index() {
+    /*if compact_index <= state.get_truncated_state().get_index() {
         return Err(box_err!("try to truncate compacted entries"));
     } else if compact_index > state.get_applied_index() {
         return Err(box_err!(
@@ -2831,7 +2837,7 @@ pub fn compact_raft_log(
             compact_index,
             state.get_applied_index()
         ));
-    }
+    }*/
 
     // we don't actually delete the logs now, we add an async task to do it.
 
@@ -3136,6 +3142,7 @@ where
     S: Snapshot,
 {
     pub region_id: u64,
+    pub first_index: u64,
     pub apply_state: RaftApplyState,
     pub applied_index_term: u64,
     pub exec_res: VecDeque<ExecResult<S>>,
@@ -3354,13 +3361,8 @@ where
                 // So the delegate is expected to yield the CPU.
                 // It can either be executing another `CommitMerge` in pending_msgs
                 // or has been written too much data.
-                s.pending_msgs = state.pending_msgs;
                 return;
             }
-        }
-
-        if !state.pending_msgs.is_empty() {
-            self.handle_tasks(ctx, &mut state.pending_msgs);
         }
     }
 
@@ -3539,44 +3541,36 @@ where
         cb.invoke_read(resp);
     }
 
-    fn handle_tasks<W: WriteBatch<EK>>(
+    fn handle_task<W: WriteBatch<EK>>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
-        msgs: &mut Vec<Msg<EK>>,
+        msg: Msg<EK>,
     ) {
-        let mut drainer = msgs.drain(..);
-        loop {
-            match drainer.next() {
-                Some(Msg::Apply { start, apply }) => {
-                    apply_ctx
-                        .apply_wait
-                        .observe(start.saturating_elapsed_secs());
-                    // If there is any apply task, we change this fsm to normal-priority.
-                    // When it meets a ingest-request or a delete-range request, it will change to
-                    // low-priority.
-                    self.delegate.priority = Priority::Normal;
-                    self.handle_apply(apply_ctx, apply);
-                    if let Some(ref mut state) = self.delegate.yield_state {
-                        state.pending_msgs = drainer.collect();
-                        break;
-                    }
-                }
-                Some(Msg::Registration(reg)) => self.handle_registration(reg),
-                Some(Msg::Destroy(d)) => self.handle_destroy(apply_ctx, d),
-                Some(Msg::LogsUpToDate(cul)) => self.logs_up_to_date_for_merge(apply_ctx, cul),
-                Some(Msg::Noop) => {}
-                Some(Msg::Snapshot(snap_task)) => self.handle_snapshot(apply_ctx, snap_task),
-                Some(Msg::Change {
-                    cmd,
-                    region_epoch,
-                    cb,
-                }) => self.handle_change(apply_ctx, cmd, region_epoch, cb),
-                #[cfg(any(test, feature = "testexport"))]
-                Some(Msg::Validate(_, f)) => {
-                    let delegate: *const u8 = unsafe { mem::transmute(&self.delegate) };
-                    f(delegate)
-                }
-                None => break,
+        match msg {
+            Msg::Apply { start, apply } => {
+                apply_ctx
+                    .apply_wait
+                    .observe(start.saturating_elapsed_secs());
+                // If there is any apply task, we change this fsm to normal-priority.
+                // When it meets a ingest-request or a delete-range request, it will change to
+                // low-priority.
+                self.delegate.priority = Priority::Normal;
+                self.handle_apply(apply_ctx, apply);
+            }
+            Msg::Registration(reg) => self.handle_registration(reg),
+            Msg::Destroy(d) => self.handle_destroy(apply_ctx, d),
+            Msg::LogsUpToDate(cul) => self.logs_up_to_date_for_merge(apply_ctx, cul),
+            Msg::Noop => {}
+            Msg::Snapshot(snap_task) => self.handle_snapshot(apply_ctx, snap_task),
+            Msg::Change {
+                cmd,
+                region_epoch,
+                cb,
+            } => self.handle_change(apply_ctx, cmd, region_epoch, cb),
+            #[cfg(any(test, feature = "testexport"))]
+            Msg::Validate(_, f) => {
+                let delegate: *const u8 = unsafe { mem::transmute(&self.delegate) };
+                f(delegate)
             }
         }
     }
@@ -3699,7 +3693,7 @@ where
     }
 
     fn handle_control(&mut self, control: &mut ControlFsm) -> Option<usize> {
-        loop {
+        /*loop {
             match control.receiver.try_recv() {
                 Ok(ControlMsg::LatencyInspect {
                     send_time,
@@ -3719,11 +3713,12 @@ where
                     return Some(0);
                 }
             }
-        }
+        }*/
+        None
     }
 
     fn handle_normal(&mut self, normal: &mut ApplyFsm<EK>) -> Option<usize> {
-        let mut expected_msg_count = None;
+        /*let mut expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
             if normal.delegate.wait_merge_state.is_some() {
@@ -3778,7 +3773,8 @@ where
             // Let it continue to run next time.
             expected_msg_count = None;
         }
-        expected_msg_count
+        expected_msg_count*/
+        None
     }
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
@@ -4072,11 +4068,6 @@ mod memtrace {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
             }
 
-            size += self.pending_msgs.capacity() * mem::size_of::<Msg<EK>>();
-            for msg in &self.pending_msgs {
-                size += msg.heap_size();
-            }
-
             size
         }
     }
@@ -4110,6 +4101,133 @@ mod memtrace {
                 size += bytes_capacity(&e.data) + bytes_capacity(&e.context);
             }
             size
+        }
+    }
+}
+
+struct ApplyWorker<EK, W>
+where
+    EK: KvEngine,
+    W: WriteBatch<EK>,
+{
+    receiver: CBReceiver<(u64, Msg<EK>)>,
+    apply_ctx: ApplyContext<EK, W>,
+    peers: HashMap<u64, Box<ApplyFsm<EK>>>,
+}
+
+impl<EK, W> ApplyWorker<EK, W>
+where
+    EK: KvEngine,
+    W: WriteBatch<EK>,
+{
+    fn fetch_msg(&mut self) -> Option<(u64, Msg<EK>)> {
+        match self.receiver.try_recv() {
+            Ok(m) => Some(m),
+            Err(TryRecvError::Empty) => {
+                self.apply_ctx.flush();
+                match self.receiver.recv() {
+                    Ok(m) => Some(m),
+                    Err(_) => None,
+                }
+            }
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+
+    fn run(&mut self) {
+        while let Some(m) = self.fetch_msg() {
+            if m.0 == 0 {
+                return;
+            }
+            if let Some(p) = self.peers.get_mut(&m.0) {
+                p.handle_task(&mut self.apply_ctx, m.1);
+            } else {
+                if let Msg::Registration(r) = m.1 {
+                    let (_, p) = ApplyFsm::from_registration(r);
+                    self.peers.insert(m.0, p);
+                } else {
+                    error!("no peer for msg";
+                        "region_id" => m.0,
+                        "msg" => ?m.1,
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub struct ApplySystem<EK: KvEngine> {
+    senders: Vec<CBSender<(u64, Msg<EK>)>>,
+    handlers: Vec<JoinHandle<()>>,
+}
+
+impl<EK> ApplySystem<EK>
+where
+    EK: KvEngine,
+{
+    pub fn new() -> Self {
+        Self {
+            senders: vec![],
+            handlers: vec![],
+        }
+    }
+
+    pub fn senders(&self) -> &Vec<CBSender<(u64, Msg<EK>)>> {
+        &self.senders
+    }
+
+    pub fn spawn<T, ER: RaftEngine, W: WriteBatch<EK> + 'static>(
+        &mut self,
+        builder: &RaftPollerBuilder<EK, ER, T>,
+        sender: Box<dyn Notifier<EK>>,
+        router: &ApplyRouter<EK>,
+    ) -> Result<()> {
+        let tag = format!("[store {}]", builder.store.get_id());
+        for i in 0..builder.cfg.value().apply_batch_system.pool_size {
+            let (tx, rx) = unbounded();
+            let mut worker = ApplyWorker {
+                receiver: rx,
+                apply_ctx: ApplyContext::<EK, W>::new(
+                    tag.clone(),
+                    builder.coprocessor_host.clone(),
+                    builder.importer.clone(),
+                    builder.region_scheduler.clone(),
+                    builder.engines.kv.clone(),
+                    router.clone(),
+                    sender.clone_box(),
+                    &builder.cfg.value(),
+                    builder.store.get_id(),
+                    builder.pending_create_peers.clone(),
+                    Priority::Normal,
+                ),
+                peers: HashMap::default(),
+            };
+            let t = thread::Builder::new()
+                .name(thd_name!(format!("apply-{}", i)))
+                .spawn(move || {
+                    worker.run();
+                })?;
+            self.senders.push(tx);
+            self.handlers.push(t);
+        }
+        Ok(())
+    }
+
+    pub fn schedule_all<'a, ER: RaftEngine>(&self, peers: impl Iterator<Item = &'a Peer<EK, ER>>) {
+        for peer in peers {
+            for sender in &self.senders {
+                sender
+                    .send((peer.region().get_id(), Msg::register(peer)))
+                    .unwrap();
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        assert_eq!(self.senders.len(), self.handlers.len());
+        for (i, handler) in self.handlers.drain(..).enumerate() {
+            self.senders[i].send((0, Msg::Noop)).unwrap();
+            handler.join().unwrap();
         }
     }
 }
