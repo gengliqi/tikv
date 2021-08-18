@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::Bound::{Excluded, Unbounded};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::iter::Iterator;
 use std::time::Instant;
 use std::{cmp, mem, u64};
@@ -70,6 +70,8 @@ use crate::store::{
 };
 use crate::{Error, Result};
 
+use super::ApplyRes;
+
 /// Limits the maximum number of regions returned by error.
 ///
 /// Another choice is using coprocessor batch limit, but 10 should be a good fit in most case.
@@ -134,6 +136,8 @@ where
     /// Destroy is delayed because of some unpersisted readies in Peer.
     /// Should call `destroy_peer` again after persisting all readies.
     delayed_destroy: Option<bool>,
+
+    pending_apply_res: BTreeMap<u64, ApplyRes<EK::Snapshot>>,
 }
 
 pub struct BatchRaftCmdRequestBuilder<E>
@@ -242,6 +246,7 @@ where
                 ),
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
+                pending_apply_res: BTreeMap::new(),
             }),
         ))
     }
@@ -287,6 +292,7 @@ where
                 ),
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
+                pending_apply_res: BTreeMap::new(),
             }),
         ))
     }
@@ -1273,17 +1279,41 @@ where
                     "peer_id" => self.fsm.peer_id(),
                     "res" => ?res,
                 );
-                self.on_ready_result(&mut res.exec_res, &res.metrics);
-                if self.fsm.stopped {
-                    return;
+                if res.first_index == self.fsm.peer.get_store().applied_index() + 1 {
+                    let mut applied_index = res.apply_state.get_applied_index();
+                    self.on_ready_result(&mut res.exec_res, &res.metrics);
+                    if self.fsm.stopped {
+                        return;
+                    }
+                    self.fsm.has_ready |= self.fsm.peer.post_apply(
+                        self.ctx,
+                        res.apply_state,
+                        res.applied_index_term,
+                        &res.metrics,
+                    );
+                    while let Some(x) = self.fsm.pending_apply_res.first_key_value() {
+                        assert!(*x.0 >= applied_index + 1);
+                        if *x.0 == applied_index + 1 {
+                            let (_, mut v) = self.fsm.pending_apply_res.pop_first().unwrap();
+                            applied_index = v.apply_state.get_applied_index();
+                            self.on_ready_result(&mut v.exec_res, &v.metrics);
+                            if self.fsm.stopped {
+                                return;
+                            }
+                            self.fsm.has_ready |= self.fsm.peer.post_apply(
+                                self.ctx,
+                                v.apply_state,
+                                v.applied_index_term,
+                                &v.metrics,
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    assert!(self.fsm.pending_apply_res.insert(res.first_index, res).is_none());
                 }
-                self.fsm.has_ready |= self.fsm.peer.post_apply(
-                    self.ctx,
-                    res.first_index,
-                    res.apply_state,
-                    res.applied_index_term,
-                    &res.metrics,
-                );
+
                 // After applying, several metrics are updated, report it to pd to
                 // get fair schedule.
                 if self.fsm.peer.is_leader() {

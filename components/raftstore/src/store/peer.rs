@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -576,7 +576,6 @@ where
     snap_ctx: Option<SnapshotContext>,
     pub apply_chosen_id: usize,
     pub parallel_apply: bool,
-    applied_state: BTreeMap<u64, (RaftApplyState, u64, ApplyMetrics)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -684,7 +683,6 @@ where
             snap_ctx: None,
             apply_chosen_id: rand::random::<usize>() % cfg.apply_batch_system.pool_size,
             parallel_apply: true,
-            applied_state: BTreeMap::new(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -2500,35 +2498,6 @@ where
     }
 
     pub fn post_apply<T>(
-        &mut self,
-        ctx: &mut PollContext<EK, ER, T>,
-        first_index: u64,
-        apply_state: RaftApplyState,
-        applied_index_term: u64,
-        apply_metrics: &ApplyMetrics,
-    ) -> bool {
-        if first_index == self.get_store().applied_index() + 1 {
-            let mut has_ready = false;
-            let mut applied_index = apply_state.get_applied_index();
-            has_ready |= self.post_apply_internal(ctx, apply_state, applied_index_term, apply_metrics);
-            while let Some(x) = self.applied_state.first_key_value() {
-                assert!(*x.0 >= applied_index + 1);
-                if *x.0 == applied_index + 1 {
-                    let (_, v) = self.applied_state.pop_first().unwrap();
-                    applied_index = v.0.get_applied_index();
-                    has_ready |= self.post_apply_internal(ctx, v.0, v.1, &v.2);
-                } else {
-                    break;
-                }
-            }
-            return has_ready;
-        }
-        assert!(self.applied_state.insert(first_index, (apply_state, applied_index_term, apply_metrics.clone())).is_none());
-
-        false
-    }
-
-    fn post_apply_internal<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         apply_state: RaftApplyState,

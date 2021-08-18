@@ -960,7 +960,9 @@ where
         apply_ctx.committed_count += committed_entries_drainer.len();
         let mut results = VecDeque::new();
         while let Some(entry) = committed_entries_drainer.next() {
-            first_index = Some(entry.get_index());
+            if first_index.is_none() {
+                first_index = Some(entry.get_index());
+            }
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
@@ -1006,7 +1008,7 @@ where
                     if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
                     }
-                    return;
+                    panic!("{} should not yield", self.tag);
                 }
             }
         }
@@ -1055,25 +1057,20 @@ where
             if apply_ctx.yield_high_latency_operation && has_high_latency_operation(&cmd) {
                 self.priority = Priority::Low;
             }
-            let mut has_unflushed_data =
-                self.last_flush_applied_index != self.apply_state.get_applied_index();
-            if has_unflushed_data && should_write_to_engine(&cmd)
-                || apply_ctx.kv_wb().should_write_to_engine()
-            {
+            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
                 apply_ctx.commit(self);
                 /*if let Some(start) = self.handle_start.as_ref() {
                     if start.saturating_elapsed() >= apply_ctx.yield_duration {
                         return ApplyResult::Yield;
                     }
                 }*/
-                has_unflushed_data = false;
             }
-            if self.priority != apply_ctx.priority {
+            /*if self.priority != apply_ctx.priority {
                 if has_unflushed_data {
                     apply_ctx.commit(self);
                 }
                 return ApplyResult::Yield;
-            }
+            }*/
 
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
