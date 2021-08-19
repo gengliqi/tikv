@@ -11,7 +11,7 @@ use std::{cmp, mem, u64};
 use batch_system::{BasicMailbox, Fsm};
 use collections::HashMap;
 use engine_traits::CF_RAFT;
-use engine_traits::{Engines, KvEngine, PerfContext, RaftEngine, SSTMetaInfo, WriteBatchExt};
+use engine_traits::{Engines, KvEngine, RaftEngine, SSTMetaInfo, WriteBatchExt};
 use error_code::ErrorCodeExt;
 use fail::fail_point;
 use keys::{self, enc_end_key, enc_start_key};
@@ -766,7 +766,7 @@ where
                 msg.to = peer_id;
                 msg.from = self.fsm.peer.peer_id();
 
-                let raft_msg = self.fsm.peer.switch_to_raft_msg(&self.ctx, vec![msg]);
+                let raft_msg = self.fsm.peer.switch_to_raft_msg(self.ctx, vec![msg]);
                 self.fsm.peer.send_raft_msg(&mut self.ctx, raft_msg);
             }
         }
@@ -1350,6 +1350,10 @@ where
     }
 
     fn handle_reported_disk_usage(&mut self, msg: &RaftMessage) {
+        // Mocked
+        if matches!(msg.disk_usage, DiskUsage::Normal) {
+            return;
+        }
         let store_id = msg.get_from_peer().get_store_id();
         let peer_id = msg.get_from_peer().get_id();
         let refill_disk_usages = if matches!(msg.disk_usage, DiskUsage::Normal) {
@@ -2103,13 +2107,13 @@ where
         self.fsm.peer.pending_remove = true;
 
         if self.fsm.peer.has_unpersisted_ready() {
-            // The destroy must be destroyed if there are some unpersisted readies.
+            // The destroy must be delayed if there are some unpersisted readies.
             // Otherwise there is a race of writting kv db and raft db between here
             // and write worker.
             assert_eq!(self.fsm.delayed_destroy, None);
             self.fsm.delayed_destroy = Some(merged_by_target);
             // TODO: The destroy process can also be asynchronous as snapshot process,
-            // if so, all of the write db behavior is removed in store thread.
+            // if so, all write db operations are removed in store thread.
             info!(
                 "delays destroy";
                 "region_id" => self.fsm.region_id(),
@@ -2126,7 +2130,7 @@ where
             "merged_by_target" => merged_by_target,
         );
         let region_id = self.region_id();
-        // We can't destroy a peer which is applying snapshot.
+        // We can't destroy a peer which is handling snapshot.
         assert!(!self.fsm.peer.is_handling_snapshot());
 
         let mut meta = self.ctx.store_meta.lock().unwrap();
@@ -2168,15 +2172,17 @@ where
             );
         }
         let is_initialized = self.fsm.peer.is_initialized();
-        self.ctx.perf_context.start_observe();
-        if let Err(e) = self.fsm.peer.destroy(self.ctx, merged_by_target) {
+        if let Err(e) = self.fsm.peer.destroy(
+            &self.ctx.engines,
+            &mut self.ctx.perf_context,
+            merged_by_target,
+        ) {
             // If not panic here, the peer will be recreated in the next restart,
             // then it will be gc again. But if some overlap region is created
             // before restarting, the gc action will delete the overlap region's
             // data too.
             panic!("{} destroy err {:?}", self.fsm.peer.tag, e);
         }
-        self.ctx.perf_context.report_metrics();
 
         // Some places use `force_send().unwrap()` if the StoreMeta lock is held.
         // So in here, it's necessary to held the StoreMeta lock when closing the router.
