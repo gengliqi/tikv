@@ -8,7 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::compat::Stream01CompatExt;
 use futures::stream::StreamExt;
-use grpcio::{ChannelBuilder, EnvBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
+use grpcio::{
+    ChannelBuilder, EnvBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder,
+};
 use grpcio_health::{create_health, HealthService, ServingStatus};
 use kvproto::tikvpb::*;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle as RuntimeHandle, Runtime};
@@ -173,10 +175,10 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             .keepalive_timeout(cfg.value().grpc_keepalive_timeout.into())
             .build_args();
         let raft_service = RaftService::<T, E>::new(
-                store_id,
-                raft_router.clone(),
-                cfg.value().reject_messages_on_memory_ratio,
-            );
+            store_id,
+            raft_router.clone(),
+            cfg.value().reject_messages_on_memory_ratio,
+        );
         let raft_builder = {
             let mut sb = ServerBuilder::new(Arc::clone(&raft_env))
                 .channel_args(raft_channel_args)

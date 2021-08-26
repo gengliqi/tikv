@@ -24,7 +24,6 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::marker::Unpin;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -514,6 +513,7 @@ struct StreamBackEnd<S, R, E> {
     queue: Arc<Queue>,
     builder: ConnectionBuilder<S, R>,
     engine: PhantomData<E>,
+    cq_num: usize,
 }
 
 impl<S, R, E> StreamBackEnd<S, R, E>
@@ -582,7 +582,10 @@ where
                 CString::new("random id").unwrap(),
                 CONN_ID.fetch_add(1, Ordering::SeqCst),
             );
-        let channel = self.builder.security_mgr.connect(cb, addr);
+        let channel = self
+            .builder
+            .security_mgr
+            .connect_with_id(cb, addr, self.cq_num);
         TikvRaftClient::new(channel)
     }
 
@@ -780,6 +783,7 @@ async fn start<S, R, E>(
 struct ConnectionPool {
     connections: HashMap<(u64, usize), Arc<Queue>>,
     tombstone_stores: HashSet<u64>,
+    cq_cnt: usize,
 }
 
 /// Queue in cache.
@@ -855,25 +859,26 @@ where
                 self.cache.resize(pool_len);
                 return false;
             }
-            let conn = pool
-                .connections
-                .entry((store_id, conn_id))
-                .or_insert_with(|| {
-                    let queue = Arc::new(Queue::with_capacity(
-                        self.builder.cfg.raft_client_queue_size,
-                    ));
-                    let back_end = StreamBackEnd {
-                        store_id,
-                        queue: queue.clone(),
-                        builder: self.builder.clone(),
-                        engine: PhantomData::<E>,
-                    };
-                    self.future_pool
-                        .spawn(start(back_end, conn_id, self.pool.clone()));
-                    queue
-                })
-                .clone();
-            (conn, pool.connections.len())
+            let q = if let Some(q) = pool.connections.get(&(store_id, conn_id)) {
+                q.clone()
+            } else {
+                let queue = Arc::new(Queue::with_capacity(
+                    self.builder.cfg.raft_client_queue_size,
+                ));
+                let back_end = StreamBackEnd {
+                    store_id,
+                    queue: queue.clone(),
+                    builder: self.builder.clone(),
+                    engine: PhantomData::<E>,
+                    cq_num: pool.cq_cnt,
+                };
+                pool.cq_cnt += 1;
+                self.future_pool
+                    .spawn(start(back_end, conn_id, self.pool.clone()));
+                pool.connections.insert((store_id, conn_id), queue.clone());
+                queue
+            };
+            (q, pool.connections.len())
         };
         self.cache.resize(pool_len);
         self.cache.insert(

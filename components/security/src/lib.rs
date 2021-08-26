@@ -153,6 +153,26 @@ impl SecurityManager {
         }
     }
 
+    pub fn connect_with_id(&self, mut cb: ChannelBuilder, addr: &str, id: usize) -> Channel {
+        if self.cfg.ca_path.is_empty() {
+            cb.connect_with_id(addr, id)
+        } else {
+            if !self.cfg.override_ssl_target.is_empty() {
+                cb = cb.override_ssl_target(self.cfg.override_ssl_target.clone());
+            }
+            // Fill in empty certificate information if read fails.
+            // Returning empty certificates delays error processing until
+            // actual connection in grpc.
+            let (ca, cert, key) = self.cfg.load_certs().unwrap_or_default();
+
+            let cred = ChannelCredentialsBuilder::new()
+                .root_cert(ca)
+                .cert(cert, key)
+                .build();
+            cb.secure_connect_with_id(addr, cred, id)
+        }
+    }
+
     pub fn bind(&self, mut sb: ServerBuilder, addr: &str, port: u16) -> ServerBuilder {
         if self.cfg.ca_path.is_empty() {
             sb.bind(addr, port)
