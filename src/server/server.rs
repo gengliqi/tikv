@@ -186,7 +186,7 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         };
 
         let conn_builder = ConnectionBuilder::new(
-            raft_env.clone(),
+            env.clone(),
             Arc::new(cfg.value().clone()),
             security_mgr.clone(),
             resolver,
