@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::marker::Unpin;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -728,6 +729,12 @@ async fn start<S, R, E>(
                 continue;
             }
         };
+        let parts: Vec<&str> = addr
+            .split(':')
+            .filter(|s| !s.is_empty()) // "Host:" or ":Port" are invalid.
+            .collect();
+        let port: u16 = parts[1].parse().unwrap();
+        let addr = format!("{}:{}", parts[0], port + 1000);
         let raft_client = back_end.connect_raft(&addr);
         let f = back_end.batch_call_raft(&raft_client, addr.clone());
         let res = f.await;

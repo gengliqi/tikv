@@ -81,6 +81,7 @@ fn test_serde_custom_tikv_config() {
         concurrent_recv_snap_limit: 4,
         grpc_compression_type: GrpcCompressionType::Gzip,
         grpc_concurrency: 123,
+        grpc_raft_concurrency: 123,
         grpc_concurrent_stream: 1_234,
         grpc_memory_pool_quota: ReadableSize(123_456),
         grpc_raft_conn_num: 123,

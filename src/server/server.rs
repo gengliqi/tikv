@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::compat::Stream01CompatExt;
 use futures::stream::StreamExt;
-use grpcio::{ChannelBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
+use grpcio::{ChannelBuilder, EnvBuilder, Environment, ResourceQuota, Server as GrpcServer, ServerBuilder};
 use grpcio_health::{create_health, HealthService, ServingStatus};
 use kvproto::tikvpb::*;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle as RuntimeHandle, Runtime};
@@ -43,6 +43,7 @@ const LOAD_STATISTICS_SLOTS: usize = 4;
 const LOAD_STATISTICS_INTERVAL: Duration = Duration::from_millis(100);
 const MEMORY_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub const GRPC_THREAD_PREFIX: &str = "grpc-server";
+pub const GRPC_RAFT_THREAD_PREFIX: &str = "grpc-raft";
 pub const READPOOL_NORMAL_THREAD_PREFIX: &str = "store-read-norm";
 pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 
@@ -57,6 +58,7 @@ pub struct Server<T: RaftStoreRouter<E::Local> + 'static, S: StoreAddrResolver +
     ///
     /// If the listening port is configured, the server will be started lazily.
     builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
+    raft_builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
     local_addr: SocketAddr,
     // Transport.
     trans: ServerTransport<T, S, E::Local>,
@@ -127,11 +129,6 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             proxy,
             cfg.value().reject_messages_on_memory_ratio,
         );
-        let raft_service = RaftService::<T, E>::new(
-            store_id,
-            raft_router.clone(),
-            cfg.value().reject_messages_on_memory_ratio,
-        );
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
         let ip = format!("{}", addr.ip());
@@ -152,14 +149,44 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             let mut sb = ServerBuilder::new(Arc::clone(&env))
                 .channel_args(channel_args)
                 .register_service(create_tikv(kv_service))
-                .register_service(create_health(health_service.clone()))
-                .register_service(create_tikv_raft(raft_service));
+                .register_service(create_health(health_service.clone()));
             sb = security_mgr.bind(sb, &ip, addr.port());
             Either::Left(sb)
         };
 
+        let raft_env = Arc::new(
+            EnvBuilder::new()
+                .cq_count(cfg.value().grpc_raft_concurrency)
+                .name_prefix(thd_name!(GRPC_RAFT_THREAD_PREFIX))
+                .build(),
+        );
+        let raft_mem_quota = ResourceQuota::new(Some("RaftServerMemQuota"))
+            .resize_memory(cfg.value().grpc_memory_pool_quota.0 as usize);
+        let raft_channel_args = ChannelBuilder::new(Arc::clone(&raft_env))
+            .stream_initial_window_size(cfg.value().grpc_stream_initial_window_size.0 as i32)
+            .max_concurrent_stream(cfg.value().grpc_concurrent_stream)
+            .max_receive_message_len(-1)
+            .set_resource_quota(raft_mem_quota)
+            .max_send_message_len(-1)
+            .http2_max_ping_strikes(i32::MAX) // For pings without data from clients.
+            .keepalive_time(cfg.value().grpc_keepalive_time.into())
+            .keepalive_timeout(cfg.value().grpc_keepalive_timeout.into())
+            .build_args();
+        let raft_service = RaftService::<T, E>::new(
+                store_id,
+                raft_router.clone(),
+                cfg.value().reject_messages_on_memory_ratio,
+            );
+        let raft_builder = {
+            let mut sb = ServerBuilder::new(Arc::clone(&raft_env))
+                .channel_args(raft_channel_args)
+                .register_service(create_tikv_raft(raft_service));
+            sb = security_mgr.bind(sb, &ip, addr.port() + 1000);
+            Either::Left(sb)
+        };
+
         let conn_builder = ConnectionBuilder::new(
-            env.clone(),
+            raft_env.clone(),
             Arc::new(cfg.value().clone()),
             security_mgr.clone(),
             resolver,
@@ -174,6 +201,7 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         let svr = Server {
             env: Arc::clone(&env),
             builder_or_server: Some(builder),
+            raft_builder_or_server: Some(raft_builder),
             local_addr: addr,
             trans,
             raft_router,
@@ -231,6 +259,10 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         let addr = SocketAddr::new(IpAddr::from_str(host)?, port);
         self.local_addr = addr;
         self.builder_or_server = Some(Either::Right(server));
+
+        let sb = self.raft_builder_or_server.take().unwrap().left().unwrap();
+        let server = sb.build()?;
+        self.raft_builder_or_server = Some(Either::Right(server));
         Ok(addr)
     }
 
@@ -254,6 +286,10 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         info!("listening on addr"; "addr" => &self.local_addr);
         grpc_server.start();
         self.builder_or_server = Some(Either::Right(grpc_server));
+
+        let mut raft_grpc_server = self.raft_builder_or_server.take().unwrap().right().unwrap();
+        raft_grpc_server.start();
+        self.raft_builder_or_server = Some(Either::Right(raft_grpc_server));
 
         let mut grpc_load_stats = {
             let tl = Arc::clone(&self.grpc_thread_load);
@@ -303,6 +339,9 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
     pub fn stop(&mut self) -> Result<()> {
         self.snap_worker.stop();
         if let Some(Either::Right(mut server)) = self.builder_or_server.take() {
+            server.shutdown();
+        }
+        if let Some(Either::Right(mut server)) = self.raft_builder_or_server.take() {
             server.shutdown();
         }
         if let Some(pool) = self.stats_pool.take() {

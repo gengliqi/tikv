@@ -2097,11 +2097,7 @@ pub struct RaftService<T, E> {
 }
 
 impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine> RaftService<T, E> {
-    pub fn new(
-        store_id: u64,
-        ch: T,
-        reject_messages_on_memory_ratio: f64,
-    ) -> Self {
+    pub fn new(store_id: u64, ch: T, reject_messages_on_memory_ratio: f64) -> Self {
         Self {
             store_id,
             ch,
@@ -2154,8 +2150,8 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine> TikvRaft for RaftService
     }
 }
 
-impl<T: RaftStoreRouter<E::Local> + Clone + 'static, E: Engine + Clone>
-    Clone for RaftService<T, E>
+impl<T: RaftStoreRouter<E::Local> + Clone + 'static, E: Engine + Clone> Clone
+    for RaftService<T, E>
 {
     fn clone(&self) -> Self {
         Self {

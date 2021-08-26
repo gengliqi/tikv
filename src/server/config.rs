@@ -103,6 +103,8 @@ pub struct Config {
     #[online_config(skip)]
     pub grpc_concurrency: usize,
     #[online_config(skip)]
+    pub grpc_raft_concurrency: usize,
+    #[online_config(skip)]
     pub grpc_concurrent_stream: i32,
     #[online_config(skip)]
     pub grpc_raft_conn_num: usize,
@@ -211,6 +213,7 @@ impl Default for Config {
             raft_msg_max_batch_size: 128,
             grpc_compression_type: GrpcCompressionType::None,
             grpc_concurrency: DEFAULT_GRPC_CONCURRENCY,
+            grpc_raft_concurrency: 4,
             grpc_concurrent_stream: DEFAULT_GRPC_CONCURRENT_STREAM,
             grpc_raft_conn_num: DEFAULT_GRPC_RAFT_CONN_NUM,
             grpc_stream_initial_window_size: ReadableSize(DEFAULT_GRPC_STREAM_INITIAL_WINDOW_SIZE),
