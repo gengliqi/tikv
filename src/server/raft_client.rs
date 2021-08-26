@@ -15,7 +15,7 @@ use grpcio::{
     WriteFlags,
 };
 use kvproto::raft_serverpb::{Done, RaftMessage};
-use kvproto::tikvpb::{BatchRaftMessage, TikvClient};
+use kvproto::tikvpb::{BatchRaftMessage, TikvClient, TikvRaftClient};
 use raft::SnapshotStatus;
 use raftstore::errors::DiscardReason;
 use raftstore::router::RaftStoreRouter;
@@ -567,6 +567,44 @@ where
             .inc_by(len as u64);
     }
 
+    fn connect_raft(&self, addr: &str) -> TikvRaftClient {
+        info!("server: new connection with tikv endpoint"; "addr" => addr, "store_id" => self.store_id);
+
+        let cb = ChannelBuilder::new(self.builder.env.clone())
+            .stream_initial_window_size(self.builder.cfg.grpc_stream_initial_window_size.0 as i32)
+            .max_send_message_len(self.builder.cfg.max_grpc_send_msg_len)
+            .keepalive_time(self.builder.cfg.grpc_keepalive_time.0)
+            .keepalive_timeout(self.builder.cfg.grpc_keepalive_timeout.0)
+            .default_compression_algorithm(self.builder.cfg.grpc_compression_algorithm())
+            // hack: so it's different args, grpc will always create a new connection.
+            .raw_cfg_int(
+                CString::new("random id").unwrap(),
+                CONN_ID.fetch_add(1, Ordering::SeqCst),
+            );
+        let channel = self.builder.security_mgr.connect(cb, addr);
+        TikvRaftClient::new(channel)
+    }
+
+    fn batch_call_raft(&self, client: &TikvRaftClient, addr: String) -> oneshot::Receiver<()> {
+        let (batch_sink, batch_stream) = client.batch_raft().unwrap();
+        let (tx, rx) = oneshot::channel();
+        let call = RaftCall {
+            sender: batch_sink,
+            receiver: batch_stream,
+            queue: self.queue.clone(),
+            buffer: BatchMessageBuffer::new(self.builder.cfg.clone()),
+            router: self.builder.router.clone(),
+            snap_scheduler: self.builder.snap_scheduler.clone(),
+            lifetime: Some(tx),
+            store_id: self.store_id,
+            addr,
+            engine: PhantomData::<E>,
+        };
+        // TODO: verify it will be notified if client is dropped while env still alive.
+        client.spawn(call);
+        rx
+    }
+
     fn connect(&self, addr: &str) -> TikvClient {
         info!("server: new connection with tikv endpoint"; "addr" => addr, "store_id" => self.store_id);
 
@@ -690,7 +728,10 @@ async fn start<S, R, E>(
                 continue;
             }
         };
-        let client = back_end.connect(&addr);
+        let raft_client = back_end.connect_raft(&addr);
+        let f = back_end.batch_call_raft(&raft_client, addr.clone());
+        let res = f.await;
+        /*let client = back_end.connect(&addr);
         let f = back_end.batch_call(&client, addr.clone());
         let mut res = f.await;
         if res == Ok(()) {
@@ -699,7 +740,7 @@ async fn start<S, R, E>(
             // need to fallback to use legacy API.
             let f = back_end.call(&client, addr.clone());
             res = f.await;
-        }
+        }*/
         match res {
             Ok(()) => {
                 error!("connection fail"; "store_id" => back_end.store_id, "addr" => addr, "err" => "require fallback even with legacy API");

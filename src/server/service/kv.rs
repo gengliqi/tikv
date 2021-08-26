@@ -1,5 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tikv_util::time::{duration_to_ms, duration_to_sec, Instant};
 
@@ -132,34 +133,6 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Service<
             grpc_thread_load,
             proxy,
             reject_messages_on_memory_ratio,
-        }
-    }
-
-    fn handle_raft_message(
-        store_id: u64,
-        ch: &T,
-        msg: RaftMessage,
-        reject: bool,
-    ) -> ServerResult<()> {
-        let to_store_id = msg.get_to_peer().get_store_id();
-        if to_store_id != store_id {
-            return Err(Error::from(RaftStoreError::StoreNotMatch {
-                to_store_id,
-                my_store_id: store_id,
-            }));
-        }
-        if reject && msg.get_message().get_msg_type() == MessageType::MsgAppend {
-            RAFT_APPEND_REJECTS.inc();
-            let id = msg.get_region_id();
-            let peer_id = msg.get_message().get_from();
-            let m = CasualMessage::RejectRaftAppend { peer_id };
-            let _ = ch.send_casual_msg(id, m);
-            return Ok(());
-        }
-        match ch.send_raft_msg(msg) {
-            Ok(()) => Ok(()),
-            Err(RaftStoreError::RegionNotFound(_)) => Ok(()),
-            Err(e) => Err(Error::from(e)),
         }
     }
 }
@@ -669,7 +642,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Tikv for
             while let Some(msg) = stream.try_next().await? {
                 RAFT_MESSAGE_RECV_COUNTER.inc();
                 let reject = needs_reject_raft_append(reject_messages_on_memory_ratio);
-                Self::handle_raft_message(store_id, &ch, msg, reject)?;
+                handle_raft_message::<T, E>(store_id, &ch, msg, reject)?;
             }
             Ok::<(), Error>(())
         };
@@ -709,7 +682,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Tikv for
                 RAFT_MESSAGE_BATCH_SIZE.observe(len as f64);
                 let reject = needs_reject_raft_append(reject_messages_on_memory_ratio);
                 for msg in batch_msg.take_msgs().into_iter() {
-                    Self::handle_raft_message(store_id, &ch, msg, reject)?;
+                    handle_raft_message::<T, E>(store_id, &ch, msg, reject)?;
                 }
             }
             Ok::<(), Error>(())
@@ -1139,6 +1112,34 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager> Tikv for
         })
         .map(|_| ());
         ctx.spawn(task);
+    }
+}
+
+fn handle_raft_message<T: RaftStoreRouter<E::Local> + 'static, E: Engine>(
+    store_id: u64,
+    ch: &T,
+    msg: RaftMessage,
+    reject: bool,
+) -> ServerResult<()> {
+    let to_store_id = msg.get_to_peer().get_store_id();
+    if to_store_id != store_id {
+        return Err(Error::from(RaftStoreError::StoreNotMatch {
+            to_store_id,
+            my_store_id: store_id,
+        }));
+    }
+    if reject && msg.get_message().get_msg_type() == MessageType::MsgAppend {
+        RAFT_APPEND_REJECTS.inc();
+        let id = msg.get_region_id();
+        let peer_id = msg.get_message().get_from();
+        let m = CasualMessage::RejectRaftAppend { peer_id };
+        let _ = ch.send_casual_msg(id, m);
+        return Ok(());
+    }
+    match ch.send_raft_msg(msg) {
+        Ok(()) => Ok(()),
+        Err(RaftStoreError::RegionNotFound(_)) => Ok(()),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -2083,6 +2084,87 @@ fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
         }
     }
     false
+}
+
+pub struct RaftService<T, E> {
+    store_id: u64,
+    // For handling raft messages.
+    ch: T,
+
+    // Go `server::Config` to get more details.
+    reject_messages_on_memory_ratio: f64,
+    _phantom: PhantomData<E>,
+}
+
+impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine> RaftService<T, E> {
+    pub fn new(
+        store_id: u64,
+        ch: T,
+        reject_messages_on_memory_ratio: f64,
+    ) -> Self {
+        Self {
+            store_id,
+            ch,
+            reject_messages_on_memory_ratio,
+            _phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine> TikvRaft for RaftService<T, E> {
+    fn batch_raft(
+        &mut self,
+        ctx: RpcContext<'_>,
+        stream: RequestStream<BatchRaftMessage>,
+        sink: ClientStreamingSink<Done>,
+    ) {
+        info!("batch_raft RPC is called, new gRPC stream established");
+        let store_id = self.store_id;
+        let ch = self.ch.clone();
+        let reject_messages_on_memory_ratio = self.reject_messages_on_memory_ratio;
+
+        let res = async move {
+            let mut stream = stream.map_err(Error::from);
+            while let Some(mut batch_msg) = stream.try_next().await? {
+                let len = batch_msg.get_msgs().len();
+                RAFT_MESSAGE_RECV_COUNTER.inc_by(len as u64);
+                RAFT_MESSAGE_BATCH_SIZE.observe(len as f64);
+                let reject = needs_reject_raft_append(reject_messages_on_memory_ratio);
+                for msg in batch_msg.take_msgs().into_iter() {
+                    handle_raft_message::<T, E>(store_id, &ch, msg, reject)?;
+                }
+            }
+            Ok::<(), Error>(())
+        };
+
+        ctx.spawn(async move {
+            let status = match res.await {
+                Err(e) => {
+                    let msg = format!("{:?}", e);
+                    error!("dispatch raft msg from gRPC to raftstore fail"; "err" => %msg);
+                    RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg)
+                }
+                Ok(_) => RpcStatus::new(RpcStatusCode::UNKNOWN),
+            };
+            let _ = sink
+                .fail(status)
+                .map_err(|e| error!("RaftService::batch_raft send response fail"; "err" => ?e))
+                .await;
+        });
+    }
+}
+
+impl<T: RaftStoreRouter<E::Local> + Clone + 'static, E: Engine + Clone>
+    Clone for RaftService<T, E>
+{
+    fn clone(&self) -> Self {
+        Self {
+            store_id: self.store_id,
+            ch: self.ch.clone(),
+            reject_messages_on_memory_ratio: self.reject_messages_on_memory_ratio,
+            _phantom: PhantomData::default(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -127,6 +127,11 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             proxy,
             cfg.value().reject_messages_on_memory_ratio,
         );
+        let raft_service = RaftService::<T, E>::new(
+            store_id,
+            raft_router.clone(),
+            cfg.value().reject_messages_on_memory_ratio,
+        );
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
         let ip = format!("{}", addr.ip());
@@ -147,7 +152,8 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
             let mut sb = ServerBuilder::new(Arc::clone(&env))
                 .channel_args(channel_args)
                 .register_service(create_tikv(kv_service))
-                .register_service(create_health(health_service.clone()));
+                .register_service(create_health(health_service.clone()))
+                .register_service(create_tikv_raft(raft_service));
             sb = security_mgr.bind(sb, &ip, addr.port());
             Either::Left(sb)
         };
