@@ -140,8 +140,9 @@ pub struct BatchRaftCmdRequestBuilder<E>
 where
     E: KvEngine,
 {
-    raft_entry_max_size: f64,
-    batch_req_size: u32,
+    can_batch_limit: u64,
+    should_propose_size: u64,
+    batch_req_size: u64,
     request: Option<RaftCmdRequest>,
     callbacks: Vec<(Callback<E::Snapshot>, usize)>,
 }
@@ -237,9 +238,7 @@ where
                 receiver: rx,
                 skip_split_count: 0,
                 skip_gc_raft_log_ticks: 0,
-                batch_req_builder: BatchRaftCmdRequestBuilder::new(
-                    cfg.raft_entry_max_size.0 as f64,
-                ),
+                batch_req_builder: BatchRaftCmdRequestBuilder::new(cfg),
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
             }),
@@ -282,9 +281,7 @@ where
                 receiver: rx,
                 skip_split_count: 0,
                 skip_gc_raft_log_ticks: 0,
-                batch_req_builder: BatchRaftCmdRequestBuilder::new(
-                    cfg.raft_entry_max_size.0 as f64,
-                ),
+                batch_req_builder: BatchRaftCmdRequestBuilder::new(cfg),
                 trace: PeerMemoryTrace::default(),
                 delayed_destroy: None,
             }),
@@ -348,24 +345,24 @@ impl<E> BatchRaftCmdRequestBuilder<E>
 where
     E: KvEngine,
 {
-    fn new(raft_entry_max_size: f64) -> BatchRaftCmdRequestBuilder<E> {
+    fn new(cfg: &Config) -> BatchRaftCmdRequestBuilder<E> {
         BatchRaftCmdRequestBuilder {
-            raft_entry_max_size,
-            request: None,
+            can_batch_limit: (cfg.raft_entry_max_size.0 as f64 * 0.2) as u64,
+            should_propose_size: cmp::min(
+                (cfg.raft_entry_max_size.0 as f64 * 0.4) as u64,
+                cfg.raft_ready_size_limit.0,
+            ),
             batch_req_size: 0,
+            request: None,
             callbacks: vec![],
         }
-    }
-
-    fn get_batch_size(&self) -> u32 {
-        self.batch_req_size
     }
 
     fn can_batch(&self, req: &RaftCmdRequest, req_size: u32) -> bool {
         // No batch request whose size exceed 20% of raft_entry_max_size,
         // so total size of request in batch_raft_request would not exceed
         // (40% + 20%) of raft_entry_max_size
-        if req.get_requests().is_empty() || f64::from(req_size) > self.raft_entry_max_size * 0.2 {
+        if req.get_requests().is_empty() || req_size as u64 > self.can_batch_limit {
             return false;
         }
         for r in req.get_requests() {
@@ -401,14 +398,14 @@ where
             self.request = Some(request);
         };
         self.callbacks.push((callback, req_num));
-        self.batch_req_size += req_size;
+        self.batch_req_size += req_size as u64;
     }
 
     fn should_finish(&self) -> bool {
         if let Some(batch_req) = self.request.as_ref() {
             // Limit the size of batch request so that it will not exceed raft_entry_max_size after
             // adding header.
-            if f64::from(self.batch_req_size) > self.raft_entry_max_size * 0.4 {
+            if self.batch_req_size > self.should_propose_size {
                 return true;
             }
             if batch_req.get_requests().len() > <E as WriteBatchExt>::WRITE_BATCH_MAX_KEYS {
@@ -575,6 +572,11 @@ where
                             "peer_id" => self.fsm.peer_id(),
                         );
                     }
+                    if self.fsm.peer.raft_group.raft.raft_log.unstable.entries_size
+                        >= self.ctx.cfg.raft_ready_size_limit.0 as usize
+                    {
+                        self.collect_ready();
+                    }
                 }
                 PeerMsg::RaftCommand(cmd) => {
                     self.ctx
@@ -609,6 +611,11 @@ where
                             cmd.extra_opts.disk_full_opt,
                         )
                     }
+                    if self.fsm.peer.raft_group.raft.raft_log.unstable.entries_size
+                        >= self.ctx.cfg.raft_ready_size_limit.0 as usize
+                    {
+                        self.collect_ready();
+                    }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
                 PeerMsg::ApplyRes { res } => {
@@ -627,7 +634,7 @@ where
                     peer_id,
                     ready_number,
                     send_time,
-                } => self.on_persisted_msg(peer_id, ready_number, send_time),
+                } => self.on_persisted_msg(peer_id, ready_number, Some(send_time)),
                 PeerMsg::UpdateReplicationMode => self.on_update_replication_mode(),
                 PeerMsg::Destroy(peer_id) => {
                     if self.fsm.peer.peer_id() == peer_id {
@@ -639,13 +646,6 @@ where
                         }
                     }
                 }
-            }
-            if self.fsm.batch_req_builder.get_batch_size() as usize
-                + self.fsm.peer.raft_group.raft.raft_log.unstable.entries_size
-                >= self.ctx.cfg.raft_ready_size_limit.0 as usize
-            {
-                self.propose_batch_raft_command();
-                self.collect_ready();
             }
         }
         // Propose batch request which may be still waiting for more raft-command
@@ -964,7 +964,7 @@ where
             SignificantMsg::CatchUpLogs(catch_up_logs) => {
                 self.on_catch_up_logs_for_merge(catch_up_logs);
             }
-            SignificantMsg::StoreResolved { store_id, group_id } => {
+            SignificantMsg::StoreResolved { group_id, .. } => {
                 let state = self.ctx.global_replication_state.lock().unwrap();
                 if state.status().get_mode() != ReplicationMode::DrAutoSync {
                     return;
@@ -977,7 +977,7 @@ where
                     .peer
                     .raft_group
                     .raft
-                    .assign_commit_groups(&[(store_id, group_id)]);
+                    .assign_commit_groups(&[(self.fsm.peer_id(), group_id)]);
             }
             SignificantMsg::CaptureChange {
                 cmd,
@@ -990,7 +990,12 @@ where
         }
     }
 
-    fn on_persisted_msg(&mut self, peer_id: u64, ready_number: u64, send_time: TiInstant) {
+    pub fn on_persisted_msg(
+        &mut self,
+        peer_id: u64,
+        ready_number: u64,
+        send_time: Option<TiInstant>,
+    ) {
         if peer_id != self.fsm.peer_id() {
             error!(
                 "peer id not match";
@@ -1001,10 +1006,12 @@ where
             );
             return;
         }
-        self.ctx
-            .raft_metrics
-            .persisted_msg_wait
-            .observe(duration_to_sec(send_time.saturating_elapsed()));
+        if let Some(t) = send_time {
+            self.ctx
+                .raft_metrics
+                .persisted_msg_wait
+                .observe(duration_to_sec(t.saturating_elapsed()));
+        }
         if let Some(persist_snap_res) = self.fsm.peer.on_persist_ready(self.ctx, ready_number) {
             self.on_ready_apply_snapshot(persist_snap_res);
             if self.fsm.peer.pending_merge_state.is_some() {
@@ -3202,13 +3209,11 @@ where
             "region" => ?region,
         );
 
-        if prev_region.get_peers() != region.get_peers() {
-            let mut state = self.ctx.global_replication_state.lock().unwrap();
-            let gb = state
-                .calculate_commit_group(self.fsm.peer.replication_mode_version, region.get_peers());
-            self.fsm.peer.raft_group.raft.clear_commit_group();
-            self.fsm.peer.raft_group.raft.assign_commit_groups(gb);
-        }
+        let mut state = self.ctx.global_replication_state.lock().unwrap();
+        let gb = state
+            .calculate_commit_group(self.fsm.peer.replication_mode_version, region.get_peers());
+        self.fsm.peer.raft_group.raft.clear_commit_group();
+        self.fsm.peer.raft_group.raft.assign_commit_groups(gb);
 
         let mut meta = self.ctx.store_meta.lock().unwrap();
         debug!(
@@ -3360,10 +3365,6 @@ where
         self.ctx.store_stat.lock_cf_bytes_written += metrics.lock_cf_written_bytes;
         self.ctx.store_stat.engine_total_bytes_written += metrics.written_bytes;
         self.ctx.store_stat.engine_total_keys_written += metrics.written_keys;
-        self.ctx
-            .store_stat
-            .engine_total_query_stats
-            .add_query_stats(&metrics.written_query_stats.0);
     }
 
     /// Check if a request is valid if it has valid prepare_merge/commit_merge proposal.
@@ -3546,7 +3547,7 @@ where
                 for t in request_times {
                     self.ctx
                         .raft_metrics
-                        .batch_wait
+                        .wf_batch_wait
                         .observe(duration_to_sec(now.saturating_duration_since(*t)));
                 }
             }
@@ -4517,7 +4518,9 @@ mod memtrace {
 
 #[cfg(test)]
 mod tests {
-    use super::BatchRaftCmdRequestBuilder;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use crate::store::local_metrics::RaftMetrics;
     use crate::store::msg::{Callback, ExtCallback, RaftCommand};
 
@@ -4527,13 +4530,15 @@ mod tests {
         StatusRequest,
     };
     use protobuf::Message;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use tikv_util::config::ReadableSize;
+
+    use super::*;
 
     #[test]
     fn test_batch_raft_cmd_request_builder() {
-        let max_batch_size = 1000.0;
-        let mut builder = BatchRaftCmdRequestBuilder::<KvTestEngine>::new(max_batch_size);
+        let mut cfg = Config::default();
+        cfg.raft_entry_max_size = ReadableSize(1000);
+        let mut builder = BatchRaftCmdRequestBuilder::<KvTestEngine>::new(&cfg);
         let mut q = Request::default();
         let mut metric = RaftMetrics::new(true);
 

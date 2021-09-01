@@ -52,9 +52,7 @@ use crate::store::hibernate_state::GroupState;
 use crate::store::memory::{needs_evict_entry_cache, MEMTRACE_RAFT_ENTRIES};
 use crate::store::msg::RaftCommand;
 use crate::store::util::{admin_cmd_epoch_lookup, RegionReadProgress};
-use crate::store::worker::{
-    HeartbeatTask, QueryStats, ReadDelegate, ReadExecutor, ReadProgress, RegionTask,
-};
+use crate::store::worker::{HeartbeatTask, ReadDelegate, ReadExecutor, ReadProgress, RegionTask};
 use crate::store::{
     Callback, Config, GlobalReplicationState, PdTask, ReadIndexContext, ReadResponse,
 };
@@ -117,7 +115,7 @@ impl<S: Snapshot> ProposalQueue<S> {
 
     fn find_request_times(&self, index: u64) -> Option<(u64, &SmallVec<[TiInstant; 4]>)> {
         self.queue
-            .binary_search_by_key(&index, |p: &Proposal<_>| (p.index))
+            .binary_search_by_key(&index, |p: &Proposal<_>| p.index)
             .ok()
             .map(|i| {
                 self.queue[i]
@@ -237,7 +235,6 @@ pub struct ConsistencyState {
 pub struct PeerStat {
     pub written_bytes: u64,
     pub written_keys: u64,
-    pub written_query_stats: QueryStats,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -1304,7 +1301,7 @@ where
                     }
                     for t in times {
                         metrics
-                            .know_persist
+                            .wf_persist_log
                             .observe(duration_to_sec(now.unwrap().saturating_duration_since(*t)));
                     }
                 }
@@ -1329,9 +1326,9 @@ where
                         now = Some(TiInstant::now());
                     }
                     let hist = if index <= self.raft_group.raft.raft_log.persisted {
-                        &metrics.know_commit
+                        &metrics.wf_commit_log
                     } else {
-                        &metrics.know_commit_not_persist
+                        &metrics.wf_commit_not_persist_log
                     };
                     for t in times {
                         hist.observe(duration_to_sec(now.unwrap().saturating_duration_since(*t)));
@@ -1819,6 +1816,7 @@ where
                 // the peer, it's still dangerous if continue to handle ready for the
                 // peer. So it's better to revoke `JOB_STATUS_CANCELLING` to ensure all
                 // started tasks can get finished correctly.
+                self.snap_ctx = None;
             }
         }
         assert_eq!(self.snap_ctx, None);
@@ -1936,7 +1934,7 @@ where
                             now = Some(TiInstant::now());
                         }
                         for t in times {
-                            ctx.raft_metrics.to_write_queue.observe(duration_to_sec(
+                            ctx.raft_metrics.wf_send_to_queue.observe(duration_to_sec(
                                 now.unwrap().saturating_duration_since(*t),
                             ));
                         }
@@ -2014,11 +2012,15 @@ where
 
         match &ready_res {
             HandleReadyResult::SendIOTask | HandleReadyResult::Snapshot { .. } => {
-                self.write_router.send_write_msg(
-                    ctx,
-                    self.unpersisted_readies.back().map(|r| r.number),
-                    WriteMsg::WriteTask(task),
-                );
+                if let Some(write_worker) = ctx.write_worker.as_mut() {
+                    write_worker.batch.add_write_task(task);
+                } else {
+                    self.write_router.send_write_msg(
+                        ctx,
+                        self.unpersisted_readies.back().map(|r| r.number),
+                        WriteMsg::WriteTask(task),
+                    );
+                }
             }
             _ => (),
         }
@@ -2073,8 +2075,10 @@ where
                     // persisted with the last ready at the same time.
                     assert!(ready.number() > last.max_number);
                     last.max_number = ready.number();
-                    self.unpersisted_message_count += msgs.len();
-                    last.raft_msgs.push(msgs);
+                    if !msgs.is_empty() {
+                        self.unpersisted_message_count += msgs.len();
+                        last.raft_msgs.push(msgs);
+                    }
                 } else {
                     // If this ready don't need to be persisted and there is no previous unpersisted ready,
                     // we can safely consider it is persisted so the persisted msgs can be sent immediately.
@@ -2280,8 +2284,10 @@ where
         }
         self.persisted_number = persisted_number;
 
-        self.write_router
-            .check_new_persisted(ctx, self.persisted_number);
+        if ctx.write_worker.is_none() {
+            self.write_router
+                .check_new_persisted(ctx, self.persisted_number);
+        }
 
         if !self.pending_remove {
             // If `pending_remove` is true, no need to call `on_persist_ready` to
@@ -2293,7 +2299,7 @@ where
             self.report_know_commit_duration(pre_commit_index, &ctx.raft_metrics);
 
             let persist_index = self.raft_group.raft.raft_log.persisted;
-            self.mut_store().update_persist_index(persist_index);
+            self.mut_store().update_cache_persisted(persist_index);
         }
 
         if self.snap_ctx.is_some() && self.unpersisted_readies.is_empty() {
@@ -2512,9 +2518,6 @@ where
 
         self.peer_stat.written_keys += apply_metrics.written_keys;
         self.peer_stat.written_bytes += apply_metrics.written_bytes;
-        self.peer_stat
-            .written_query_stats
-            .add_query_stats(&apply_metrics.written_query_stats.0);
         self.delete_keys_hint += apply_metrics.delete_keys_hint;
         let diff = self.size_diff_hint as i64 + apply_metrics.size_diff_hint;
         self.size_diff_hint = cmp::max(diff, 0) as u64;
@@ -3908,7 +3911,6 @@ where
             pending_peers: self.collect_pending_peers(ctx),
             written_bytes: self.peer_stat.written_bytes,
             written_keys: self.peer_stat.written_keys,
-            written_query_stats: self.peer_stat.written_query_stats.clone(),
             approximate_size: self.approximate_size,
             approximate_keys: self.approximate_keys,
             replication_status: self.region_replication_status(),

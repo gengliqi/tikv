@@ -78,7 +78,6 @@ impl Transport for TestTransport {
     fn need_flush(&self) -> bool {
         false
     }
-    fn delay_flush(&mut self) {}
     fn flush(&mut self) {}
 }
 
@@ -277,7 +276,7 @@ fn test_worker() {
 
     t.worker.batch.add_write_task(task_3);
 
-    t.worker.write_to_db();
+    t.worker.write_to_db(true);
 
     let snapshot = engines.kv.snapshot();
     assert_eq!(snapshot.get_value(b"kv_k1").unwrap().unwrap(), b"kv_v1");

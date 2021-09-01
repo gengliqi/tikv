@@ -27,10 +27,9 @@ use std::marker::Unpin;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{cmp, mem, result};
 use tikv_util::lru::LruCache;
-use tikv_util::time::Instant as TiInstant;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::Scheduler;
 use yatp::task::future::TaskCell;
@@ -766,8 +765,6 @@ pub struct RaftClient<S, R, E> {
     builder: ConnectionBuilder<S, R>,
     engine: PhantomData<E>,
     last_hash: (u64, u64),
-    last_flush_time: TiInstant,
-    delay_flush: Duration,
 }
 
 impl<S, R, E> RaftClient<S, R, E>
@@ -782,7 +779,6 @@ where
                 .max_thread_count(1)
                 .build_future_pool(),
         );
-        let delay_flush = builder.cfg.raft_client_delay_flush_time.0;
         RaftClient {
             pool: Arc::default(),
             cache: LruCache::with_capacity_and_sample(0, 7),
@@ -792,8 +788,6 @@ where
             builder,
             engine: PhantomData::<E>,
             last_hash: (0, 0),
-            last_flush_time: TiInstant::now_coarse(),
-            delay_flush,
         }
     }
 
@@ -936,19 +930,8 @@ where
         }
     }
 
-    pub fn delay_flush(&mut self) {
-        if !self.need_flush() {
-            return;
-        }
-        let now = TiInstant::now_coarse();
-        if now > self.last_flush_time + self.delay_flush {
-            self.flush();
-        }
-    }
-
     /// Flushes all buffered messages.
     pub fn flush(&mut self) {
-        self.last_flush_time = TiInstant::now_coarse();
         self.flush_full_metrics();
         if self.need_flush.is_empty() {
             return;
@@ -992,8 +975,6 @@ where
             builder: self.builder.clone(),
             engine: PhantomData::<E>,
             last_hash: (0, 0),
-            last_flush_time: TiInstant::now_coarse(),
-            delay_flush: self.delay_flush,
         }
     }
 }
