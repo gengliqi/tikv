@@ -32,6 +32,7 @@ impl Default for ReadOptions {
 #[derive(Clone)]
 pub struct WriteOptions {
     sync: bool,
+    disable_wal: bool,
     no_slowdown: bool,
 }
 
@@ -39,6 +40,7 @@ impl WriteOptions {
     pub fn new() -> WriteOptions {
         WriteOptions {
             sync: false,
+            disable_wal: false,
             no_slowdown: false,
         }
     }
@@ -49,6 +51,14 @@ impl WriteOptions {
 
     pub fn sync(&self) -> bool {
         self.sync
+    }
+
+    pub fn set_disable_wal(&mut self, disable_wal: bool) {
+        self.disable_wal = disable_wal;
+    }
+
+    pub fn disable_wal(&self) -> bool {
+        self.disable_wal
     }
 
     pub fn set_no_slowdown(&mut self, no_slowdown: bool) {
@@ -62,10 +72,7 @@ impl WriteOptions {
 
 impl Default for WriteOptions {
     fn default() -> WriteOptions {
-        WriteOptions {
-            sync: false,
-            no_slowdown: false,
-        }
+        WriteOptions::new()
     }
 }
 

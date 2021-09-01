@@ -385,6 +385,7 @@ where
     perf_context: EK::PerfContext,
 
     yield_duration: Duration,
+    disable_wal: bool,
 
     store_id: u64,
     /// region_id -> (peer_id, is_splitting)
@@ -455,6 +456,7 @@ where
             use_delete_range: cfg.use_delete_range,
             perf_context: engine.get_perf_context(cfg.perf_level, PerfContextKind::RaftstoreApply),
             yield_duration: cfg.apply_yield_duration.0,
+            disable_wal: cfg.apply_disable_wal,
             delete_ssts: vec![],
             store_id,
             pending_create_peers,
@@ -521,6 +523,7 @@ where
         if !self.kv_wb_mut().is_empty() {
             let mut write_opts = engine_traits::WriteOptions::new();
             write_opts.set_sync(need_sync);
+            write_opts.set_disable_wal(self.disable_wal);
             self.kv_wb().write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("failed to write to engine: {:?}", e);
             });

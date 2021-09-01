@@ -177,6 +177,7 @@ pub struct Config {
     pub dev_assert: bool,
     #[online_config(hidden)]
     pub apply_yield_duration: ReadableDuration,
+    pub apply_disable_wal: bool,
 
     #[serde(with = "engine_config::perf_level_serde")]
     #[online_config(skip)]
@@ -293,6 +294,7 @@ impl Default for Config {
             hibernate_regions: true,
             dev_assert: false,
             apply_yield_duration: ReadableDuration::millis(500),
+            apply_disable_wal: false,
             perf_level: PerfLevel::EnableTime,
             evict_cache_on_memory_ratio: 0.2,
             cmd_batch: true,
