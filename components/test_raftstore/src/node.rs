@@ -126,6 +126,8 @@ impl Transport for ChannelTransport {
         false
     }
 
+    fn try_delay_flush(&mut self) {}
+
     fn flush(&mut self) {}
 }
 

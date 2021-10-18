@@ -647,10 +647,6 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
 
-        if self.poll_ctx.trans.need_flush() {
-            self.poll_ctx.trans.flush();
-        }
-
         let dur = self.timer.saturating_elapsed();
         if !self.poll_ctx.store_stat.is_busy {
             let election_timeout = Duration::from_millis(
@@ -813,6 +809,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }
+
+        self.poll_ctx.trans.try_delay_flush();
+
         self.poll_ctx.current_time = None;
         self.poll_ctx
             .raft_metrics
