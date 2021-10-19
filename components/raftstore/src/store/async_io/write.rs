@@ -29,7 +29,6 @@ use error_code::ErrorCodeExt;
 use fail::fail_point;
 use kvproto::raft_serverpb::{RaftLocalState, RaftMessage};
 use protobuf::Message;
-use raft::eraftpb::Entry;
 use tikv_util::config::{Tracker, VersionTrack};
 use tikv_util::time::{duration_to_sec, Instant};
 use tikv_util::{box_err, debug, info, thd_name, warn};
@@ -80,7 +79,7 @@ where
     pub send_time: Instant,
     pub kv_wb: Option<EK::WriteBatch>,
     pub raft_wb: Option<ER::LogBatch>,
-    pub entries: Vec<Entry>,
+    pub entries: Vec<(u64, Vec<u8>)>,
     pub cut_logs: Option<(u64, u64)>,
     pub raft_state: Option<RaftLocalState>,
     pub messages: Vec<RaftMessage>,
@@ -126,7 +125,7 @@ where
                 self.ready_number
             ));
         }
-        if let Some(last_index) = self.entries.last().map(|e| e.get_index()) {
+        if let Some(last_index) = self.entries.last().map(|e| e.0) {
             if let Some((from, _)) = self.cut_logs {
                 if from != last_index + 1 {
                     // Entries are put and deleted in the same writebatch.
@@ -215,7 +214,10 @@ where
         }
 
         let entries = std::mem::take(&mut task.entries);
-        self.raft_wb.append(task.region_id, entries).unwrap();
+        for (index, entry) in entries {
+            let key = keys::raft_log_key(task.region_id, index);
+            self.raft_wb.put_entry(&key, &entry).unwrap();
+        }
         if let Some((from, to)) = task.cut_logs {
             self.raft_wb.cut_logs(task.region_id, from, to);
         }

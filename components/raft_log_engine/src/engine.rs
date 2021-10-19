@@ -89,6 +89,10 @@ impl RaftLogBatchTrait for RaftLogBatch {
     fn merge(&mut self, src: Self) {
         self.0.merge(src.0);
     }
+
+    fn put_entry(&mut self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        panic!("unimplemented");
+    }
 }
 
 impl RaftEngineReadOnly for RaftLogEngine {

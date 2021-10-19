@@ -1094,7 +1094,11 @@ where
 
         self.cache.append(&self.tag, &entries);
 
-        task.entries = entries;
+        for e in entries {
+            task.entries
+                .push((e.get_index(), e.write_to_bytes().unwrap()));
+        }
+
         // Delete any previously appended log entries which never committed.
         task.cut_logs = Some((last_index + 1, prev_last_index + 1));
 
