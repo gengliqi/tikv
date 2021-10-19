@@ -14,8 +14,6 @@ pub trait Transport: Send + Clone {
 
     fn need_flush(&self) -> bool;
 
-    fn try_delay_flush(&mut self);
-
     fn flush(&mut self);
 }
 

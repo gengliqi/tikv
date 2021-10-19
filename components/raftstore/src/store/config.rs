@@ -211,6 +211,9 @@ pub struct Config {
     pub io_reschedule_concurrent_max_count: usize,
     pub io_reschedule_hotpot_duration: ReadableDuration,
 
+    pub store_events_flush_interval: ReadableDuration,
+    pub raft_msg_flush_interval_us: u64,
+
     // Deprecated! These configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
     #[doc(hidden)]
@@ -303,6 +306,8 @@ impl Default for Config {
             waterfall_metrics: false,
             io_reschedule_concurrent_max_count: 4,
             io_reschedule_hotpot_duration: ReadableDuration::secs(5),
+            store_events_flush_interval: ReadableDuration::millis(1),
+            raft_msg_flush_interval_us: 500,
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),

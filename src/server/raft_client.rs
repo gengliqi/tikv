@@ -27,7 +27,7 @@ use std::marker::Unpin;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{cmp, mem, result};
 use tikv_util::lru::LruCache;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
@@ -764,14 +764,12 @@ struct CachedQueue {
 pub struct RaftClient<S, R, E> {
     pool: Arc<Mutex<ConnectionPool>>,
     cache: LruCache<(u64, usize), CachedQueue>,
-    first_send_time: Instant,
     need_flush: Vec<(u64, usize)>,
     full_stores: Vec<(u64, usize)>,
     future_pool: Arc<ThreadPool<TaskCell>>,
     builder: ConnectionBuilder<S, R>,
     engine: PhantomData<E>,
     last_hash: (u64, u64),
-    delay_flush_time: Duration,
 }
 
 impl<S, R, E> RaftClient<S, R, E>
@@ -786,18 +784,15 @@ where
                 .max_thread_count(1)
                 .build_future_pool(),
         );
-        let delay_flush_time = Duration::from_micros(builder.cfg.raft_msg_delay_time_us);
         RaftClient {
             pool: Arc::default(),
             cache: LruCache::with_capacity_and_sample(0, 7),
-            first_send_time: Instant::now(),
             need_flush: vec![],
             full_stores: vec![],
             future_pool,
             builder,
             engine: PhantomData::<E>,
             last_hash: (0, 0),
-            delay_flush_time,
         }
     }
 
@@ -892,9 +887,6 @@ where
                     Ok(_) => {
                         if !s.dirty {
                             s.dirty = true;
-                            if !self.delay_flush_time.is_zero() && self.need_flush.is_empty() {
-                                self.first_send_time = Instant::now();
-                            }
                             self.need_flush.push((store_id, conn_id));
                         }
                         return Ok(());
@@ -943,15 +935,6 @@ where
         }
     }
 
-    pub fn try_delay_flush(&mut self) {
-        if !self.need_flush() {
-            return;
-        }
-        if self.first_send_time.elapsed() > self.delay_flush_time {
-            self.flush();
-        }
-    }
-
     /// Flushes all buffered messages.
     pub fn flush(&mut self) {
         self.flush_full_metrics();
@@ -991,14 +974,12 @@ where
         RaftClient {
             pool: self.pool.clone(),
             cache: LruCache::with_capacity_and_sample(0, 7),
-            first_send_time: Instant::now(),
             need_flush: vec![],
             full_stores: vec![],
             future_pool: self.future_pool.clone(),
             builder: self.builder.clone(),
             engine: PhantomData::<E>,
             last_hash: (0, 0),
-            delay_flush_time: self.delay_flush_time,
         }
     }
 }

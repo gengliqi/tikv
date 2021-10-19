@@ -78,7 +78,6 @@ impl Transport for TestTransport {
     fn need_flush(&self) -> bool {
         false
     }
-    fn try_delay_flush(&mut self) {}
     fn flush(&mut self) {}
 }
 

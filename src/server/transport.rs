@@ -65,10 +65,6 @@ where
         self.raft_client.need_flush()
     }
 
-    fn try_delay_flush(&mut self) {
-        self.raft_client.try_delay_flush();
-    }
-
     fn flush(&mut self) {
         self.raft_client.flush();
     }
