@@ -786,8 +786,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
     fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
         let now = TiInstant::now();
         if self.poll_ctx.trans.need_flush() {
-            let flush_msg_dur = self.last_flush_msg_time.saturating_duration_since(now);
-            if flush_msg_dur >= Duration::from_micros(self.poll_ctx.cfg.raft_msg_flush_interval_us)
+            if now.saturating_duration_since(self.last_flush_msg_time)
+                >= Duration::from_micros(self.poll_ctx.cfg.raft_msg_flush_interval_us)
             {
                 self.last_flush_msg_time = now;
                 self.poll_ctx.trans.flush();
@@ -798,8 +798,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             peer.update_memory_trace(&mut self.trace_event);
         }
 
-        let flush_dur = self.last_flush_time.saturating_duration_since(now);
-        if flush_dur >= self.poll_ctx.cfg.store_events_flush_interval.0 {
+        if now.saturating_duration_since(self.last_flush_time)
+            >= self.poll_ctx.cfg.store_events_flush_interval.0
+        {
             self.last_flush_time = now;
             self.flush_events();
         }
