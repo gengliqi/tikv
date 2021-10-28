@@ -262,6 +262,10 @@ impl RaftLogBatch for RocksWriteBatch {
     fn merge(&mut self, src: Self) {
         WriteBatch::<RocksEngine>::merge(self, src);
     }
+
+    fn put_entry(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put(key, value)
+    }
 }
 
 impl RocksWriteBatch {

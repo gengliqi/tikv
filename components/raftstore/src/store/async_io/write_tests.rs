@@ -12,20 +12,21 @@ use engine_test::kv::KvTestEngine;
 use engine_test::new_temp_engine;
 use engine_traits::{Mutable, Peekable, WriteBatchExt};
 use kvproto::raft_serverpb::RaftMessage;
+use raft::eraftpb::Entry;
 use tempfile::Builder;
 
 use super::*;
 
 fn must_have_entries_and_state(
     raft_engine: &KvTestEngine,
-    entries_state: Vec<(u64, Vec<Entry>, RaftLocalState)>,
+    entries_state: Vec<(u64, Vec<(u64, Vec<u8>)>, RaftLocalState)>,
 ) {
     let snapshot = raft_engine.snapshot();
     for (region_id, entries, state) in entries_state {
         for e in entries {
-            let key = keys::raft_log_key(region_id, e.get_index());
-            let val = snapshot.get_msg::<Entry>(&key).unwrap().unwrap();
-            assert_eq!(val, e);
+            let key = keys::raft_log_key(region_id, e.0);
+            let val = snapshot.get_value(&key).unwrap().unwrap();
+            assert_eq!(val, e.1.as_slice());
         }
         let val = snapshot
             .get_msg::<RaftLocalState>(&keys::raft_state_key(region_id))
@@ -34,15 +35,15 @@ fn must_have_entries_and_state(
         assert_eq!(val, state);
         let key = keys::raft_log_key(region_id, state.get_last_index() + 1);
         // last_index + 1 entry should not exist
-        assert!(snapshot.get_msg::<Entry>(&key).unwrap().is_none());
+        assert!(snapshot.get_value(&key).unwrap().is_none());
     }
 }
 
-fn new_entry(index: u64, term: u64) -> Entry {
+fn new_entry(index: u64, term: u64) -> (u64, Vec<u8>) {
     let mut e = Entry::default();
     e.set_index(index);
     e.set_term(term);
-    e
+    (index, e.write_to_bytes().unwrap())
 }
 
 fn new_raft_state(term: u64, vote: u64, commit: u64, last_index: u64) -> RaftLocalState {

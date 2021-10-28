@@ -101,6 +101,8 @@ pub trait RaftLogBatch: Send {
 
     /// Merge another RaftLogBatch to itself.
     fn merge(&mut self, _: Self);
+
+    fn put_entry(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Default)]

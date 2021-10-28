@@ -122,4 +122,8 @@ impl RaftLogBatch for PanicWriteBatch {
     fn merge(&mut self, _: Self) {
         panic!()
     }
+
+    fn put_entry(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        panic!()
+    }
 }
