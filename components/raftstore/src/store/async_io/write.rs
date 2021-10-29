@@ -25,7 +25,6 @@ use engine_traits::{
     Engines, KvEngine, PerfContext, PerfContextKind, RaftEngine, RaftLogBatch, WriteBatch,
     WriteOptions,
 };
-use error_code::ErrorCodeExt;
 use fail::fail_point;
 use kvproto::raft_serverpb::{RaftLocalState, RaftMessage};
 use protobuf::Message;
@@ -37,6 +36,14 @@ const KV_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const KV_WB_DEFAULT_SIZE: usize = 16 * 1024;
 const RAFT_WB_SHRINK_SIZE: usize = 10 * 1024 * 1024;
 const RAFT_WB_DEFAULT_SIZE: usize = 256 * 1024;
+
+pub struct WriteEvent<EK, ER>
+where
+    EK: KvEngine,
+    ER: RaftEngine,
+{
+    pub tasks: Vec<WriteTask<EK, ER>>,
+}
 
 /// Notify the event to the specified region.
 pub trait Notifier: Clone + Send + 'static {
@@ -73,9 +80,9 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    region_id: u64,
-    peer_id: u64,
-    ready_number: u64,
+    pub region_id: u64,
+    pub peer_id: u64,
+    pub ready_number: u64,
     pub send_time: Instant,
     pub kv_wb: Option<EK::WriteBatch>,
     pub raft_wb: Option<ER::LogBatch>,
@@ -84,6 +91,7 @@ where
     pub raft_state: Option<RaftLocalState>,
     pub messages: Vec<RaftMessage>,
     pub request_times: Vec<Instant>,
+    pub should_callback: bool,
 }
 
 impl<EK, ER> WriteTask<EK, ER>
@@ -104,6 +112,7 @@ where
             raft_state: None,
             messages: vec![],
             request_times: vec![],
+            should_callback: true,
         }
     }
 
@@ -338,6 +347,8 @@ where
     metrics: StoreWriteMetrics,
     message_metrics: RaftSendMessageMetrics,
     perf_context: EK::PerfContext,
+    store_pool_size: usize,
+    event_sender: Sender<WriteEvent<EK, ER>>,
 }
 
 impl<EK, ER, N, T> Worker<EK, ER, N, T>
@@ -355,6 +366,7 @@ where
         notifier: N,
         trans: T,
         cfg: &Arc<VersionTrack<Config>>,
+        event_sender: Sender<WriteEvent<EK, ER>>,
     ) -> Self {
         let batch = WriteTaskBatch::new(
             engines.kv.write_batch_with_cap(KV_WB_DEFAULT_SIZE),
@@ -377,6 +389,8 @@ where
             metrics: StoreWriteMetrics::new(cfg.value().waterfall_metrics),
             message_metrics: Default::default(),
             perf_context,
+            store_pool_size: cfg.value().store_batch_system.pool_size,
+            event_sender,
         }
     }
 
@@ -422,6 +436,7 @@ where
             if let Some(incoming) = self.cfg_tracker.any_new() {
                 self.raft_write_size_limit = incoming.raft_write_size_limit.0 as usize;
                 self.metrics.waterfall_metrics = incoming.waterfall_metrics;
+                self.store_pool_size = incoming.store_batch_system.pool_size;
             }
 
             STORE_WRITE_LOOP_DURATION_HISTOGRAM
@@ -518,7 +533,28 @@ where
 
         fail_point!("raft_before_follower_send");
 
-        let now = Instant::now();
+        let num = self.batch.tasks.len() / self.store_pool_size;
+        let mut event = WriteEvent {
+            tasks: Vec::with_capacity(num),
+        };
+        for mut t in std::mem::take(&mut self.batch.tasks) {
+            let (peer_id, ready_number) = self.batch.readies.get(&t.region_id).unwrap();
+            if *peer_id != t.peer_id || *ready_number != t.ready_number {
+                t.should_callback = false;
+            }
+            event.tasks.push(t);
+            if event.tasks.len() >= num {
+                let _ = self.event_sender.send(event);
+                event = WriteEvent {
+                    tasks: Vec::with_capacity(num),
+                };
+            }
+        }
+        if !event.tasks.is_empty() {
+            let _ = self.event_sender.send(event);
+        }
+
+        /*let now = Instant::now();
         for task in &mut self.batch.tasks {
             for msg in task.messages.drain(..) {
                 let msg_type = msg.get_message().get_msg_type();
@@ -570,7 +606,7 @@ where
             self.notifier
                 .notify_persisted(*region_id, *peer_id, *ready_number);
         }
-        STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(now2.saturating_elapsed()));
+        STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(duration_to_sec(now2.saturating_elapsed()));*/
 
         self.batch.clear();
     }
@@ -582,6 +618,7 @@ where
     ER: RaftEngine,
 {
     writers: Vec<Sender<WriteMsg<EK, ER>>>,
+    event_sender: Sender<WriteEvent<EK, ER>>,
     handlers: Vec<JoinHandle<()>>,
 }
 
@@ -590,9 +627,10 @@ where
     EK: KvEngine,
     ER: RaftEngine,
 {
-    pub fn new() -> Self {
+    pub fn new(event_sender: Sender<WriteEvent<EK, ER>>) -> Self {
         Self {
             writers: vec![],
+            event_sender,
             handlers: vec![],
         }
     }
@@ -621,6 +659,7 @@ where
                 notifier.clone(),
                 trans.clone(),
                 cfg,
+                self.event_sender.clone(),
             );
             info!("starting store writer {}", i);
             let t = thread::Builder::new().name(thd_name!(tag)).spawn(move || {

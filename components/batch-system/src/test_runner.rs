@@ -103,7 +103,7 @@ impl Handler {
     }
 }
 
-impl PollHandler<Runner, Runner> for Handler {
+impl PollHandler<Runner, Runner, ()> for Handler {
     fn begin(&mut self, _batch_size: usize) {
         self.local.begin += 1;
     }
@@ -137,7 +137,7 @@ impl Builder {
     }
 }
 
-impl HandlerBuilder<Runner, Runner> for Builder {
+impl HandlerBuilder<Runner, Runner, ()> for Builder {
     type Handler = Handler;
 
     fn build(&mut self, priority: Priority) -> Handler {

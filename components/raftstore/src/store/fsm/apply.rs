@@ -21,7 +21,7 @@ use batch_system::{
     BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler, Priority,
 };
 use collections::{HashMap, HashMapEntry, HashSet};
-use crossbeam::channel::{TryRecvError, TrySendError};
+use crossbeam::channel::{self, TryRecvError, TrySendError};
 use engine_traits::PerfContext;
 use engine_traits::PerfContextKind;
 use engine_traits::{
@@ -3662,7 +3662,7 @@ where
     trace_event: TraceEvent,
 }
 
-impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm> for ApplyPoller<EK, W>
+impl<EK, W> PollHandler<ApplyFsm<EK>, ControlFsm, ()> for ApplyPoller<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -3820,7 +3820,7 @@ where
     }
 }
 
-impl<EK, W> HandlerBuilder<ApplyFsm<EK>, ControlFsm> for Builder<EK, W>
+impl<EK, W> HandlerBuilder<ApplyFsm<EK>, ControlFsm, ()> for Builder<EK, W>
 where
     EK: KvEngine,
     W: WriteBatch<EK>,
@@ -3987,19 +3987,20 @@ where
 }
 
 pub struct ApplyBatchSystem<EK: KvEngine> {
-    system: BatchSystem<ApplyFsm<EK>, ControlFsm>,
+    system: BatchSystem<ApplyFsm<EK>, ControlFsm, ()>,
+    event_sender: channel::Sender<()>,
 }
 
 impl<EK: KvEngine> Deref for ApplyBatchSystem<EK> {
-    type Target = BatchSystem<ApplyFsm<EK>, ControlFsm>;
+    type Target = BatchSystem<ApplyFsm<EK>, ControlFsm, ()>;
 
-    fn deref(&self) -> &BatchSystem<ApplyFsm<EK>, ControlFsm> {
+    fn deref(&self) -> &BatchSystem<ApplyFsm<EK>, ControlFsm, ()> {
         &self.system
     }
 }
 
 impl<EK: KvEngine> DerefMut for ApplyBatchSystem<EK> {
-    fn deref_mut(&mut self) -> &mut BatchSystem<ApplyFsm<EK>, ControlFsm> {
+    fn deref_mut(&mut self) -> &mut BatchSystem<ApplyFsm<EK>, ControlFsm, ()> {
         &mut self.system
     }
 }
@@ -4022,9 +4023,9 @@ pub fn create_apply_batch_system<EK: KvEngine>(
     cfg: &Config,
 ) -> (ApplyRouter<EK>, ApplyBatchSystem<EK>) {
     let (control_tx, control_fsm) = ControlFsm::new();
-    let (router, system) =
+    let (router, system, event_sender) =
         batch_system::create_system(&cfg.apply_batch_system, control_tx, control_fsm);
-    (ApplyRouter { router }, ApplyBatchSystem { system })
+    (ApplyRouter { router }, ApplyBatchSystem { system, event_sender })
 }
 
 mod memtrace {

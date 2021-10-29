@@ -217,7 +217,7 @@ impl<N: Fsm, C: Fsm> Batch<N, C> {
 ///
 /// Note that, every poll thread has its own handler, which doesn't have to be
 /// Sync.
-pub trait PollHandler<N, C> {
+pub trait PollHandler<N, C, E> {
     /// This function is called at the very beginning of every round.
     fn begin(&mut self, batch_size: usize);
 
@@ -235,6 +235,8 @@ pub trait PollHandler<N, C> {
     /// The returned value is handled in the same way as `handle_control`.
     fn handle_normal(&mut self, normal: &mut N) -> Option<usize>;
 
+    fn handle_event(&mut self, _event: E) {}
+
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
 
@@ -248,9 +250,10 @@ pub trait PollHandler<N, C> {
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
-struct Poller<N: Fsm, C: Fsm, Handler> {
+struct Poller<N: Fsm, C: Fsm, E, Handler> {
     router: Router<N, C, NormalScheduler<N, C>, ControlScheduler<N, C>>,
     fsm_receiver: channel::Receiver<FsmTypes<N, C>>,
+    event_receiver: channel::Receiver<E>,
     handler: Handler,
     max_batch_size: usize,
     reschedule_duration: Duration,
@@ -262,7 +265,7 @@ enum ReschedulePolicy {
     Schedule,
 }
 
-impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
+impl<N: Fsm, C: Fsm, E, Handler: PollHandler<N, C, E>> Poller<N, C, E, Handler> {
     fn fetch_fsm(&mut self, batch: &mut Batch<N, C>) -> bool {
         if batch.control.is_some() {
             return true;
@@ -274,8 +277,23 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 
         if batch.is_empty() {
             self.handler.pause();
-            if let Ok(fsm) = self.fsm_receiver.recv() {
-                return batch.push(fsm);
+            loop {
+                channel::select! {
+                    recv(self.fsm_receiver) -> msg => {
+                        if let Ok(fsm) = msg {
+                            return batch.push(fsm);
+                        }
+                        break;
+                    },
+                    recv(self.event_receiver) -> msg => {
+                        if let Ok(event) = msg {
+                            self.handler.handle_event(event);
+                        }
+                        while let Ok(event) = self.event_receiver.try_recv() {
+                            self.handler.handle_event(event);
+                        }
+                    }
+                }
             }
         }
         !batch.is_empty()
@@ -304,6 +322,10 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 } else if let Some(len) = len {
                     batch.release_control(&self.router.control_box, len);
                 }
+
+                while let Ok(event) = self.event_receiver.try_recv() {
+                    self.handler.handle_event(event);
+                }
             }
 
             let mut hot_fsm_count = 0;
@@ -328,6 +350,10 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                         reschedule_fsms.push((i, ReschedulePolicy::Release(l)));
                     }
                 }
+
+                while let Ok(event) = self.event_receiver.try_recv() {
+                    self.handler.handle_event(event);
+                }
             }
             let mut fsm_cnt = batch.normals.len();
             while batch.normals.len() < max_batch_size {
@@ -347,6 +373,10 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     reschedule_fsms.push((fsm_cnt, ReschedulePolicy::Release(l)));
                 }
                 fsm_cnt += 1;
+
+                while let Ok(event) = self.event_receiver.try_recv() {
+                    self.handler.handle_event(event);
+                }
             }
             self.handler.end(&mut batch.normals);
 
@@ -365,8 +395,8 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
 }
 
 /// A builder trait that can build up poll handlers.
-pub trait HandlerBuilder<N, C> {
-    type Handler: PollHandler<N, C>;
+pub trait HandlerBuilder<N, C, E> {
+    type Handler: PollHandler<N, C, E>;
 
     fn build(&mut self, priority: Priority) -> Self::Handler;
 }
@@ -376,11 +406,12 @@ pub trait HandlerBuilder<N, C> {
 /// To use the system, two type of FSMs and their PollHandlers need
 /// to be defined: Normal and Control. Normal FSM handles the general
 /// task while Control FSM creates normal FSM instances.
-pub struct BatchSystem<N: Fsm, C: Fsm> {
+pub struct BatchSystem<N: Fsm, C: Fsm, E> {
     name_prefix: Option<String>,
     router: BatchRouter<N, C>,
     receiver: channel::Receiver<FsmTypes<N, C>>,
     low_receiver: channel::Receiver<FsmTypes<N, C>>,
+    event_receiver: channel::Receiver<E>,
     pool_size: usize,
     max_batch_size: usize,
     workers: Vec<JoinHandle<()>>,
@@ -388,10 +419,11 @@ pub struct BatchSystem<N: Fsm, C: Fsm> {
     low_priority_pool_size: usize,
 }
 
-impl<N, C> BatchSystem<N, C>
+impl<N, C, E> BatchSystem<N, C, E>
 where
     N: Fsm + Send + 'static,
     C: Fsm + Send + 'static,
+    E: Send + 'static,
 {
     pub fn router(&self) -> &BatchRouter<N, C> {
         &self.router
@@ -399,7 +431,7 @@ where
 
     fn start_poller<B>(&mut self, name: String, priority: Priority, builder: &mut B)
     where
-        B: HandlerBuilder<N, C>,
+        B: HandlerBuilder<N, C, E>,
         B::Handler: Send + 'static,
     {
         let handler = builder.build(priority);
@@ -410,6 +442,7 @@ where
         let mut poller = Poller {
             router: self.router.clone(),
             fsm_receiver: receiver,
+            event_receiver: self.event_receiver.clone(),
             handler,
             max_batch_size: self.max_batch_size,
             reschedule_duration: self.reschedule_duration,
@@ -429,7 +462,7 @@ where
     /// Start the batch system.
     pub fn spawn<B>(&mut self, name_prefix: String, mut builder: B)
     where
-        B: HandlerBuilder<N, C>,
+        B: HandlerBuilder<N, C, E>,
         B::Handler: Send + 'static,
     {
         for i in 0..self.pool_size {
@@ -477,15 +510,16 @@ pub type BatchRouter<N, C> = Router<N, C, NormalScheduler<N, C>, ControlSchedule
 /// Create a batch system with the given thread name prefix and pool size.
 ///
 /// `sender` and `controller` should be paired.
-pub fn create_system<N: Fsm, C: Fsm>(
+pub fn create_system<N: Fsm, C: Fsm, E>(
     cfg: &Config,
     sender: mpsc::LooseBoundedSender<C::Message>,
     controller: Box<C>,
-) -> (BatchRouter<N, C>, BatchSystem<N, C>) {
+) -> (BatchRouter<N, C>, BatchSystem<N, C, E>, channel::Sender<E>) {
     let state_cnt = Arc::new(AtomicUsize::new(0));
     let control_box = BasicMailbox::new(sender, controller, state_cnt.clone());
     let (tx, rx) = channel::unbounded();
     let (tx2, rx2) = channel::unbounded();
+    let (tx3, rx3) = channel::unbounded();
     let normal_scheduler = NormalScheduler {
         sender: tx.clone(),
         low_sender: tx2.clone(),
@@ -500,11 +534,12 @@ pub fn create_system<N: Fsm, C: Fsm>(
         router: router.clone(),
         receiver: rx,
         low_receiver: rx2,
+        event_receiver: rx3,
         pool_size: cfg.pool_size,
         max_batch_size: cfg.max_batch_size(),
         reschedule_duration: cfg.reschedule_duration.0,
         workers: vec![],
         low_priority_pool_size: cfg.low_priority_pool_size,
     };
-    (router, system)
+    (router, system, tx3)
 }

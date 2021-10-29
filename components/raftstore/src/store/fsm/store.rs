@@ -35,6 +35,7 @@ use time::{self, Timespec};
 use collections::HashMap;
 use engine_traits::CompactedEvent;
 use engine_traits::{RaftEngine, RaftLogBatch};
+use error_code::ErrorCodeExt;
 use keys::{self, data_end_key, data_key, enc_end_key, enc_start_key};
 use pd_client::{FeatureGate, PdClient};
 use sst_importer::SSTImporter;
@@ -53,7 +54,7 @@ use tikv_util::{
 use crate::bytes_capacity;
 use crate::coprocessor::split_observer::SplitObserver;
 use crate::coprocessor::{BoxAdminObserver, CoprocessorHost, RegionChangeEvent};
-use crate::store::async_io::write::{StoreWriters, WriteMsg};
+use crate::store::async_io::write::{StoreWriters, WriteEvent, WriteMsg};
 use crate::store::config::Config;
 use crate::store::fsm::metrics::*;
 use crate::store::fsm::peer::{
@@ -677,8 +678,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
     }
 }
 
-impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, StoreFsm<EK>>
-    for RaftPoller<EK, ER, T>
+impl<EK: KvEngine, ER: RaftEngine, T: Transport>
+    PollHandler<PeerFsm<EK, ER>, StoreFsm<EK>, WriteEvent<EK, ER>> for RaftPoller<EK, ER, T>
 {
     fn begin(&mut self, _batch_size: usize) {
         self.previous_metrics = self.poll_ctx.raft_metrics.ready.clone();
@@ -781,6 +782,68 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
         expected_msg_count
+    }
+
+    fn handle_event(&mut self, event: WriteEvent<EK, ER>) {
+        for task in event.tasks {
+            for msg in task.messages {
+                let msg_type = msg.get_message().get_msg_type();
+                let to_peer_id = msg.get_to_peer().get_id();
+                let to_store_id = msg.get_to_peer().get_store_id();
+
+                debug!(
+                    "send raft msg in write thread";
+                    "tag" => &self.tag,
+                    "region_id" => task.region_id,
+                    "peer_id" => task.peer_id,
+                    "msg_type" => ?msg_type,
+                    "msg_size" => msg.get_message().compute_size(),
+                    "to" => to_peer_id,
+                    "disk_usage" => ?msg.get_disk_usage(),
+                );
+
+                if let Err(e) = self.poll_ctx.trans.send(msg) {
+                    // We use metrics to observe failure on production.
+                    debug!(
+                        "failed to send msg to other peer";
+                        "region_id" => task.region_id,
+                        "peer_id" => task.peer_id,
+                        "target_peer_id" => to_peer_id,
+                        "target_store_id" => to_store_id,
+                        "err" => ?e,
+                        "error_code" => %e.error_code(),
+                    );
+                    self.poll_ctx.raft_metrics.send_message.add(msg_type, false);
+                    // If this msg is snapshot, it is unnecessary to send snapshot
+                    // status to this peer because it has already become follower.
+                    // (otherwise the snapshot msg should be sent in store thread other than here)
+                    // Also, the follower don't need flow control, so don't send
+                    // unreachable msg here.
+                } else {
+                    self.poll_ctx.raft_metrics.send_message.add(msg_type, true);
+                }
+            }
+            if task.should_callback {
+                if let Err(e) = self.poll_ctx.router.force_send(
+                    task.region_id,
+                    PeerMsg::Persisted {
+                        peer_id: task.peer_id,
+                        ready_number: task.ready_number,
+                    },
+                ) {
+                    warn!(
+                        "failed to send noop to trigger persisted ready";
+                        "region_id" => task.region_id,
+                        "peer_id" => task.peer_id,
+                        "ready_number" => task.ready_number,
+                        "error" => ?e,
+                    );
+                }
+            }
+        }
+        if self.poll_ctx.trans.need_flush() {
+            self.poll_ctx.trans.flush();
+        }
     }
 
     fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
@@ -1050,7 +1113,8 @@ impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
     }
 }
 
-impl<EK, ER, T> HandlerBuilder<PeerFsm<EK, ER>, StoreFsm<EK>> for RaftPollerBuilder<EK, ER, T>
+impl<EK, ER, T> HandlerBuilder<PeerFsm<EK, ER>, StoreFsm<EK>, WriteEvent<EK, ER>>
+    for RaftPollerBuilder<EK, ER, T>
 where
     EK: KvEngine + 'static,
     ER: RaftEngine + 'static,
@@ -1131,7 +1195,7 @@ struct Workers<EK: KvEngine> {
 }
 
 pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
-    system: BatchSystem<PeerFsm<EK, ER>, StoreFsm<EK>>,
+    system: BatchSystem<PeerFsm<EK, ER>, StoreFsm<EK>, WriteEvent<EK, ER>>,
     apply_router: ApplyRouter<EK>,
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
@@ -1387,7 +1451,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
 ) -> (RaftRouter<EK, ER>, RaftBatchSystem<EK, ER>) {
     let (store_tx, store_fsm) = StoreFsm::new(cfg);
     let (apply_router, apply_system) = create_apply_batch_system(cfg);
-    let (router, system) =
+    let (router, system, event_sender) =
         batch_system::create_system(&cfg.store_batch_system, store_tx, store_fsm);
     let raft_router = RaftRouter { router };
     let system = RaftBatchSystem {
@@ -1396,7 +1460,7 @@ pub fn create_raft_batch_system<EK: KvEngine, ER: RaftEngine>(
         apply_router,
         apply_system,
         router: raft_router.clone(),
-        store_writers: StoreWriters::new(),
+        store_writers: StoreWriters::new(event_sender),
     };
     (raft_router, system)
 }
