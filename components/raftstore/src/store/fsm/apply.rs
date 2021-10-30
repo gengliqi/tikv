@@ -2828,6 +2828,14 @@ pub fn compact_raft_log(
     Ok(())
 }
 
+pub struct ApplyEntries<S>
+where
+    S: Snapshot,
+{
+    pub entries: Vec<Entry>,
+    pub cbs: Vec<Proposal<S>>,
+}
+
 pub struct Apply<S>
 where
     S: Snapshot,
@@ -2835,42 +2843,28 @@ where
     pub peer_id: u64,
     pub region_id: u64,
     pub term: u64,
-    pub entries: CachedEntries,
-    pub cbs: Vec<Proposal<S>>,
+    pub entries_and_cbs: Arc<Mutex<ApplyEntries<S>>>,
 }
 
 impl<S: Snapshot> Apply<S> {
-    pub(crate) fn new(
-        peer_id: u64,
-        region_id: u64,
-        term: u64,
-        entries: Vec<Entry>,
-        cbs: Vec<Proposal<S>>,
-    ) -> Apply<S> {
-        let entries = CachedEntries::new(entries);
+    pub(crate) fn new(peer_id: u64, region_id: u64, term: u64) -> Apply<S> {
         Apply {
             peer_id,
             region_id,
             term,
-            entries,
-            cbs,
+            entries_and_cbs: Arc::new(Mutex::new(ApplyEntries {
+                entries: vec![],
+                cbs: vec![],
+            })),
         }
     }
 
-    pub fn on_schedule(&mut self, metrics: &RaftMetrics) {
-        let mut now = None;
-        for cb in &mut self.cbs {
-            if let Callback::Write { request_times, .. } = &mut cb.cb {
-                if now.is_none() {
-                    now = Some(Instant::now());
-                }
-                for t in request_times {
-                    metrics
-                        .store_time
-                        .observe(duration_to_sec(now.unwrap().saturating_duration_since(*t)));
-                    *t = now.unwrap();
-                }
-            }
+    pub fn clone(&self) -> Apply<S> {
+        Apply {
+            peer_id: self.peer_id,
+            region_id: self.region_id,
+            term: self.term,
+            entries_and_cbs: self.entries_and_cbs.clone(),
         }
     }
 }
@@ -3205,11 +3199,15 @@ where
         fail_point!("on_handle_apply_2", self.delegate.id() == 2, |_| {});
         fail_point!("on_handle_apply", |_| {});
 
-        if apply.entries.range.is_empty() || self.delegate.pending_remove || self.delegate.stopped {
+        if self.delegate.pending_remove || self.delegate.stopped {
             return;
         }
+        let (mut entries, mut cbs) = {
+            let mut e = apply.entries_and_cbs.lock().unwrap();
+            (mem::take(&mut e.entries), mem::take(&mut e.cbs))
+        };
 
-        let (mut entries, dangle_size) = apply.entries.take_entries();
+        /*let (mut entries, dangle_size) = apply.entries.take_entries();
         if dangle_size > 0 {
             MEMTRACE_ENTRY_CACHE.trace(TraceEvent::Sub(dangle_size));
             RAFT_ENTRIES_CACHES_GAUGE.sub(dangle_size as i64);
@@ -3222,7 +3220,7 @@ where
                 .raft_engine
                 .fetch_entries_to(rid, start, end, None, &mut entries)
                 .unwrap();
-        }
+        }*/
 
         self.delegate.metrics = ApplyMetrics::default();
         self.delegate.term = apply.term;
@@ -3242,7 +3240,7 @@ where
             self.delegate.apply_state.set_commit_term(cur_state.1);
         }
 
-        self.append_proposal(apply.cbs.drain(..));
+        self.append_proposal(cbs.drain(..));
         self.delegate
             .handle_raft_committed_entries(apply_ctx, entries.drain(..));
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
@@ -3905,10 +3903,10 @@ where
                     //     proposed by new leader, then it won't be able to propose new proposals.
                     // So only shutdown needs to be checked here.
                     if !tikv_util::thread_group::is_shutdown(!cfg!(test)) {
-                        for p in apply.cbs.drain(..) {
+                        /*for p in apply.cbs.drain(..) {
                             let cmd = PendingCmd::<EK::Snapshot>::new(p.index, p.term, p.cb);
                             notify_region_removed(apply.region_id, apply.peer_id, cmd);
-                        }
+                        }*/
                     }
                     return;
                 }

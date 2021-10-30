@@ -580,6 +580,8 @@ where
     persisted_number: u64,
     /// The context of applying snapshot.
     apply_snap_ctx: Option<ApplySnapshotContext>,
+
+    last_apply: Option<Apply<EK::Snapshot>>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -685,6 +687,7 @@ where
             unpersisted_message_count: 0,
             persisted_number: 0,
             apply_snap_ctx: None,
+            last_apply: None,
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -2153,7 +2156,7 @@ where
     fn handle_raft_committed_entries<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
-        committed_entries: Vec<Entry>,
+        mut committed_entries: Vec<Entry>,
     ) {
         fail_point!(
             "before_leader_handle_committed_entries",
@@ -2209,7 +2212,7 @@ where
                 self.raft_group.skip_bcast_commit(true);
                 self.last_urgent_proposal_idx = u64::MAX;
             }
-            let cbs = if !self.proposals.is_empty() {
+            let mut cbs = if !self.proposals.is_empty() {
                 let current_term = self.term();
                 let cbs = committed_entries
                     .iter()
@@ -2231,21 +2234,61 @@ where
             } else {
                 vec![]
             };
-            let mut apply = Apply::new(
-                self.peer_id(),
-                self.region_id,
-                self.term(),
-                committed_entries,
-                cbs,
-            );
-            apply.on_schedule(&ctx.raft_metrics);
-            self.mut_store().trace_cached_entries(apply.entries.clone());
+            let mut now = None;
+            for cb in &mut cbs {
+                if let Callback::Write { request_times, .. } = &mut cb.cb {
+                    if now.is_none() {
+                        now = Some(TiInstant::now());
+                    }
+                    for t in request_times {
+                        ctx.raft_metrics
+                            .store_time
+                            .observe(duration_to_sec(now.unwrap().saturating_duration_since(*t)));
+                        *t = now.unwrap();
+                    }
+                }
+            }
+
+            let mut append_to_last = false;
+            if let Some(apply) = self.last_apply.take() {
+                assert_eq!(self.region_id, apply.region_id);
+                if apply.peer_id == self.peer_id() && apply.term == self.term() {
+                    let mut entries_and_cbs = apply.entries_and_cbs.lock().unwrap();
+                    if !entries_and_cbs.entries.is_empty() {
+                        append_to_last = true;
+                        entries_and_cbs
+                            .entries
+                            .append(&mut mem::take(&mut committed_entries));
+                        if !cbs.is_empty() {
+                            entries_and_cbs.cbs.append(&mut cbs);
+                        }
+                    }
+                }
+            }
+
+            if !append_to_last {
+                let mut apply = Apply::new(self.peer_id(), self.region_id, self.term());
+
+                let mut entries_and_cbs = apply.entries_and_cbs.lock().unwrap();
+                entries_and_cbs.entries.append(&mut committed_entries);
+                if !cbs.is_empty() {
+                    entries_and_cbs.cbs.append(&mut cbs);
+                }
+                drop(entries_and_cbs);
+
+                self.last_apply = Some(apply.clone());
+
+                ctx.apply_router
+                    .schedule_task(self.region_id, ApplyTask::apply(apply));
+            }
+
+            //apply.on_schedule(&ctx.raft_metrics);
+
+            //self.mut_store().trace_cached_entries(apply.entries.clone());
             if needs_evict_entry_cache(ctx.cfg.evict_cache_on_memory_ratio) {
                 // Compact all cached entries instead of half evict.
                 self.mut_store().evict_cache(false);
             }
-            ctx.apply_router
-                .schedule_task(self.region_id, ApplyTask::apply(apply));
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }
