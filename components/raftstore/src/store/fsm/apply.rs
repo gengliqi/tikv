@@ -412,6 +412,10 @@ where
     pending_latency_inspect: Vec<LatencyInspector>,
     apply_wait: LocalHistogram,
     apply_time: LocalHistogram,
+    decode_cmd_time: LocalHistogram,
+    process_cmd_time: LocalHistogram,
+    apply_cmd_time: LocalHistogram,
+    exec_cmd_time: LocalHistogram,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -465,6 +469,10 @@ where
             pending_latency_inspect: vec![],
             apply_wait: APPLY_TASK_WAIT_TIME_HISTOGRAM.local(),
             apply_time: APPLY_TIME_HISTOGRAM.local(),
+            decode_cmd_time: APPLY_DECODE_CMD_TIME_HISTOGRAM.local(),
+            process_cmd_time: APPLY_PROCESS_CMD_TIME_HISTOGRAM.local(),
+            apply_cmd_time: APPLY_APPLY_CMD_TIME_HISTOGRAM.local(),
+            exec_cmd_time: APPLY_EXEC_CMD_TIME_HISTOGRAM.local(),
         }
     }
 
@@ -522,9 +530,11 @@ where
         if !self.kv_wb_mut().is_empty() {
             let mut write_opts = engine_traits::WriteOptions::new();
             write_opts.set_sync(need_sync);
+            let now = Instant::now();
             self.kv_wb().write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("failed to write to engine: {:?}", e);
             });
+            APPLY_WRITE_KV_DB_TIME_HISTOGRAM.observe(now.saturating_elapsed_secs());
             self.perf_context.report_metrics();
             self.sync_log_hint = false;
             let data_size = self.kv_wb().data_size();
@@ -569,6 +579,10 @@ where
         }
         self.apply_time.flush();
         self.apply_wait.flush();
+        self.decode_cmd_time.flush();
+        self.process_cmd_time.flush();
+        self.apply_cmd_time.flush();
+        self.exec_cmd_time.flush();
         need_sync
     }
 
@@ -1044,7 +1058,9 @@ where
         let data = entry.get_data();
 
         if !data.is_empty() {
+            let now = Instant::now();
             let cmd = util::parse_data_at(data, index, &self.tag);
+            apply_ctx.decode_cmd_time.observe(now.saturating_elapsed_secs());
 
             if apply_ctx.yield_high_latency_operation && has_high_latency_operation(&cmd) {
                 self.priority = Priority::Low;
@@ -1069,7 +1085,10 @@ where
                 return ApplyResult::Yield;
             }
 
-            return self.process_raft_cmd(apply_ctx, index, term, cmd);
+            let now = Instant::now();
+            let ret = self.process_raft_cmd(apply_ctx, index, term, cmd);
+            apply_ctx.process_cmd_time.observe(now.saturating_elapsed_secs());
+            return ret;
         }
         // TOOD(cdc): should we observe empty cmd, aka leader change?
 
@@ -1186,7 +1205,9 @@ where
         apply_ctx.sync_log_hint |= should_sync_log(&cmd);
 
         apply_ctx.host.pre_apply(&self.region, &cmd);
+        let now = Instant::now();
         let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx, index, term, &cmd);
+        apply_ctx.apply_cmd_time.observe(now.saturating_elapsed_secs());
         if let ApplyResult::WaitMergeSource(_) = exec_result {
             return exec_result;
         }
@@ -1230,6 +1251,7 @@ where
         ctx.exec_ctx = Some(self.new_ctx(index, term));
         ctx.kv_wb_mut().set_save_point();
         let mut origin_epoch = None;
+        let now = Instant::now();
         let (resp, exec_result) = match self.exec_raft_cmd(ctx, req) {
             Ok(a) => {
                 ctx.kv_wb_mut().pop_save_point().unwrap();
@@ -1257,6 +1279,7 @@ where
                 (cmd_resp::new_error(e), ApplyResult::None)
             }
         };
+        ctx.exec_cmd_time.observe(now.saturating_elapsed_secs());
         if let ApplyResult::WaitMergeSource(_) = exec_result {
             return (resp, exec_result);
         }

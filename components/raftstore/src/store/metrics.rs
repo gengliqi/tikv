@@ -276,6 +276,36 @@ lazy_static! {
             "Bucketed histogram of write msg block wait duration.",
             exponential_buckets(0.00001, 2.0, 26).unwrap()
         ).unwrap();
+    pub static ref APPLY_WRITE_KV_DB_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_write_kv_db_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_DECODE_CMD_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_decode_cmd_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_PROCESS_CMD_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_process_cmd_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_APPLY_CMD_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_apply_cmd_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_EXEC_CMD_TIME_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_exec_cmd_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
 
     /// Waterfall Metrics
     pub static ref STORE_WF_BATCH_WAIT_DURATION_HISTOGRAM: Histogram =
