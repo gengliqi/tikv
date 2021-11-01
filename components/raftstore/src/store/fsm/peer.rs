@@ -637,12 +637,17 @@ where
     }
 
     fn propose_batch_raft_command(&mut self, force: bool) {
-        if !force
-            && self.ctx.cfg.cmd_batch_concurrent_ready_max_count != 0
-            && self.fsm.peer.unpersisted_ready_len()
-                >= self.ctx.cfg.cmd_batch_concurrent_ready_max_count
-        {
-            return;
+        if !force {
+            if (self.ctx.cfg.cmd_batch_concurrent_ready_max_count != 0
+                && self.fsm.peer.unpersisted_ready_len()
+                    >= self.ctx.cfg.cmd_batch_concurrent_ready_max_count)
+                || (self.ctx.cfg.concurrent_unapplied_entries_count != 0
+                    && self.fsm.peer.get_store().commit_index()
+                        - self.fsm.peer.get_store().applied_index()
+                        >= self.ctx.cfg.concurrent_unapplied_entries_count)
+            {
+                return;
+            }
         }
         if let Some((request, callback)) =
             self.fsm.batch_req_builder.build(&mut self.ctx.raft_metrics)
@@ -1294,6 +1299,7 @@ where
                 if self.fsm.peer.is_leader() {
                     self.register_pd_heartbeat_tick();
                     self.register_split_region_check_tick();
+                    self.propose_batch_raft_command(false);
                 }
             }
             ApplyTaskRes::Destroy {

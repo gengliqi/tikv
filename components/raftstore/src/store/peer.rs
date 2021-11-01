@@ -2267,7 +2267,7 @@ where
             }
 
             if !append_to_last {
-                let mut apply = Apply::new(self.peer_id(), self.region_id, self.term());
+                let apply = Apply::new(self.peer_id(), self.region_id, self.term());
 
                 let mut entries_and_cbs = apply.entries_and_cbs.lock().unwrap();
                 entries_and_cbs.entries.append(&mut committed_entries);

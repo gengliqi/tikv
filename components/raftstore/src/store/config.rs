@@ -203,6 +203,8 @@ pub struct Config {
     /// If it is 0, it means no limit.
     pub cmd_batch_concurrent_ready_max_count: usize,
 
+    pub concurrent_unapplied_entries_count: u64,
+
     /// When the size of raft db writebatch exceeds this value, write will be triggered.
     pub raft_write_size_limit: ReadableSize,
 
@@ -302,6 +304,7 @@ impl Default for Config {
             evict_cache_on_memory_ratio: 0.2,
             cmd_batch: true,
             cmd_batch_concurrent_ready_max_count: 1,
+            concurrent_unapplied_entries_count: 16,
             raft_write_size_limit: ReadableSize::mb(1),
             waterfall_metrics: false,
             io_reschedule_concurrent_max_count: 4,

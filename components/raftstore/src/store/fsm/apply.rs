@@ -3189,7 +3189,7 @@ where
     fn handle_apply<W: WriteBatch<EK>>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
-        mut apply: Apply<EK::Snapshot>,
+        apply: Apply<EK::Snapshot>,
     ) {
         if apply_ctx.timer.is_none() {
             apply_ctx.timer = Some(Instant::now_coarse());
