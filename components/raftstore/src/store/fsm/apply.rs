@@ -306,7 +306,7 @@ impl<S: Snapshot> ApplyCallbackBatch<S> {
         }
     }
 
-    fn push_batch(&mut self, observe_info: &CmdObserveInfo, region: Region) {
+    fn push_batch(&mut self, observe_info: &CmdObserveInfo, region: &Region) {
         let cb = CmdBatch::new(observe_info, region);
         self.batch_max_level = cmp::max(self.batch_max_level, cb.level);
         self.cmd_batch.push(cb);
@@ -470,7 +470,7 @@ where
     pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
         let now = Instant::now();
         self.applied_batch
-            .push_batch(&delegate.observe_info, delegate.region.clone());
+            .push_batch(&delegate.observe_info, &delegate.region);
         APPLY_PREPARE_FOR_HISTOGRAM.observe(now.saturating_elapsed_secs());
     }
 
@@ -570,6 +570,12 @@ where
             cb.invoke_with_response(resp);
         }
         APPLY_INVOKE_CALLBACK_HISTOGRAM.observe(now.saturating_elapsed_secs());
+        if !self.apply_res.is_empty() {
+            let now = Instant::now();
+            let apply_res = mem::take(&mut self.apply_res);
+            self.notifier.notify(apply_res);
+            APPLY_NOTIFY_STORE_HISTOGRAM.observe(now.saturating_elapsed_secs());
+        }
         self.apply_time.flush();
         self.apply_wait.flush();
         self.decode_cmd_time.flush();
@@ -635,13 +641,6 @@ where
         let now = Instant::now();
         let is_synced = self.write_to_db();
         APPLY_WRITE_TO_DB_HISTOGRAM.observe(now.saturating_elapsed_secs());
-
-        if !self.apply_res.is_empty() {
-            let now = Instant::now();
-            let apply_res = mem::take(&mut self.apply_res);
-            self.notifier.notify(apply_res);
-            APPLY_NOTIFY_STORE_HISTOGRAM.observe(now.saturating_elapsed_secs());
-        }
 
         let elapsed = t.saturating_elapsed();
         STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
@@ -957,11 +956,10 @@ where
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         mut committed_entries_drainer: Drain<Entry>,
-    ) -> f64 {
+    ) {
         if committed_entries_drainer.len() == 0 {
-            return 0.0;
+            return;
         }
-        let now = Instant::now(); 
         apply_ctx.prepare_for(self);
 
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
@@ -1012,11 +1010,10 @@ where
                         pending_msgs: Vec::default(),
                         heap_size: None,
                     });
-                    APPLY_YIELD_COUNT.inc();
                     if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
                     }
-                    return now.saturating_elapsed_secs();
+                    return;
                 }
             }
         }
@@ -1025,8 +1022,6 @@ where
         if self.pending_remove {
             self.destroy(apply_ctx);
         }
-
-        now.saturating_elapsed_secs()
     }
 
     fn update_metrics<W: WriteBatch<EK>>(&mut self, apply_ctx: &ApplyContext<EK, W>) {
@@ -1108,7 +1103,6 @@ where
         // 2. When a leader tries to read index during transferring leader,
         //    it will also propose an empty entry. But that entry will not contain
         //    any associated callback. So no need to clear callback.
-        let now = Instant::now();
         while let Some(mut cmd) = self.pending_cmds.pop_normal(std::u64::MAX, term - 1) {
             if let Some(cb) = cmd.cb.take() {
                 apply_ctx
@@ -3224,12 +3218,11 @@ where
         if self.delegate.pending_remove || self.delegate.stopped {
             return;
         }
-        let now = Instant::now();
+
         let (mut entries, mut cbs) = {
             let mut e = apply.entries_and_cbs.lock().unwrap();
             (mem::take(&mut e.entries), mem::take(&mut e.cbs))
         };
-        APPLY_GET_ENTRIES_HISTOGRAM.observe(now.saturating_elapsed_secs());
 
         /*let (mut entries, dangle_size) = apply.entries.take_entries();
         if dangle_size > 0 {
@@ -3263,13 +3256,12 @@ where
             self.delegate.apply_state.set_commit_index(cur_state.0);
             self.delegate.apply_state.set_commit_term(cur_state.1);
         }
-        let now = Instant::now();
+
         self.append_proposal(cbs.drain(..));
-        APPLY_APPEND_PROPOSAL_HISTOGRAM.observe(now.saturating_elapsed_secs());
-        let now = Instant::now();
-        let x = self.delegate
+
+        self.delegate
             .handle_raft_committed_entries(apply_ctx, entries.drain(..));
-        APPLY_DROP_ENTRY_HISTOGRAM.observe(now.saturating_elapsed_secs() - x);
+
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
     }
 
@@ -5777,9 +5769,9 @@ mod tests {
     fn test_xxxxx() {
         println!(
             "{} {}",
-            std::mem::size_of::<RaftCmdResponse>(),
+            std::mem::size_of::<ApplyRes<KvTestSnapshot>>(),
             std::mem::size_of::<protobuf::SingularPtrField<RaftResponseHeader>>()
         );
-        println!("{}", std::mem::size_of::<ApplyResult<KvTestSnapshot>>());
+        println!("{}", std::mem::size_of::<RaftApplyState>());
     }
 }

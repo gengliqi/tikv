@@ -313,35 +313,7 @@ lazy_static! {
             "TODO.",
             exponential_buckets(0.00001, 2.0, 26).unwrap()
         ).unwrap();
-    pub static ref APPLY_YIELD_COUNT: IntCounter =
-        register_int_counter!(
-            "tikv_raftstore_apply_yield_count",
-            "TODO."
-        ).unwrap();
-    pub static ref APPLY_GET_ENTRIES_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_get_entries_duration_seconds",
-            "TODO.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
-        ).unwrap();
-    pub static ref APPLY_APPEND_PROPOSAL_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_append_proposal_duration_seconds",
-            "TODO.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
-        ).unwrap(); 
-    pub static ref APPLY_POP_NORMAL_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_pop_normal_duration_seconds",
-            "TODO.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
-        ).unwrap();
-    pub static ref APPLY_DROP_ENTRY_HISTOGRAM: Histogram =
-        register_histogram!(
-            "tikv_raftstore_drop_entry_duration_seconds",
-            "TODO.",
-            exponential_buckets(0.00001, 2.0, 26).unwrap()
-        ).unwrap();
+
 
     pub static ref APPLY_WRITE_KV_DB_TIME_HISTOGRAM: Histogram =
         register_histogram!(
