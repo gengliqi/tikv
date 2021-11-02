@@ -90,17 +90,19 @@ where
     pub index: u64,
     pub term: u64,
     pub cb: Option<Callback<S>>,
+    pub req: Option<RaftCmdRequest>,
 }
 
 impl<S> PendingCmd<S>
 where
     S: Snapshot,
 {
-    fn new(index: u64, term: u64, cb: Callback<S>) -> PendingCmd<S> {
+    fn new(index: u64, term: u64, cb: Callback<S>, req: RaftCmdRequest) -> PendingCmd<S> {
         PendingCmd {
             index,
             term,
             cb: Some(cb),
+            req: Some(req),
         }
     }
 }
@@ -1057,11 +1059,17 @@ where
         let data = entry.get_data();
 
         if !data.is_empty() {
-            let now = Instant::now();
-            let cmd = util::parse_data_at(data, index, &self.tag);
-            apply_ctx
-                .decode_cmd_time
-                .observe(now.saturating_elapsed_secs());
+            let cmd_cb = self.find_pending(index, term, false);
+            let (cb, cmd) = if let Some((cb, cmd)) = cmd_cb {
+                (Some(cb), cmd)
+            } else {
+                let now = Instant::now();
+                let cmd = util::parse_data_at(data, index, &self.tag);
+                apply_ctx
+                    .decode_cmd_time
+                    .observe(now.saturating_elapsed_secs());
+                (None, cmd)
+            };
 
             if apply_ctx.yield_high_latency_operation && has_high_latency_operation(&cmd) {
                 self.priority = Priority::Low;
@@ -1087,7 +1095,12 @@ where
             }
 
             let now = Instant::now();
-            let ret = self.process_raft_cmd(apply_ctx, index, term, cmd);
+            let (resp, ret) = self.process_raft_cmd(apply_ctx, index, term, &cmd);
+
+            let cmd = Cmd::new(index, cmd, resp);
+            apply_ctx
+                .applied_batch
+                .push(cb, cmd, &self.observe_info, self.region_id());
             apply_ctx
                 .process_cmd_time
                 .observe(now.saturating_elapsed_secs());
@@ -1135,12 +1148,12 @@ where
             _ => unreachable!(),
         };
         let cmd = util::parse_data_at(conf_change.get_context(), index, &self.tag);
-        match self.process_raft_cmd(apply_ctx, index, term, cmd) {
-            ApplyResult::None => {
+        match self.process_raft_cmd(apply_ctx, index, term, &cmd) {
+            (_, ApplyResult::None) => {
                 // If failed, tell Raft that the `ConfChange` was aborted.
                 ApplyResult::Res(ExecResult::ChangePeer(Default::default()))
             }
-            ApplyResult::Res(mut res) => {
+            (_, ApplyResult::Res(mut res)) => {
                 if let ExecResult::ChangePeer(ref mut cp) = res {
                     cp.conf_change = conf_change;
                 } else {
@@ -1151,7 +1164,7 @@ where
                 }
                 ApplyResult::Res(res)
             }
-            ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => unreachable!(),
+            (_, ApplyResult::Yield) | (_, ApplyResult::WaitMergeSource(_)) => unreachable!(),
         }
     }
 
@@ -1160,12 +1173,12 @@ where
         index: u64,
         term: u64,
         is_conf_change: bool,
-    ) -> Option<Callback<EK::Snapshot>> {
+    ) -> Option<(Callback<EK::Snapshot>, RaftCmdRequest)> {
         let (region_id, peer_id) = (self.region_id(), self.id());
         if is_conf_change {
             if let Some(mut cmd) = self.pending_cmds.take_conf_change() {
                 if cmd.index == index && cmd.term == term {
-                    return Some(cmd.cb.take().unwrap());
+                    return Some((cmd.cb.take().unwrap(), cmd.req.take().unwrap()));
                 } else {
                     notify_stale_command(region_id, peer_id, self.term, cmd);
                 }
@@ -1175,7 +1188,7 @@ where
         while let Some(mut head) = self.pending_cmds.pop_normal(index, term) {
             if head.term == term {
                 if head.index == index {
-                    return Some(head.cb.take().unwrap());
+                    return Some((head.cb.take().unwrap(), head.req.take().unwrap()));
                 } else {
                     panic!(
                         "{} unexpected callback at term {}, found index {}, expected {}",
@@ -1196,8 +1209,8 @@ where
         apply_ctx: &mut ApplyContext<EK, W>,
         index: u64,
         term: u64,
-        cmd: RaftCmdRequest,
-    ) -> ApplyResult<EK::Snapshot> {
+        cmd: &RaftCmdRequest,
+    ) -> (RaftCmdResponse, ApplyResult<EK::Snapshot>) {
         if index == 0 {
             panic!(
                 "{} processing raft command needs a none zero index",
@@ -1206,16 +1219,16 @@ where
         }
 
         // Set sync log hint if the cmd requires so.
-        apply_ctx.sync_log_hint |= should_sync_log(&cmd);
+        apply_ctx.sync_log_hint |= should_sync_log(cmd);
 
-        apply_ctx.host.pre_apply(&self.region, &cmd);
+        apply_ctx.host.pre_apply(&self.region, cmd);
         let now = Instant::now();
-        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx, index, term, &cmd);
+        let (mut resp, exec_result) = self.apply_raft_cmd(apply_ctx, index, term, cmd);
         apply_ctx
             .apply_cmd_time
             .observe(now.saturating_elapsed_secs());
         if let ApplyResult::WaitMergeSource(_) = exec_result {
-            return exec_result;
+            return (resp, exec_result);
         }
 
         debug!(
@@ -1228,12 +1241,7 @@ where
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
         // store will call it after handing exec result.
         cmd_resp::bind_term(&mut resp, self.term);
-        let cmd_cb = self.find_pending(index, term, is_conf_change_cmd(&cmd));
-        let cmd = Cmd::new(index, cmd, resp);
-        apply_ctx
-            .applied_batch
-            .push(cmd_cb, cmd, &self.observe_info, self.region_id());
-        exec_result
+        (resp, exec_result)
     }
 
     /// Applies raft command.
@@ -2920,6 +2928,7 @@ where
     pub index: u64,
     pub term: u64,
     pub cb: Callback<S>,
+    pub req: RaftCmdRequest,
     /// `propose_time` is set to the last time when a peer starts to renew lease.
     pub propose_time: Option<Timespec>,
     pub must_pass_epoch_check: bool,
@@ -3271,13 +3280,13 @@ where
         let propose_num = props_drainer.len();
         if self.delegate.stopped {
             for p in props_drainer {
-                let cmd = PendingCmd::<EK::Snapshot>::new(p.index, p.term, p.cb);
+                let cmd = PendingCmd::<EK::Snapshot>::new(p.index, p.term, p.cb, p.req);
                 notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
             }
             return;
         }
         for p in props_drainer {
-            let cmd = PendingCmd::new(p.index, p.term, p.cb);
+            let cmd = PendingCmd::new(p.index, p.term, p.cb, p.req);
             if p.is_conf_change {
                 if let Some(cmd) = self.delegate.pending_cmds.take_conf_change() {
                     // if it loses leadership before conf change is replicated, there may be

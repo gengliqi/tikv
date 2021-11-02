@@ -2729,7 +2729,7 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         mut cb: Callback<EK::Snapshot>,
-        req: RaftCmdRequest,
+        mut req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
         disk_full_opt: DiskFullOpt,
     ) -> bool {
@@ -2759,7 +2759,7 @@ where
             Ok(RequestPolicy::ProposeNormal) => {
                 let mut stores = Vec::new();
                 if self.check_disk_usages_before_propose(ctx, disk_full_opt, &mut stores) {
-                    self.propose_normal(ctx, req)
+                    self.propose_normal(ctx, &mut req)
                 } else {
                     let errmsg = format!(
                         "propose failed: tikv disk full, cmd-disk_full_opt={:?}, leader-diskUsage={:?}",
@@ -2816,6 +2816,7 @@ where
                     index: idx,
                     term: self.term(),
                     cb,
+                    req,
                     propose_time: None,
                     must_pass_epoch_check: has_applied_to_current_term,
                 };
@@ -3271,13 +3272,14 @@ where
         // TimeoutNow has been sent out, so we need to propose explicitly to
         // update leader lease.
         if self.leader_lease.inspect(Some(now)) == LeaseState::Suspect {
-            let req = RaftCmdRequest::default();
-            if let Ok(Either::Left(index)) = self.propose_normal(poll_ctx, req) {
+            let mut req = RaftCmdRequest::default();
+            if let Ok(Either::Left(index)) = self.propose_normal(poll_ctx, &mut req) {
                 let p = Proposal {
                     is_conf_change: false,
                     index,
                     term: self.term(),
                     cb: Callback::None,
+                    req,
                     propose_time: Some(now),
                     must_pass_epoch_check: false,
                 };
@@ -3438,7 +3440,7 @@ where
     fn propose_normal<T>(
         &mut self,
         poll_ctx: &mut PollContext<EK, ER, T>,
-        mut req: RaftCmdRequest,
+        req: &mut RaftCmdRequest,
     ) -> Result<Either<u64, u64>> {
         if self.pending_merge_state.is_some()
             && req.get_admin_request().get_cmd_type() != AdminCmdType::RollbackMerge
@@ -3469,7 +3471,7 @@ where
         }
 
         // TODO: validate request for unexpected changes.
-        let ctx = match self.pre_propose(poll_ctx, &mut req) {
+        let ctx = match self.pre_propose(poll_ctx, req) {
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!(
