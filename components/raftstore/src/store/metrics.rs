@@ -294,8 +294,32 @@ lazy_static! {
             "tikv_raftstore_apply_write_to_db_time_duration_seconds",
             "TODO.",
             exponential_buckets(0.00001, 2.0, 26).unwrap()
-        ).unwrap(); 
- 
+        ).unwrap();
+    pub static ref APPLY_PREPARE_FOR_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_prepare_for_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_FINISH_FOR_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_finish_for_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_NOTIFY_STORE_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_notify_store_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_YIELD_COUNT: IntCounter =
+        register_int_counter!(
+            "tikv_raftstore_apply_yield_count",
+            "TODO."
+        ).unwrap();
+
+
     pub static ref APPLY_WRITE_KV_DB_TIME_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_apply_write_kv_db_time_duration_seconds",

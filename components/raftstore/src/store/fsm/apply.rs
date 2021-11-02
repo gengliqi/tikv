@@ -468,8 +468,10 @@ where
     /// `prepare_for` -> `commit` [-> `commit` ...] -> `finish_for`.
     /// After all delegates are handled, `write_to_db` method should be called.
     pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
+        let now = Instant::now();
         self.applied_batch
             .push_batch(&delegate.observe_info, delegate.region.clone());
+        APPLY_PREPARE_FOR_HISTOGRAM.observe(now.saturating_elapsed_secs());
     }
 
     /// Commits all changes have done for delegate. `persistent` indicates whether
@@ -583,6 +585,7 @@ where
         delegate: &mut ApplyDelegate<EK>,
         results: VecDeque<ExecResult<EK::Snapshot>>,
     ) {
+        let now = Instant::now();
         if !delegate.pending_remove {
             delegate.write_apply_state(self.kv_wb_mut());
         }
@@ -594,6 +597,7 @@ where
             metrics: delegate.metrics.clone(),
             applied_index_term: delegate.applied_index_term,
         });
+        APPLY_FINISH_FOR_HISTOGRAM.observe(now.saturating_elapsed_secs());
     }
 
     pub fn delta_bytes(&self) -> u64 {
@@ -633,8 +637,10 @@ where
         APPLY_WRITE_TO_DB_HISTOGRAM.observe(now.saturating_elapsed_secs());
 
         if !self.apply_res.is_empty() {
+            let now = Instant::now();
             let apply_res = mem::take(&mut self.apply_res);
             self.notifier.notify(apply_res);
+            APPLY_NOTIFY_STORE_HISTOGRAM.observe(now.saturating_elapsed_secs());
         }
 
         let elapsed = t.saturating_elapsed();
@@ -956,6 +962,7 @@ where
             return;
         }
         apply_ctx.prepare_for(self);
+
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
@@ -1004,6 +1011,7 @@ where
                         pending_msgs: Vec::default(),
                         heap_size: None,
                     });
+                    APPLY_YIELD_COUNT.inc();
                     if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
                     }
@@ -5757,7 +5765,11 @@ mod tests {
 
     #[test]
     fn test_xxxxx() {
-        println!("{} {}", std::mem::size_of::<RaftCmdResponse>(), std::mem::size_of::<protobuf::SingularPtrField<RaftResponseHeader>>());
+        println!(
+            "{} {}",
+            std::mem::size_of::<RaftCmdResponse>(),
+            std::mem::size_of::<protobuf::SingularPtrField<RaftResponseHeader>>()
+        );
         println!("{}", std::mem::size_of::<ApplyResult<KvTestSnapshot>>());
     }
 }
