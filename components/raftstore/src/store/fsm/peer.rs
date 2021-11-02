@@ -371,7 +371,6 @@ where
     }
 
     fn add(&mut self, cmd: RaftCommand<E::Snapshot>, req_size: u32) {
-        let req_num = cmd.request.get_requests().len();
         let RaftCommand {
             mut request,
             mut callback,
@@ -425,7 +424,7 @@ where
             let mut cbs = std::mem::take(&mut self.callbacks);
             let proposed_cbs: Vec<ExtCallback> = cbs
                 .iter_mut()
-                .filter_map(|mut cb| {
+                .filter_map(|cb| {
                     if let Callback::Write { proposed_cb, .. } = cb {
                         proposed_cb.take()
                     } else {
@@ -444,7 +443,7 @@ where
             };
             let committed_cbs: Vec<_> = cbs
                 .iter_mut()
-                .filter_map(|mut cb| {
+                .filter_map(|cb| {
                     if let Callback::Write { committed_cb, .. } = cb {
                         committed_cb.take()
                     } else {
@@ -464,7 +463,7 @@ where
 
             let times: SmallVec<[TiInstant; 4]> = cbs
                 .iter_mut()
-                .filter_map(|mut cb| {
+                .filter_map(|cb| {
                     if let Callback::Write { request_times, .. } = cb {
                         Some(request_times[0])
                     } else {
