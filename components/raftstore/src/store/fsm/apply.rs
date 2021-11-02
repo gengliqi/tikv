@@ -80,7 +80,7 @@ use crate::{bytes_capacity, Error, Result};
 use super::metrics::*;
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
-const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
+const APPLY_WB_SHRINK_SIZE: usize = 10 * 1024 * 1024;
 const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
 
 pub struct PendingCmd<S>
@@ -486,7 +486,9 @@ where
     fn commit_opt(&mut self, delegate: &mut ApplyDelegate<EK>, persistent: bool) {
         delegate.update_metrics(self);
         if persistent {
+            let now = Instant::now();
             self.write_to_db();
+            APPLY_WRITE_TO_DB_HISTOGRAM.observe(now.saturating_elapsed_secs());
             self.prepare_for(delegate);
             delegate.last_flush_applied_index = delegate.apply_state.get_applied_index()
         }
@@ -520,7 +522,6 @@ where
             self.kv_wb().write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("failed to write to engine: {:?}", e);
             });
-            APPLY_WRITE_KV_DB_TIME_HISTOGRAM.observe(now.saturating_elapsed_secs());
             self.perf_context.report_metrics();
             self.sync_log_hint = false;
             let data_size = self.kv_wb().data_size();
@@ -534,6 +535,7 @@ where
             }
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
+            APPLY_WRITE_KV_DB_TIME_HISTOGRAM.observe(now.saturating_elapsed_secs());
         }
         if !self.delete_ssts.is_empty() {
             let tag = self.tag.clone();
@@ -544,6 +546,7 @@ where
             }
         }
         // Take the applied commands and their callback
+        let now = Instant::now();
         let ApplyCallbackBatch {
             cmd_batch,
             batch_max_level,
@@ -552,6 +555,7 @@ where
         // Call it before invoking callback for preventing Commit is executed before Prewrite is observed.
         self.host
             .on_flush_applied_cmd_batch(batch_max_level, cmd_batch, &self.engine);
+        APPLY_ON_FLUSH_APPLIED_CMD_BATCH_HISTOGRAM.observe(now.saturating_elapsed_secs());
         // Invoke callbacks
         let now = Instant::now();
         for (cb, resp) in cb_batch.drain(..) {
@@ -563,6 +567,7 @@ where
             }
             cb.invoke_with_response(resp);
         }
+        APPLY_INVOKE_CALLBACK_HISTOGRAM.observe(now.saturating_elapsed_secs());
         self.apply_time.flush();
         self.apply_wait.flush();
         self.decode_cmd_time.flush();
@@ -623,7 +628,9 @@ where
         // take raft log gc for example, we write kv WAL first, then write raft WAL,
         // if power failure happen, raft WAL may synced to disk, but kv WAL may not.
         // so we use sync-log flag here.
+        let now = Instant::now();
         let is_synced = self.write_to_db();
+        APPLY_WRITE_TO_DB_HISTOGRAM.observe(now.saturating_elapsed_secs());
 
         if !self.apply_res.is_empty() {
             let apply_res = mem::take(&mut self.apply_res);
@@ -5746,5 +5753,11 @@ mod tests {
             // It would abort and fail if there was a double-panic in PendingCmd dtor.
         });
         res.unwrap_err();
+    }
+
+    #[test]
+    fn test_xxxxx() {
+        println!("{} {}", std::mem::size_of::<RaftCmdResponse>(), std::mem::size_of::<protobuf::SingularPtrField<RaftResponseHeader>>());
+        println!("{}", std::mem::size_of::<ApplyResult<KvTestSnapshot>>());
     }
 }

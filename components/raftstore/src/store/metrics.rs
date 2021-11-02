@@ -276,6 +276,26 @@ lazy_static! {
             "Bucketed histogram of write msg block wait duration.",
             exponential_buckets(0.00001, 2.0, 26).unwrap()
         ).unwrap();
+
+    pub static ref APPLY_ON_FLUSH_APPLIED_CMD_BATCH_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_on_flush_applied_cmd_batch_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_INVOKE_CALLBACK_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_invoke_callback_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap();
+    pub static ref APPLY_WRITE_TO_DB_HISTOGRAM: Histogram =
+        register_histogram!(
+            "tikv_raftstore_apply_write_to_db_time_duration_seconds",
+            "TODO.",
+            exponential_buckets(0.00001, 2.0, 26).unwrap()
+        ).unwrap(); 
+ 
     pub static ref APPLY_WRITE_KV_DB_TIME_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_apply_write_kv_db_time_duration_seconds",
