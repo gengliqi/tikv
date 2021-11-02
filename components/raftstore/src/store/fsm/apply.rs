@@ -957,10 +957,11 @@ where
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
         mut committed_entries_drainer: Drain<Entry>,
-    ) {
+    ) -> f64 {
         if committed_entries_drainer.len() == 0 {
-            return;
+            return 0.0;
         }
+        let now = Instant::now(); 
         apply_ctx.prepare_for(self);
 
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
@@ -1015,7 +1016,7 @@ where
                     if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
                         self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
                     }
-                    return;
+                    return now.saturating_elapsed_secs();
                 }
             }
         }
@@ -1024,6 +1025,8 @@ where
         if self.pending_remove {
             self.destroy(apply_ctx);
         }
+
+        now.saturating_elapsed_secs()
     }
 
     fn update_metrics<W: WriteBatch<EK>>(&mut self, apply_ctx: &ApplyContext<EK, W>) {
@@ -1105,6 +1108,7 @@ where
         // 2. When a leader tries to read index during transferring leader,
         //    it will also propose an empty entry. But that entry will not contain
         //    any associated callback. So no need to clear callback.
+        let now = Instant::now();
         while let Some(mut cmd) = self.pending_cmds.pop_normal(std::u64::MAX, term - 1) {
             if let Some(cb) = cmd.cb.take() {
                 apply_ctx
@@ -1112,6 +1116,7 @@ where
                     .push_cb(cb, cmd_resp::err_resp(Error::StaleCommand, term));
             }
         }
+
         ApplyResult::None
     }
 
@@ -3219,10 +3224,12 @@ where
         if self.delegate.pending_remove || self.delegate.stopped {
             return;
         }
+        let now = Instant::now();
         let (mut entries, mut cbs) = {
             let mut e = apply.entries_and_cbs.lock().unwrap();
             (mem::take(&mut e.entries), mem::take(&mut e.cbs))
         };
+        APPLY_GET_ENTRIES_HISTOGRAM.observe(now.saturating_elapsed_secs());
 
         /*let (mut entries, dangle_size) = apply.entries.take_entries();
         if dangle_size > 0 {
@@ -3256,10 +3263,13 @@ where
             self.delegate.apply_state.set_commit_index(cur_state.0);
             self.delegate.apply_state.set_commit_term(cur_state.1);
         }
-
+        let now = Instant::now();
         self.append_proposal(cbs.drain(..));
-        self.delegate
+        APPLY_APPEND_PROPOSAL_HISTOGRAM.observe(now.saturating_elapsed_secs());
+        let now = Instant::now();
+        let x = self.delegate
             .handle_raft_committed_entries(apply_ctx, entries.drain(..));
+        APPLY_DROP_ENTRY_HISTOGRAM.observe(now.saturating_elapsed_secs() - x);
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
     }
 
