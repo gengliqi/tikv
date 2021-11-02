@@ -133,7 +133,7 @@ where
     has_proposed_cb: bool,
     header_checked: Option<bool>,
     request: Option<RaftCmdRequest>,
-    callbacks: Vec<(Callback<E::Snapshot>, usize)>,
+    callbacks: Vec<Callback<E::Snapshot>>,
 }
 
 impl<EK, ER> Drop for PeerFsm<EK, ER>
@@ -391,7 +391,7 @@ where
                 callback.invoke_proposed();
             }
         }
-        self.callbacks.push((callback, req_num));
+        self.callbacks.push(callback);
         self.batch_req_size += req_size as u64;
     }
 
@@ -418,15 +418,15 @@ where
             self.has_proposed_cb = false;
             self.header_checked = None;
             if self.callbacks.len() == 1 {
-                let (cb, _) = self.callbacks.pop().unwrap();
+                let cb = self.callbacks.pop().unwrap();
                 return Some((req, cb));
             }
             metric.propose.batch += self.callbacks.len() - 1;
             let mut cbs = std::mem::take(&mut self.callbacks);
             let proposed_cbs: Vec<ExtCallback> = cbs
                 .iter_mut()
-                .filter_map(|cb| {
-                    if let Callback::Write { proposed_cb, .. } = &mut cb.0 {
+                .filter_map(|mut cb| {
+                    if let Callback::Write { proposed_cb, .. } = cb {
                         proposed_cb.take()
                     } else {
                         None
@@ -444,8 +444,8 @@ where
             };
             let committed_cbs: Vec<_> = cbs
                 .iter_mut()
-                .filter_map(|cb| {
-                    if let Callback::Write { committed_cb, .. } = &mut cb.0 {
+                .filter_map(|mut cb| {
+                    if let Callback::Write { committed_cb, .. } = cb {
                         committed_cb.take()
                     } else {
                         None
@@ -464,8 +464,8 @@ where
 
             let times: SmallVec<[TiInstant; 4]> = cbs
                 .iter_mut()
-                .filter_map(|cb| {
-                    if let Callback::Write { request_times, .. } = &mut cb.0 {
+                .filter_map(|mut cb| {
+                    if let Callback::Write { request_times, .. } = cb {
                         Some(request_times[0])
                     } else {
                         None
@@ -475,19 +475,10 @@ where
 
             let mut cb = Callback::write_ext(
                 Box::new(move |resp| {
-                    let mut last_index = 0;
-                    let has_error = resp.response.get_header().has_error();
-                    for (cb, req_num) in cbs {
-                        let next_index = last_index + req_num;
+                    for cb in cbs {
                         let mut cmd_resp = RaftCmdResponse::default();
                         cmd_resp.set_header(resp.response.get_header().clone());
-                        if !has_error {
-                            cmd_resp.set_responses(
-                                resp.response.get_responses()[last_index..next_index].into(),
-                            );
-                        }
                         cb.invoke_with_response(cmd_resp);
-                        last_index = next_index;
                     }
                 }),
                 proposed_cb,
@@ -685,7 +676,7 @@ where
                     .is_none()
             {
                 self.fsm.batch_req_builder.header_checked = Some(true);
-                for (cb, _) in &mut self.fsm.batch_req_builder.callbacks {
+                for cb in &mut self.fsm.batch_req_builder.callbacks {
                     cb.invoke_proposed();
                 }
             }
@@ -1440,7 +1431,6 @@ where
                 if self.fsm.peer.is_leader() {
                     self.register_pd_heartbeat_tick();
                     self.register_split_region_check_tick();
-                    self.propose_batch_raft_command(false);
                 }
             }
             ApplyTaskRes::Destroy {
