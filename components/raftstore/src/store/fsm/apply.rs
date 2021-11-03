@@ -972,7 +972,140 @@ where
         // commands again.
         apply_ctx.committed_count += committed_entries_drainer.len();
         let mut results = VecDeque::new();
+        let mut cmds = Vec::with_capacity(committed_entries_drainer.len());
         while let Some(entry) = committed_entries_drainer.next() {
+            // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by `unimplemented!()`,
+            // which can break compatibility (i.e. old version tikv running on data written by new version tikv),
+            // but PD will reject old version tikv join the cluster, so this should not happen.
+            match entry.get_entry_type() {
+                EntryType::EntryNormal => {
+                    let cmd_cb = self.find_pending(entry.get_index(), entry.get_term(), false);
+                    if let Some((cb, cmd)) = cmd_cb {
+                        cmds.push((entry.get_index(), entry.get_term(), Some(cmd), Some(cb)));
+                    } else if !entry.get_data().is_empty() {
+                        let now = Instant::now();
+                        let cmd =
+                            util::parse_data_at(entry.get_data(), entry.get_index(), &self.tag);
+                        apply_ctx
+                            .decode_cmd_time
+                            .observe(now.saturating_elapsed_secs());
+                        cmds.push((entry.get_index(), entry.get_term(), Some(cmd), None));
+                    } else {
+                        cmds.push((entry.get_index(), entry.get_term(), None, None));
+                    };
+                }
+                EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                    panic!("unimplemented");
+                    //self.handle_raft_entry_conf_change(apply_ctx, &entry)
+                }
+            };
+        }
+
+        let mut index = 0;
+        while index < cmds.len() && !self.pending_remove {
+            let origin_index = index;
+            let mut count = apply_ctx.kv_wb().count();
+            while index < cmds.len() {
+                if cmds[index].2.is_none() {
+                    if index == origin_index {
+                        index += 1;
+                    }
+                    break;
+                }
+                let cmd = cmds[index].2.as_ref().unwrap();
+                if should_write_to_engine(&cmd) || count >= 256 {
+                    if index != origin_index {
+                        break;
+                    } else {
+                        apply_ctx.commit(self);
+                    }
+                }
+                if cmd.has_admin_request() {
+                    if index == origin_index {
+                        index += 1;
+                    }
+                    break;
+                }
+                if index != origin_index {
+                    // guess no ingest sst and delete range request.
+                    if cmds[origin_index].2.as_ref().unwrap().get_header() != cmd.get_header() {
+                        break;
+                    }
+                }
+                count += cmd.get_requests().len();
+                index += 1;
+            }
+            // apply [index, batch_end)
+            let now = Instant::now();
+            if index == origin_index + 1 {
+                if cmds[origin_index].2.is_none() {
+                    self.apply_state.set_applied_index(cmds[origin_index].0);
+                    self.applied_index_term = cmds[origin_index].1;
+                    assert!(cmds[origin_index].1 > 0);
+
+                    // 1. When a peer become leader, it will send an empty entry.
+                    // 2. When a leader tries to read index during transferring leader,
+                    //    it will also propose an empty entry. But that entry will not contain
+                    //    any associated callback. So no need to clear callback.
+                    while let Some(mut cmd) = self
+                        .pending_cmds
+                        .pop_normal(std::u64::MAX, cmds[origin_index].1 - 1)
+                    {
+                        if let Some(cb) = cmd.cb.take() {
+                            apply_ctx.applied_batch.push_cb(
+                                cb,
+                                cmd_resp::err_resp(Error::StaleCommand, cmds[origin_index].1),
+                            );
+                        }
+                    }
+                } else {
+                    let cmd = cmds[origin_index].2.as_ref().unwrap();
+                    let (resp, ret) = self.process_raft_cmd(
+                        apply_ctx,
+                        cmds[origin_index].0,
+                        cmds[origin_index].1,
+                        &cmd,
+                    );
+
+                    let cmd = Cmd::new(
+                        cmds[origin_index].0,
+                        cmds[origin_index].2.take().unwrap(),
+                        resp,
+                    );
+                    apply_ctx.applied_batch.push(
+                        cmds[origin_index].3.take(),
+                        cmd,
+                        &self.observe_info,
+                        self.region_id(),
+                    );
+
+                    match ret {
+                        ApplyResult::None => {}
+                        ApplyResult::Res(res) => results.push_back(res),
+                        e @ _ => {
+                            panic!("return apply result");
+                        }
+                    }
+                }
+            } else {
+                let resp =
+                    self.apply_normal_raft_cmd(apply_ctx, &cmds.as_slice()[origin_index..index]);
+                for i in origin_index..index {
+                    let cmd = Cmd::new(cmds[i].0, cmds[i].2.take().unwrap(), resp.clone());
+                    apply_ctx.applied_batch.push(
+                        cmds[i].3.take(),
+                        cmd,
+                        &self.observe_info,
+                        self.region_id(),
+                    );
+                }
+            }
+            apply_ctx
+                .process_cmd_time
+                .observe(now.saturating_elapsed_secs());
+        }
+
+        /*while let Some(entry) = committed_entries_drainer.next() {
             if self.pending_remove {
                 // This peer is about to be destroyed, skip everything.
                 break;
@@ -1021,7 +1154,7 @@ where
                     return;
                 }
             }
-        }
+        }*/
         apply_ctx.finish_for(self, results);
 
         if self.pending_remove {
@@ -1357,6 +1490,47 @@ where
         (resp, exec_result)
     }
 
+    fn apply_normal_raft_cmd<W: WriteBatch<EK>>(
+        &mut self,
+        ctx: &mut ApplyContext<EK, W>,
+        reqs: &[(
+            u64,
+            u64,
+            Option<RaftCmdRequest>,
+            Option<Callback<EK::Snapshot>>,
+        )],
+    ) -> RaftCmdResponse {
+        // if pending remove, apply should be aborted already.
+        assert!(!self.pending_remove);
+
+        let now = Instant::now();
+        let resp = match self.exec_normal_write_cmd(ctx, reqs) {
+            Ok(a) => RaftCmdResponse::default(),
+            Err(e) => {
+                match e {
+                    Error::EpochNotMatch(..) => debug!(
+                        "epoch not match";
+                        "region_id" => self.region_id(),
+                        "peer_id" => self.id(),
+                        "err" => ?e
+                    ),
+                    _ => error!(?e;
+                        "execute raft command";
+                        "region_id" => self.region_id(),
+                        "peer_id" => self.id(),
+                    ),
+                }
+                cmd_resp::new_error(e)
+            }
+        };
+        ctx.exec_cmd_time.observe(now.saturating_elapsed_secs());
+
+        self.apply_state.set_applied_index(reqs.last().unwrap().0);
+        self.applied_index_term = reqs.last().unwrap().1;
+
+        resp
+    }
+
     fn destroy<W: WriteBatch<EK>>(&mut self, apply_ctx: &mut ApplyContext<EK, W>) {
         self.stopped = true;
         apply_ctx.router.close(self.region_id());
@@ -1531,6 +1705,49 @@ where
         };
 
         Ok((resp, exec_res))
+    }
+
+    fn exec_normal_write_cmd<W: WriteBatch<EK>>(
+        &mut self,
+        ctx: &mut ApplyContext<EK, W>,
+        reqs: &[(
+            u64,
+            u64,
+            Option<RaftCmdRequest>,
+            Option<Callback<EK::Snapshot>>,
+        )],
+    ) -> Result<()> {
+        fail_point!(
+            "on_apply_write_cmd",
+            cfg!(release) || self.id() == 3,
+            |_| {
+                unimplemented!();
+            }
+        );
+
+        let include_region = reqs[0]
+            .2
+            .as_ref()
+            .unwrap()
+            .get_header()
+            .get_region_epoch()
+            .get_version()
+            >= self.last_merge_version;
+        check_region_epoch(reqs[0].2.as_ref().unwrap(), &self.region, include_region)?;
+
+        for cmd in reqs {
+            let cmd = cmd.2.as_ref().unwrap();
+            for req in cmd.get_requests() {
+                let cmd_type = req.get_cmd_type();
+                match cmd_type {
+                    CmdType::Put => self.handle_put(ctx.kv_wb_mut(), req),
+                    CmdType::Delete => self.handle_delete(ctx.kv_wb_mut(), req),
+                    e @ _ => Err(box_err!("not implemented type {:?}", e)),
+                }?;
+            }
+        }
+
+        Ok(())
     }
 }
 
