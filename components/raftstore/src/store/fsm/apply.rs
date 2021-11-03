@@ -911,6 +911,8 @@ where
     raft_engine: Box<dyn RaftEngineReadOnly>,
 
     trace: ApplyMemoryTrace,
+
+    key_buffer: Vec<u8>,
 }
 
 impl<EK> ApplyDelegate<EK>
@@ -942,6 +944,7 @@ where
             priority: Priority::Normal,
             raft_engine: reg.raft_engine,
             trace: ApplyMemoryTrace::default(),
+            key_buffer: Vec::with_capacity(256),
         }
     }
 
@@ -1541,7 +1544,9 @@ where
         // region key range has no data prefix, so we must use origin key to check.
         util::check_key_in_region(key, &self.region)?;
 
-        let key = keys::data_key(key);
+        keys::data_key_with_buffer(key, &mut self.key_buffer);
+        let key = self.key_buffer.as_slice();
+
         self.metrics.size_diff_hint += key.len() as i64;
         self.metrics.size_diff_hint += value.len() as i64;
         if !req.get_put().get_cf().is_empty() {
@@ -1581,7 +1586,9 @@ where
         // region key range has no data prefix, so we must use origin key to check.
         util::check_key_in_region(key, &self.region)?;
 
-        let key = keys::data_key(key);
+        keys::data_key_with_buffer(key, &mut self.key_buffer);
+        let key = self.key_buffer.as_slice();
+
         // since size_diff_hint is not accurate, so we just skip calculate the value size.
         self.metrics.size_diff_hint -= key.len() as i64;
         if !req.get_delete().get_cf().is_empty() {
