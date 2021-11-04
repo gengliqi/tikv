@@ -59,6 +59,7 @@ pub struct Config {
     pub raft_max_inflight_msgs: usize,
     // When the entry exceed the max size, reject to propose it.
     pub raft_entry_max_size: ReadableSize,
+    pub raft_entry_max_key_num: usize,
 
     // Interval to gc unnecessary raft log (ms).
     pub raft_log_gc_tick_interval: ReadableDuration,
@@ -203,7 +204,7 @@ pub struct Config {
     /// If it is 0, it means no limit.
     pub cmd_batch_concurrent_ready_max_count: usize,
 
-    pub concurrent_unapplied_entries_count: u64,
+    pub concurrent_unapplied_ready_count: usize,
 
     /// When the size of raft db writebatch exceeds this value, write will be triggered.
     pub raft_write_size_limit: ReadableSize,
@@ -250,6 +251,7 @@ impl Default for Config {
             raft_max_size_per_msg: ReadableSize::mb(1),
             raft_max_inflight_msgs: 256,
             raft_entry_max_size: ReadableSize::mb(8),
+            raft_entry_max_key_num: 256,
             raft_log_gc_tick_interval: ReadableDuration::secs(10),
             raft_log_gc_threshold: 50,
             // Assume the average size of entries is 1k.
@@ -303,7 +305,7 @@ impl Default for Config {
             evict_cache_on_memory_ratio: 0.2,
             cmd_batch: true,
             cmd_batch_concurrent_ready_max_count: 1,
-            concurrent_unapplied_entries_count: 16,
+            concurrent_unapplied_ready_count: 3,
             raft_write_size_limit: ReadableSize::mb(1),
             waterfall_metrics: false,
             io_reschedule_concurrent_max_count: 4,

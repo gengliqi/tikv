@@ -582,6 +582,7 @@ where
     apply_snap_ctx: Option<ApplySnapshotContext>,
 
     last_apply: Option<Apply<EK::Snapshot>>,
+    pub leader_pending_apply: VecDeque<u64>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -688,6 +689,7 @@ where
             persisted_number: 0,
             apply_snap_ctx: None,
             last_apply: None,
+            leader_pending_apply: VecDeque::default(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -2207,6 +2209,9 @@ where
         }
         if let Some(last_entry) = committed_entries.last() {
             self.last_applying_idx = last_entry.get_index();
+            if self.is_leader() {
+                self.leader_pending_apply.push_back(last_entry.get_index());
+            }
             if self.last_applying_idx >= self.last_urgent_proposal_idx {
                 // Urgent requests are flushed, make it lazy again.
                 self.raft_group.skip_bcast_commit(true);
@@ -2258,9 +2263,9 @@ where
                         append_to_last = true;
                         entries_and_cbs
                             .entries
-                            .append(&mut mem::take(&mut committed_entries));
+                            .push(mem::take(&mut committed_entries));
                         if !cbs.is_empty() {
-                            entries_and_cbs.cbs.append(&mut cbs);
+                            entries_and_cbs.cbs.push(mem::take(&mut cbs));
                         }
                     }
                 }
@@ -2270,9 +2275,9 @@ where
                 let apply = Apply::new(self.peer_id(), self.region_id, self.term());
 
                 let mut entries_and_cbs = apply.entries_and_cbs.lock().unwrap();
-                entries_and_cbs.entries.append(&mut committed_entries);
+                entries_and_cbs.entries.push(committed_entries);
                 if !cbs.is_empty() {
-                    entries_and_cbs.cbs.append(&mut cbs);
+                    entries_and_cbs.cbs.push(cbs);
                 }
                 drop(entries_and_cbs);
 
@@ -2598,6 +2603,13 @@ where
         if !self.is_leader() {
             self.mut_store()
                 .compact_cache_to(apply_state.applied_index + 1);
+        }
+
+        while let Some(index) = self.leader_pending_apply.front() {
+            if applied_index < *index {
+                break;
+            }
+            self.leader_pending_apply.pop_front();
         }
 
         let progress_to_be_updated = self.mut_store().applied_index_term() != applied_index_term;

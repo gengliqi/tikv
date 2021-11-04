@@ -45,6 +45,7 @@ use raft::eraftpb::{
     ConfChange, ConfChangeType, ConfChangeV2, Entry, EntryType, Snapshot as RaftSnapshot,
 };
 use raft_proto::ConfChangeI;
+use smallvec::SmallVec;
 use sst_importer::SSTImporter;
 use tikv_alloc::trace::TraceEvent;
 use tikv_util::config::{Tracker, VersionTrack};
@@ -588,16 +589,21 @@ where
     }
 
     /// Finishes `Apply`s for the delegate.
-    pub fn finish_for(
-        &mut self,
-        delegate: &mut ApplyDelegate<EK>,
-        results: VecDeque<ExecResult<EK::Snapshot>>,
-    ) {
+    pub fn finish_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
         let now = Instant::now();
         if !delegate.pending_remove {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         self.commit_opt(delegate, false);
+
+        APPLY_FINISH_FOR_HISTOGRAM.observe(now.saturating_elapsed_secs());
+    }
+
+    pub fn finish_one_step(
+        &mut self,
+        delegate: &mut ApplyDelegate<EK>,
+        results: VecDeque<ExecResult<EK::Snapshot>>,
+    ) {
         self.apply_res.push(ApplyRes {
             region_id: delegate.region_id(),
             apply_state: delegate.apply_state.clone(),
@@ -605,7 +611,6 @@ where
             metrics: delegate.metrics.clone(),
             applied_index_term: delegate.applied_index_term,
         });
-        APPLY_FINISH_FOR_HISTOGRAM.observe(now.saturating_elapsed_secs());
     }
 
     pub fn delta_bytes(&self) -> u64 {
@@ -960,9 +965,9 @@ where
     fn handle_raft_committed_entries<W: WriteBatch<EK>>(
         &mut self,
         apply_ctx: &mut ApplyContext<EK, W>,
-        mut committed_entries_drainer: Drain<Entry>,
+        mut committed_entries: SmallVec<[Vec<Entry>; 1]>,
     ) {
-        if committed_entries_drainer.len() == 0 {
+        if committed_entries.len() == 0 {
             return;
         }
         apply_ctx.prepare_for(self);
@@ -970,59 +975,62 @@ where
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
-        apply_ctx.committed_count += committed_entries_drainer.len();
-        let mut results = VecDeque::new();
-        while let Some(entry) = committed_entries_drainer.next() {
-            if self.pending_remove {
-                // This peer is about to be destroyed, skip everything.
-                break;
-            }
-
-            let expect_index = self.apply_state.get_applied_index() + 1;
-            if expect_index != entry.get_index() {
-                panic!(
-                    "{} expect index {}, but got {}",
-                    self.tag,
-                    expect_index,
-                    entry.get_index()
-                );
-            }
-
-            // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by `unimplemented!()`,
-            // which can break compatibility (i.e. old version tikv running on data written by new version tikv),
-            // but PD will reject old version tikv join the cluster, so this should not happen.
-            let res = match entry.get_entry_type() {
-                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
-                EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                    self.handle_raft_entry_conf_change(apply_ctx, &entry)
+        //apply_ctx.committed_count += committed_entries_drainer.len();
+        for entries_vec in committed_entries {
+            let mut results = VecDeque::new();
+            for entry in entries_vec {
+                if self.pending_remove {
+                    // This peer is about to be destroyed, skip everything.
+                    break;
                 }
-            };
 
-            match res {
-                ApplyResult::None => {}
-                ApplyResult::Res(res) => results.push_back(res),
-                ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => {
-                    // Both cancel and merge will yield current processing.
-                    apply_ctx.committed_count -= committed_entries_drainer.len() + 1;
-                    let mut pending_entries =
-                        Vec::with_capacity(committed_entries_drainer.len() + 1);
-                    // Note that current entry is skipped when yield.
-                    pending_entries.push(entry);
-                    pending_entries.extend(committed_entries_drainer);
-                    apply_ctx.finish_for(self, results);
-                    self.yield_state = Some(YieldState {
-                        pending_entries,
-                        pending_msgs: Vec::default(),
-                        heap_size: None,
-                    });
-                    if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
-                        self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
+                let expect_index = self.apply_state.get_applied_index() + 1;
+                if expect_index != entry.get_index() {
+                    panic!(
+                        "{} expect index {}, but got {}",
+                        self.tag,
+                        expect_index,
+                        entry.get_index()
+                    );
+                }
+
+                // NOTE: before v5.0, `EntryType::EntryConfChangeV2` entry is handled by `unimplemented!()`,
+                // which can break compatibility (i.e. old version tikv running on data written by new version tikv),
+                // but PD will reject old version tikv join the cluster, so this should not happen.
+                let res = match entry.get_entry_type() {
+                    EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
+                    EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
+                        self.handle_raft_entry_conf_change(apply_ctx, &entry)
                     }
-                    return;
+                };
+
+                match res {
+                    ApplyResult::None => {}
+                    ApplyResult::Res(res) => results.push_back(res),
+                    ApplyResult::Yield | ApplyResult::WaitMergeSource(_) => {
+                        // Both cancel and merge will yield current processing.
+                        /*apply_ctx.committed_count -= committed_entries_drainer.len() + 1;
+                        let mut pending_entries =
+                            Vec::with_capacity(committed_entries_drainer.len() + 1);
+                        // Note that current entry is skipped when yield.
+                        pending_entries.push(entry);
+                        pending_entries.extend(committed_entries_drainer);
+                        apply_ctx.finish_for(self, results);
+                        self.yield_state = Some(YieldState {
+                            pending_entries,
+                            pending_msgs: Vec::default(),
+                            heap_size: None,
+                        });
+                        if let ApplyResult::WaitMergeSource(logs_up_to_date) = res {
+                            self.wait_merge_state = Some(WaitSourceMergeState { logs_up_to_date });
+                        }*/
+                        return;
+                    }
                 }
             }
+            apply_ctx.finish_one_step(self, results);
         }
-        apply_ctx.finish_for(self, results);
+        apply_ctx.finish_for(self);
 
         if self.pending_remove {
             self.destroy(apply_ctx);
@@ -2863,8 +2871,8 @@ pub struct ApplyEntries<S>
 where
     S: Snapshot,
 {
-    pub entries: Vec<Entry>,
-    pub cbs: Vec<Proposal<S>>,
+    pub entries: SmallVec<[Vec<Entry>; 1]>,
+    pub cbs: SmallVec<[Vec<Proposal<S>>; 1]>,
 }
 
 pub struct Apply<S>
@@ -2884,8 +2892,8 @@ impl<S: Snapshot> Apply<S> {
             region_id,
             term,
             entries_and_cbs: Arc::new(Mutex::new(ApplyEntries {
-                entries: vec![],
-                cbs: vec![],
+                entries: SmallVec::new(),
+                cbs: SmallVec::new(),
             })),
         }
     }
@@ -3257,7 +3265,7 @@ where
 
         self.delegate.metrics = ApplyMetrics::default();
         self.delegate.term = apply.term;
-        if let Some(entry) = entries.last() {
+        if let Some(entry) = entries.last().unwrap().last() {
             let prev_state = (
                 self.delegate.apply_state.get_commit_index(),
                 self.delegate.apply_state.get_commit_term(),
@@ -3273,38 +3281,43 @@ where
             self.delegate.apply_state.set_commit_term(cur_state.1);
         }
 
-        self.append_proposal(cbs.drain(..));
+        self.append_proposal(cbs);
 
         self.delegate
-            .handle_raft_committed_entries(apply_ctx, entries.drain(..));
+            .handle_raft_committed_entries(apply_ctx, entries);
 
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
     }
 
     /// Handles proposals, and appends the commands to the apply delegate.
-    fn append_proposal(&mut self, props_drainer: Drain<Proposal<EK::Snapshot>>) {
+    fn append_proposal(&mut self, props: SmallVec<[Vec<Proposal<EK::Snapshot>>; 1]>) {
         let (region_id, peer_id) = (self.delegate.region_id(), self.delegate.id());
-        let propose_num = props_drainer.len();
         if self.delegate.stopped {
-            for p in props_drainer {
-                let cmd = PendingCmd::<EK::Snapshot>::new(p.index, p.term, p.cb, p.req);
-                notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
+            for prop_vec in props {
+                for p in prop_vec {
+                    let cmd = PendingCmd::<EK::Snapshot>::new(p.index, p.term, p.cb, p.req);
+                    notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
+                }
             }
             return;
         }
-        for p in props_drainer {
-            let cmd = PendingCmd::new(p.index, p.term, p.cb, p.req);
-            if p.is_conf_change {
-                if let Some(cmd) = self.delegate.pending_cmds.take_conf_change() {
-                    // if it loses leadership before conf change is replicated, there may be
-                    // a stale pending conf change before next conf change is applied. If it
-                    // becomes leader again with the stale pending conf change, will enter
-                    // this block, so we notify leadership may have been changed.
-                    notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
+        let mut propose_num = 0;
+        for prop_vec in props {
+            propose_num += prop_vec.len();
+            for p in prop_vec {
+                let cmd = PendingCmd::new(p.index, p.term, p.cb, p.req);
+                if p.is_conf_change {
+                    if let Some(cmd) = self.delegate.pending_cmds.take_conf_change() {
+                        // if it loses leadership before conf change is replicated, there may be
+                        // a stale pending conf change before next conf change is applied. If it
+                        // becomes leader again with the stale pending conf change, will enter
+                        // this block, so we notify leadership may have been changed.
+                        notify_stale_command(region_id, peer_id, self.delegate.term, cmd);
+                    }
+                    self.delegate.pending_cmds.set_conf_change(cmd);
+                } else {
+                    self.delegate.pending_cmds.append_normal(cmd);
                 }
-                self.delegate.pending_cmds.set_conf_change(cmd);
-            } else {
-                self.delegate.pending_cmds.append_normal(cmd);
             }
         }
         // TODO: observe it in batch.
@@ -3367,8 +3380,8 @@ where
             ctx.timer = Some(Instant::now_coarse());
         }
         if !state.pending_entries.is_empty() {
-            self.delegate
-                .handle_raft_committed_entries(ctx, state.pending_entries.drain(..));
+            //self.delegate
+            //    .handle_raft_committed_entries(ctx, state.pending_entries.drain(..));
             if let Some(ref mut s) = self.delegate.yield_state {
                 // So the delegate is expected to yield the CPU.
                 // It can either be executing another `CommitMerge` in pending_msgs

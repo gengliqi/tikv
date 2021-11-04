@@ -129,6 +129,7 @@ where
 {
     can_batch_limit: u64,
     should_propose_size: u64,
+    should_propose_key_num: usize,
     batch_req_size: u64,
     has_proposed_cb: bool,
     header_checked: Option<bool>,
@@ -338,6 +339,7 @@ where
         BatchRaftCmdRequestBuilder {
             can_batch_limit: (cfg.raft_entry_max_size.0 as f64 * 0.2) as u64,
             should_propose_size: (cfg.raft_entry_max_size.0 as f64 * 0.4) as u64,
+            should_propose_key_num: cfg.raft_entry_max_key_num,
             batch_req_size: 0,
             has_proposed_cb: false,
             header_checked: None,
@@ -401,7 +403,7 @@ where
             if self.batch_req_size > self.should_propose_size {
                 return true;
             }
-            if batch_req.get_requests().len() > <E as WriteBatchExt>::WRITE_BATCH_MAX_KEYS {
+            if batch_req.get_requests().len() > self.should_propose_key_num {
                 return true;
             }
         }
@@ -637,10 +639,9 @@ where
             if (self.ctx.cfg.cmd_batch_concurrent_ready_max_count != 0
                 && self.fsm.peer.unpersisted_ready_len()
                     >= self.ctx.cfg.cmd_batch_concurrent_ready_max_count)
-                || (self.ctx.cfg.concurrent_unapplied_entries_count != 0
-                    && self.fsm.peer.get_store().commit_index()
-                        - self.fsm.peer.get_store().applied_index()
-                        >= self.ctx.cfg.concurrent_unapplied_entries_count)
+                || (self.ctx.cfg.concurrent_unapplied_ready_count != 0
+                    && self.fsm.peer.leader_pending_apply.len()
+                        >= self.ctx.cfg.concurrent_unapplied_ready_count)
             {
                 return;
             }
