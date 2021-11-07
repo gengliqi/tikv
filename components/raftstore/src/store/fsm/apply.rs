@@ -1043,7 +1043,7 @@ where
     }
 
     fn write_apply_state<W: WriteBatch<EK>>(&self, wb: &mut W) {
-        wb.put_msg_cf(
+        /*wb.put_msg_cf(
             CF_RAFT,
             &keys::apply_state_key(self.region.get_id()),
             &self.apply_state,
@@ -1053,7 +1053,7 @@ where
                 "{} failed to save apply state to write batch, error: {:?}",
                 self.tag, e
             );
-        });
+        });*/
     }
 
     fn handle_raft_entry_normal<W: WriteBatch<EK>>(
