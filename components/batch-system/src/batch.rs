@@ -274,25 +274,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         if batch.is_empty() {
-            if let Some(d) = self.before_pause_wait_us {
-                channel::select! {
-                    recv(self.fsm_receiver) -> msg => {
-                        if let Ok(fsm) = msg {
-                            return batch.push(fsm);
-                        }
-                    }
-                    recv(after(Duration::from_micros(d))) -> _ => {
-                        self.handler.pause();
-                        if let Ok(fsm) = self.fsm_receiver.recv() {
-                            return batch.push(fsm);
-                        }
-                    }
-                }
-            } else {
-                self.handler.pause();
-                if let Ok(fsm) = self.fsm_receiver.recv() {
-                    return batch.push(fsm);
-                }
+            self.handler.pause();
+            if let Ok(fsm) = self.fsm_receiver.recv() {
+                return batch.push(fsm);
             }
         }
         !batch.is_empty()
