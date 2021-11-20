@@ -77,7 +77,6 @@ pub trait AdminObserver: Coprocessor {
     fn pre_apply_admin(&self, _: &mut ObserverContext<'_>, _: &AdminRequest) {}
 
     /// Hook to call after applying admin request.
-    /// For now, the `region` in `ObserverContext` is an empty region.
     fn post_apply_admin(&self, _: &mut ObserverContext<'_>, _: &AdminResponse) {}
 }
 
@@ -93,7 +92,6 @@ pub trait QueryObserver: Coprocessor {
     fn pre_apply_query(&self, _: &mut ObserverContext<'_>, _: &[Request]) {}
 
     /// Hook to call after applying write request.
-    /// For now, the `region` in `ObserverContext` is an empty region.
     fn post_apply_query(&self, _: &mut ObserverContext<'_>, _: &Cmd) {}
 }
 
@@ -276,30 +274,30 @@ pub struct CmdBatch {
     pub level: ObserveLevel,
     pub cdc_id: ObserveID,
     pub rts_id: ObserveID,
-    pub region_id: u64,
+    pub region: Region,
     pub cmds: Vec<Cmd>,
 }
 
 impl CmdBatch {
-    pub fn new(observe_info: &CmdObserveInfo, region_id: u64) -> CmdBatch {
+    pub fn new(observe_info: &CmdObserveInfo, region: Region) -> CmdBatch {
         CmdBatch {
             level: observe_info.observe_level(),
             cdc_id: observe_info.cdc_id.id,
             rts_id: observe_info.rts_id.id,
-            region_id,
+            region,
             cmds: Vec::new(),
         }
     }
 
     pub fn push(&mut self, observe_info: &CmdObserveInfo, region_id: u64, cmd: Cmd) {
-        assert_eq!(region_id, self.region_id);
+        assert_eq!(region_id, self.region.get_id());
         assert_eq!(observe_info.cdc_id.id, self.cdc_id);
         assert_eq!(observe_info.rts_id.id, self.rts_id);
         self.cmds.push(cmd)
     }
 
     pub fn into_iter(self, region_id: u64) -> IntoIter<Cmd> {
-        assert_eq!(region_id, self.region_id);
+        assert_eq!(self.region.get_id(), region_id);
         self.cmds.into_iter()
     }
 
