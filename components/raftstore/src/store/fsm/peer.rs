@@ -68,8 +68,8 @@ use crate::store::worker::{
 };
 use crate::store::PdTask;
 use crate::store::{
-    util, AbstractPeer, CasualMessage, Config, MergeResultKind, PeerMsg, PeerTicks,
-    RaftCmdExtraOpts, RaftCommand, SignificantMsg, SnapKey, StoreMsg,
+    util, AbstractPeer, CasualMessage, Config, MergeResultKind, PeerMsg, PeerTicks, RaftCommand,
+    SignificantMsg, SnapKey, StoreMsg,
 };
 use crate::{Error, Result};
 use keys::{self, enc_end_key, enc_start_key};
@@ -1449,6 +1449,10 @@ where
     }
 
     fn handle_reported_disk_usage(&mut self, msg: &RaftMessage) {
+        // Mocked
+        if matches!(msg.disk_usage, DiskUsage::Normal) {
+            return;
+        }
         let store_id = msg.get_from_peer().get_store_id();
         let peer_id = msg.get_from_peer().get_id();
         let refill_disk_usages = if matches!(msg.disk_usage, DiskUsage::Normal) {
@@ -1463,21 +1467,18 @@ where
                 return;
             }
             let disk_full_peers = &self.fsm.peer.disk_full_peers;
-
             disk_full_peers.is_empty()
                 || disk_full_peers
                     .get(peer_id)
                     .map_or(true, |x| x != msg.disk_usage)
         };
-        if refill_disk_usages || self.fsm.peer.has_region_merge_proposal {
+        if refill_disk_usages {
             let prev = self.fsm.peer.disk_full_peers.get(peer_id);
-            if Some(msg.disk_usage) != prev {
-                info!(
-                    "reported disk usage changes {:?} -> {:?}", prev, msg.disk_usage;
-                    "region_id" => self.fsm.region_id(),
-                    "peer_id" => peer_id,
-                );
-            }
+            info!(
+                "reported disk usage changes {:?} -> {:?}", prev, msg.disk_usage;
+                "region_id" => self.fsm.region_id(),
+                "peer_id" => peer_id,
+            );
             self.fsm.peer.refill_disk_full_peers(self.ctx);
             debug!(
                 "raft message refills disk full peers to {:?}",
@@ -1489,7 +1490,6 @@ where
 
     fn on_raft_message(&mut self, msg: InspectedRaftMessage) -> Result<()> {
         let InspectedRaftMessage { heap_size, mut msg } = msg;
-        let peer_disk_usage = msg.disk_usage;
         let stepped = Cell::new(false);
         let memtrace_raft_entries = &mut self.fsm.peer.memtrace_raft_entries as *mut usize;
         defer!({
@@ -1516,7 +1516,12 @@ where
 
         let msg_type = msg.get_message().get_msg_type();
         if matches!(self.ctx.self_disk_usage, DiskUsage::AlreadyFull)
-            && MessageType::MsgTimeoutNow == msg_type
+            && [
+                MessageType::MsgSnapshot,
+                MessageType::MsgAppend,
+                MessageType::MsgTimeoutNow,
+            ]
+            .contains(&msg_type)
         {
             debug!(
                 "skip {:?} because of disk full", msg_type;
@@ -1586,10 +1591,7 @@ where
         let from_peer_id = msg.get_from_peer().get_id();
         self.fsm.peer.insert_peer_cache(msg.take_from_peer());
 
-        let result = self
-            .fsm
-            .peer
-            .step(self.ctx, msg.take_message(), peer_disk_usage);
+        let result = self.fsm.peer.step(self.ctx, msg.take_message());
         stepped.set(result.is_ok());
 
         if is_snapshot {
@@ -2856,7 +2858,6 @@ where
         let (request, target_id) = {
             let state = self.fsm.peer.pending_merge_state.as_ref().unwrap();
             let expect_region = state.get_target();
-
             if !self.validate_merge_peer(expect_region)? {
                 // Wait till next round.
                 return Ok(());
@@ -2911,14 +2912,7 @@ where
             .router
             .force_send(
                 target_id,
-                PeerMsg::RaftCommand(RaftCommand::new_ext(
-                    request,
-                    Callback::None,
-                    RaftCmdExtraOpts {
-                        deadline: None,
-                        disk_full_opt: DiskFullOpt::AllowedOnAlmostFull,
-                    },
-                )),
+                PeerMsg::RaftCommand(RaftCommand::new(request, Callback::None)),
             )
             .map_err(|_| Error::RegionNotFound(target_id))
     }

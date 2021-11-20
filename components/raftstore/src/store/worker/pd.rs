@@ -1239,7 +1239,9 @@ where
                         change_peer.get_change_type(),
                         change_peer.take_peer(),
                     );
-                    send_admin_request(&router, region_id, epoch, peer, req, Callback::None, Default::default());
+                    let mut extra_opts = RaftCmdExtraOpts::default();
+                    extra_opts.disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
+                    send_admin_request(&router, region_id, epoch, peer, req, Callback::None, extra_opts);
                 } else if resp.has_change_peer_v2() {
                     PD_HEARTBEAT_COUNTER_VEC
                         .with_label_values(&["change peer"])
@@ -1298,10 +1300,7 @@ where
                     let merge = resp.take_merge();
                     info!("try to merge"; "region_id" => region_id, "merge" => ?merge);
                     let req = new_merge_request(merge);
-                    send_admin_request(&router, region_id, epoch, peer, req, Callback::None, RaftCmdExtraOpts{
-                        deadline:None,
-                        disk_full_opt:DiskFullOpt::AllowedOnAlmostFull,
-                    });
+                    send_admin_request(&router, region_id, epoch, peer, req, Callback::None, Default::default());
                 } else {
                     PD_HEARTBEAT_COUNTER_VEC.with_label_values(&["noop"]).inc();
                 }
