@@ -1535,9 +1535,14 @@ where
             return Ok(());
         }
 
-        self.handle_reported_disk_usage(&msg);
+        //self.handle_reported_disk_usage(&msg);
 
-        let msg_type = msg.get_message().get_msg_type();
+        if !self.validate_raft_msg(&msg) {
+            return Ok(());
+        }
+
+        let raft_msg = msg.take_message();
+        let msg_type = raft_msg.get_msg_type();
         if matches!(self.ctx.self_disk_usage, DiskUsage::AlreadyFull)
             && MessageType::MsgTimeoutNow == msg_type
         {
@@ -1546,10 +1551,6 @@ where
                 "region_id" => self.region_id(), "peer_id" => self.fsm.peer_id()
             );
             self.ctx.raft_metrics.message_dropped.disk_full += 1;
-            return Ok(());
-        }
-
-        if !self.validate_raft_msg(&msg) {
             return Ok(());
         }
 
@@ -1576,7 +1577,7 @@ where
             return Ok(());
         }
 
-        let is_snapshot = msg.get_message().has_snapshot();
+        let is_snapshot = raft_msg.has_snapshot();
 
         // TODO: spin off the I/O code (delete_snapshot)
         let regions_to_destroy = match self.check_snapshot(&msg)? {
@@ -1592,25 +1593,23 @@ where
             Either::Right(v) => v,
         };
 
-        if util::is_vote_msg(msg.get_message())
-            || msg.get_message().get_msg_type() == MessageType::MsgTimeoutNow
-        {
+        let from_peer_id = msg.get_from_peer().get_id();
+        if util::is_vote_msg(&raft_msg) || msg_type == MessageType::MsgTimeoutNow {
             if self.fsm.hibernate_state.group_state() != GroupState::Chaos {
                 self.fsm.reset_hibernate_state(GroupState::Chaos);
                 self.register_raft_base_tick();
             }
-        } else if msg.get_from_peer().get_id() == self.fsm.peer.leader_id() {
+        } else if from_peer_id == self.fsm.peer.leader_id() {
             self.reset_raft_tick(GroupState::Ordered);
         }
 
-        let from_peer_id = msg.get_from_peer().get_id();
         self.fsm.peer.insert_peer_cache(msg.take_from_peer());
 
-        let result = if msg.get_message().get_msg_type() == MessageType::MsgTransferLeader {
-            self.on_transfer_leader_msg(msg.get_message(), peer_disk_usage);
+        let result = if msg_type == MessageType::MsgTransferLeader {
+            self.on_transfer_leader_msg(&raft_msg, peer_disk_usage);
             Ok(())
         } else {
-            self.fsm.peer.step(self.ctx, msg.take_message())
+            self.fsm.peer.step(self.ctx, raft_msg)
         };
 
         stepped.set(result.is_ok());
@@ -4879,5 +4878,10 @@ mod tests {
         for flag in cbs_flags {
             assert!(flag.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn test_xxxx() {
+        println!("{}", std::mem::size_of::<eraftpb::Message>());
     }
 }
