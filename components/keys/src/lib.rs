@@ -1,7 +1,5 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath] Common key utitlies.
-
 //! TiKV key building
 
 #[allow(unused_extern_crates)]

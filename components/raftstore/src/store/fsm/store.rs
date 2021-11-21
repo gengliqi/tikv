@@ -1,6 +1,5 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
 use std::cell::Cell;
 use std::cmp::{Ord, Ordering as CmpOrdering};
 use std::collections::BTreeMap;
@@ -1254,7 +1253,7 @@ pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
     apply_router: ApplyRouter<EK>,
     apply_system: ApplyBatchSystem<EK>,
     router: RaftRouter<EK, ER>,
-    workers: Option<Workers<EK, ER>>,
+    workers: Option<Workers<EK>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {

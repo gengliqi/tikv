@@ -1,6 +1,5 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::Bound::{Excluded, Unbounded};
@@ -14,7 +13,6 @@ use collections::HashMap;
 use engine_traits::CF_RAFT;
 use engine_traits::{
     Engines, KvEngine, RaftEngine, RaftLogBatch, SSTMetaInfo, WriteBatch, WriteBatchExt,
-    WriteOptions,
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
@@ -33,7 +31,7 @@ use kvproto::raft_serverpb::{
 };
 use kvproto::replication_modepb::{DrAutoSyncState, ReplicationMode};
 use protobuf::Message;
-use raft::eraftpb::{self, ConfChangeType, MessageType};
+use raft::eraftpb::{ConfChangeType, MessageType};
 use raft::{self, Progress, ReadState, Ready, SnapshotStatus, StateRole, INVALID_INDEX, NO_LIMIT};
 use smallvec::SmallVec;
 use tikv_alloc::trace::TraceEvent;
@@ -60,6 +58,7 @@ use crate::store::memory::*;
 use crate::store::metrics::*;
 use crate::store::msg::{Callback, ExtCallback, InspectedRaftMessage};
 use crate::store::peer::{ConsistencyState, Peer, StaleState};
+use crate::store::peer_storage::{ApplySnapResult, InvokeContext};
 use crate::store::transport::Transport;
 use crate::store::util::{is_learner, KeysInfoFormatter};
 use crate::store::worker::{
@@ -1423,8 +1422,6 @@ where
         }
 
         let is_snapshot = msg.get_message().has_snapshot();
-
-        // TODO: spin off the I/O code (delete_snapshot)
         let regions_to_destroy = match self.check_snapshot(&msg)? {
             Either::Left(key) => {
                 // If the snapshot file is not used again, then it's OK to
@@ -2063,7 +2060,6 @@ where
         }
     }
 
-    // [PerformanceCriticalPath] TODO: spin off the I/O code (self.fsm.peer.destroy)
     fn destroy_peer(&mut self, merged_by_target: bool) {
         fail_point!("destroy_peer");
         info!(

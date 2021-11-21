@@ -1,6 +1,5 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-// #[PerformanceCriticalPath]
 use std::cell::Cell;
 use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +39,6 @@ use crate::store::fsm::store::StoreMeta;
 pub trait ReadExecutor<E: KvEngine> {
     fn get_engine(&self) -> &E;
     fn get_snapshot(&mut self, ts: Option<ThreadReadId>) -> Arc<E::Snapshot>;
-
     fn get_value(&self, req: &Request, region: &metapb::Region) -> Result<Response> {
         let key = req.get_get().get_key();
         // region key range has no data prefix, so we must use origin key to check.
