@@ -47,7 +47,7 @@ use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{LazyWorker, Scheduler, Worker};
 use tikv_util::{
-    box_err, box_try, debug, defer, error, info, is_zero_duration, slow_log, sys as sys_util, warn,
+    box_err, box_try, debug, defer, error, info, is_zero_duration, slow_log, warn,
     Either, RingQueue,
 };
 
@@ -1433,9 +1433,6 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         );
         assert!(workers.pd_worker.start_with_timer(pd_runner));
 
-        if let Err(e) = sys_util::thread::set_priority(sys_util::HIGH_PRI) {
-            warn!("set thread priority for raftstore failed"; "error" => ?e);
-        }
         self.workers = Some(workers);
         // This router will not be accessed again, free all caches.
         self.router.clear_cache();
