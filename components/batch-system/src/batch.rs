@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tikv_util::mpsc;
 use tikv_util::time::Instant;
-use tikv_util::{debug, error, info, safe_panic, thd_name, warn};
+use tikv_util::{debug, error, info, safe_panic, thd_name, warn, sys as sys_util};
 
 /// A unify type for FSMs so that they can be sent to channel easily.
 enum FsmTypes<N, C> {
@@ -332,6 +332,7 @@ struct Poller<N: Fsm, C: Fsm, Handler> {
     handler: Handler,
     max_batch_size: usize,
     reschedule_duration: Duration,
+    priority_value: i32,
     before_pause_wait: Option<Duration>,
 }
 
@@ -497,6 +498,7 @@ pub struct BatchSystem<N: Fsm, C: Fsm> {
     workers: Vec<JoinHandle<()>>,
     reschedule_duration: Duration,
     low_priority_pool_size: usize,
+    priority_value: i32,
     before_pause_wait: Option<Duration>,
 }
 
@@ -525,12 +527,18 @@ where
             handler,
             max_batch_size: self.max_batch_size,
             reschedule_duration: self.reschedule_duration,
+            priority_value: self.priority_value,
             before_pause_wait: self.before_pause_wait,
         };
         let props = tikv_util::thread_group::current_properties();
         let t = thread::Builder::new()
-            .name(name)
+            .name(name.clone())
             .spawn(move || {
+                if priority == Priority::Normal {
+                    if let Err(e) = sys_util::thread::set_priority(poller.priority_value) {
+                        warn!("set thread priority for {} failed", name; "error" => ?e);
+                    }
+                }
                 tikv_util::thread_group::set_properties(props);
                 set_io_type(IOType::ForegroundWrite);
                 poller.poll();
@@ -618,6 +626,7 @@ pub fn create_system<N: Fsm, C: Fsm>(
         reschedule_duration: cfg.reschedule_duration.0,
         workers: vec![],
         low_priority_pool_size: cfg.low_priority_pool_size,
+        priority_value: cfg.priority_value,
         before_pause_wait: cfg.before_pause_wait,
     };
     (router, system)
