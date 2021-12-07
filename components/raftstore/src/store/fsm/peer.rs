@@ -635,9 +635,10 @@ where
             return;
         }
         if !force {
-            if (self.ctx.cfg.cmd_batch_persist_max_count != 0
-                && self.fsm.peer.unpersisted_ready_len()
-                    >= self.ctx.cfg.cmd_batch_persist_max_count)
+            if (self.fsm.peer.unpersisted_ready_len() > 0 && self.fsm.peer.has_uncommitted_log())
+                || (self.ctx.cfg.cmd_batch_persist_max_count != 0
+                    && self.fsm.peer.unpersisted_ready_len()
+                        >= self.ctx.cfg.cmd_batch_persist_max_count)
                 || (self.ctx.cfg.cmd_batch_apply_max_count != 0
                     && self.fsm.peer.leader_applying_idx.len()
                         >= self.ctx.cfg.cmd_batch_apply_max_count)
