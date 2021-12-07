@@ -319,7 +319,7 @@ impl Default for Config {
             cmd_batch: true,
             cmd_batch_max_key_num: 512,
             cmd_batch_persist_max_count: 1,
-            cmd_batch_apply_max_count: 3,
+            cmd_batch_apply_max_count: 0,
             raft_write_size_limit: ReadableSize::mb(1),
             waterfall_metrics: false,
             io_reschedule_concurrent_max_count: 4,
