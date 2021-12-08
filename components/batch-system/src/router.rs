@@ -263,6 +263,15 @@ where
         }
     }
 
+    #[inline]
+    pub fn is_empty(&self, addr: u64) -> bool {
+        let res = self.check_do(addr, |mailbox| Some(mailbox.is_empty()));
+        match res {
+            CheckDoResult::Valid(r) => r,
+            CheckDoResult::Invalid | CheckDoResult::NotExist => false,
+        }
+    }
+
     /// Force sending message to control fsm.
     #[inline]
     pub fn send_control(&self, msg: C::Message) -> Result<(), TrySendError<C::Message>> {

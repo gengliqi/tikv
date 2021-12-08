@@ -690,4 +690,11 @@ lazy_static! {
     .unwrap();
     pub static ref RAFT_LOG_GC_SKIPPED: RaftLogGcSkippedVec =
         auto_flush_from!(RAFT_LOG_GC_SKIPPED_VEC, RaftLogGcSkippedVec);
+
+    pub static ref PEER_PERSISTED_MSG_VEC: IntCounterVec =
+    register_int_counter_vec!(
+        "tikv_raftstore_persisted_msg_total",
+        "Total number of proposal made.",
+        &["type"]
+    ).unwrap();
 }

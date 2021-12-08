@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::collections::Bound::{Excluded, Unbounded};
 use std::collections::{HashSet, VecDeque};
 use std::iter::Iterator;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use std::{cmp, mem, u64};
 
@@ -544,6 +545,9 @@ where
     }
 
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<EK>>) {
+        if self.ctx.sync_write_worker.is_none() {
+            self.try_update_persisted_number();
+        }
         for m in msgs.drain(..) {
             match m {
                 PeerMsg::RaftMessage(msg) => {
@@ -1136,6 +1140,17 @@ where
             SignificantMsg::LeaderCallback(cb) => {
                 self.on_leader_callback(cb);
             }
+        }
+    }
+
+    fn try_update_persisted_number(&mut self) {
+        let new_number = self
+            .fsm
+            .peer
+            .global_persisted_number
+            .load(Ordering::Acquire);
+       if new_number > self.fsm.peer.persisted_number {
+            self.on_persisted_msg(self.fsm.peer_id(), new_number);
         }
     }
 

@@ -3,7 +3,7 @@
 // #[PerformanceCriticalPath]
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{cmp, mem, u64, usize};
@@ -583,7 +583,8 @@ where
     /// Used for sync write io.
     unpersisted_ready: Option<Ready>,
     /// The last known persisted number.
-    persisted_number: u64,
+    pub persisted_number: u64,
+    pub global_persisted_number: Arc<AtomicU64>,
     /// The context of applying snapshot.
     apply_snap_ctx: Option<ApplySnapshotContext>,
     /// The applying index of each committed entries batch on leader.
@@ -697,6 +698,7 @@ where
             unpersisted_message_count: 0,
             unpersisted_ready: None,
             persisted_number: 0,
+            global_persisted_number: Arc::new(AtomicU64::new(0)),
             apply_snap_ctx: None,
             leader_applying_idx: VecDeque::default(),
         };
@@ -2093,6 +2095,7 @@ where
                     self.unpersisted_ready = Some(ready);
                     has_write_ready = true;
                 } else {
+                    task.persisted_number = Some(self.global_persisted_number.clone());
                     self.write_router.send_write_msg(
                         ctx,
                         self.unpersisted_readies.back().map(|r| r.number),

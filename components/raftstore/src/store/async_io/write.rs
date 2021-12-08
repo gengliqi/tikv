@@ -8,6 +8,7 @@
 //! raft db and then invoking callback or sending msgs if any.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -43,6 +44,7 @@ const RAFT_WB_DEFAULT_SIZE: usize = 256 * 1024;
 /// Notify the event to the specified region.
 pub trait Notifier: Clone + Send + 'static {
     fn notify_persisted(&self, region_id: u64, peer_id: u64, ready_number: u64);
+    fn has_msg(&self, region_id: u64) -> bool;
 }
 
 impl<EK, ER> Notifier for RaftRouter<EK, ER>
@@ -53,10 +55,7 @@ where
     fn notify_persisted(&self, region_id: u64, peer_id: u64, ready_number: u64) {
         if let Err(e) = self.force_send(
             region_id,
-            PeerMsg::Persisted {
-                peer_id,
-                ready_number,
-            },
+            PeerMsg::Noop,
         ) {
             warn!(
                 "failed to send noop to trigger persisted ready";
@@ -66,6 +65,10 @@ where
                 "error" => ?e,
             );
         }
+    }
+
+    fn has_msg(&self, region_id: u64) -> bool {
+        !self.is_empty(region_id)
     }
 }
 
@@ -78,6 +81,7 @@ where
     region_id: u64,
     peer_id: u64,
     ready_number: u64,
+    pub persisted_number: Option<Arc<AtomicU64>>,
     pub send_time: Instant,
     pub kv_wb: Option<EK::WriteBatch>,
     pub raft_wb: Option<ER::LogBatch>,
@@ -98,6 +102,7 @@ where
             region_id,
             peer_id,
             ready_number,
+            persisted_number: None,
             send_time: Instant::now(),
             kv_wb: None,
             raft_wb: None,
@@ -189,7 +194,7 @@ where
     pub state_size: usize,
     pub tasks: Vec<WriteTask<EK, ER>>,
     // region_id -> (peer_id, ready_number)
-    pub readies: HashMap<u64, (u64, u64)>,
+    pub readies: HashMap<u64, (u64, u64, Option<Arc<AtomicU64>>)>,
 }
 
 impl<EK, ER> WriteTaskBatch<EK, ER>
@@ -236,10 +241,14 @@ where
             }
         }
 
-        if let Some(prev_readies) = self
-            .readies
-            .insert(task.region_id, (task.peer_id, task.ready_number))
-        {
+        if let Some(prev_readies) = self.readies.insert(
+            task.region_id,
+            (
+                task.peer_id,
+                task.ready_number,
+                task.persisted_number.take(),
+            ),
+        ) {
             // The peer id must be same if they belong to the same region because
             // the peer must be destroyed after all write tasks have been finished.
             if task.peer_id != prev_readies.0 {
@@ -587,10 +596,20 @@ where
 
         let mut callback_time = 0f64;
         if notify {
-            for (region_id, (peer_id, ready_number)) in &self.batch.readies {
+            let mut not_send = 0;
+            for (region_id, (peer_id, ready_number, persisted_number)) in &self.batch.readies {
+                if let Some(persisted) = persisted_number {
+                    persisted.store(*ready_number, Ordering::Release);
+                    if self.notifier.has_msg(*region_id) {
+                        not_send += 1;
+                        continue;
+                    }
+                }
                 self.notifier
                     .notify_persisted(*region_id, *peer_id, *ready_number);
             }
+            PEER_PERSISTED_MSG_VEC.with_label_values(&["all"]).inc_by(self.batch.readies.len() as u64);
+            PEER_PERSISTED_MSG_VEC.with_label_values(&["not_send"]).inc_by(not_send);
             now = Instant::now();
             callback_time = duration_to_sec(now.saturating_duration_since(now2));
             STORE_WRITE_CALLBACK_DURATION_HISTOGRAM.observe(callback_time);

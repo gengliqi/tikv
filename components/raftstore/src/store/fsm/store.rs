@@ -47,8 +47,8 @@ use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{LazyWorker, Scheduler, Worker};
 use tikv_util::{
-    box_err, box_try, debug, defer, error, info, is_zero_duration, slow_log, warn,
-    Either, RingQueue,
+    box_err, box_try, debug, defer, error, info, is_zero_duration, slow_log, warn, Either,
+    RingQueue,
 };
 
 use crate::bytes_capacity;
