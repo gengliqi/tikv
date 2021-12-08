@@ -2285,7 +2285,16 @@ where
                 self.raft_group.raft.raft_log.committed,
                 self.raft_group.raft.raft_log.persisted,
             );
-            let commit_term = self.get_store().term(commit_index).unwrap();
+            let commit_term = match self.get_store().term(commit_index) {
+                Ok(term) => term,
+                Err(e) => panic!(
+                    "{} can not find term for min(committed {} persisted {}), err: {:?}",
+                    self.tag,
+                    self.raft_group.raft.raft_log.committed,
+                    self.raft_group.raft.raft_log.persisted,
+                    e
+                ),
+            };
             let mut apply = Apply::new(
                 self.peer_id(),
                 self.region_id,
