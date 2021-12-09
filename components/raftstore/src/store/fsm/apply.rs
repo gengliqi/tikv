@@ -41,7 +41,7 @@ use kvproto::raft_cmdpb::{
 use kvproto::raft_serverpb::{
     MergeState, PeerState, RaftApplyState, RaftTruncatedState, RegionLocalState,
 };
-use prometheus::local::LocalHistogram;
+use prometheus::local::{LocalHistogram, LocalIntCounter};
 use raft::eraftpb::{
     ConfChange, ConfChangeType, ConfChangeV2, Entry, EntryType, Snapshot as RaftSnapshot,
 };
@@ -402,6 +402,10 @@ where
     apply_time: LocalHistogram,
 
     key_buffer: Vec<u8>,
+
+    write_state: bool,
+    key_num: LocalIntCounter,
+    state_key_num: LocalIntCounter,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -457,6 +461,9 @@ where
             apply_wait: APPLY_TASK_WAIT_TIME_HISTOGRAM.local(),
             apply_time: APPLY_TIME_HISTOGRAM.local(),
             key_buffer: Vec::with_capacity(1024),
+            write_state: cfg.write_apply_state,
+            key_num: APPLY_KEY_NUM_TOTAL.with_label_values(&["all"]).local(),
+            state_key_num: APPLY_KEY_NUM_TOTAL.with_label_values(&["state"]).local(),
         }
     }
 
@@ -476,7 +483,11 @@ where
     /// This call is valid only when it's between a `prepare_for` and `finish_for`.
     pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
         if delegate.last_flush_applied_index < delegate.apply_state.get_applied_index() {
-            delegate.write_apply_state(self.kv_wb_mut());
+            if self.write_state {
+                self.state_key_num.inc();
+                self.key_num.inc();
+                delegate.write_apply_state(self.kv_wb_mut());
+            }
         }
         self.commit_opt(delegate, true);
     }
@@ -561,6 +572,8 @@ where
         }
         self.apply_time.flush();
         self.apply_wait.flush();
+        self.key_num.flush();
+        self.state_key_num.flush();
         need_sync
     }
 
@@ -571,7 +584,11 @@ where
         results: VecDeque<ExecResult<EK::Snapshot>>,
     ) {
         if !delegate.pending_remove {
-            delegate.write_apply_state(self.kv_wb_mut());
+            if self.write_state {
+                self.state_key_num.inc();
+                self.key_num.inc();
+                delegate.write_apply_state(self.kv_wb_mut());
+            }
         }
         self.commit_opt(delegate, false);
         self.apply_res.push(ApplyRes {
@@ -1507,6 +1524,7 @@ where
         keys::data_key_with_buffer(key, &mut ctx.key_buffer);
         let key = ctx.key_buffer.as_slice();
 
+        ctx.key_num.inc();
         self.metrics.size_diff_hint += key.len() as i64;
         self.metrics.size_diff_hint += value.len() as i64;
         if !req.get_put().get_cf().is_empty() {
@@ -1553,6 +1571,7 @@ where
         keys::data_key_with_buffer(key, &mut ctx.key_buffer);
         let key = ctx.key_buffer.as_slice();
 
+        ctx.key_num.inc();
         // since size_diff_hint is not accurate, so we just skip calculate the value size.
         self.metrics.size_diff_hint -= key.len() as i64;
         if !req.get_delete().get_cf().is_empty() {

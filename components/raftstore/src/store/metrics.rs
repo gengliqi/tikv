@@ -690,4 +690,11 @@ lazy_static! {
     .unwrap();
     pub static ref RAFT_LOG_GC_SKIPPED: RaftLogGcSkippedVec =
         auto_flush_from!(RAFT_LOG_GC_SKIPPED_VEC, RaftLogGcSkippedVec);
+
+    pub static ref APPLY_KEY_NUM_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_apply_key_num",
+            "TODO.",
+            &["type"]
+        ).unwrap();
 }
