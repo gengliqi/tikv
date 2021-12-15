@@ -623,7 +623,7 @@ where
             max_inflight_msgs: cfg.raft_max_inflight_msgs,
             applied: applied_index,
             check_quorum: true,
-            skip_bcast_commit: true,
+            skip_bcast_commit: cfg.skip_bcast_commit,
             pre_vote: cfg.prevote,
             max_committed_size_per_ready: MAX_COMMITTED_SIZE_PER_READY,
             ..Default::default()
@@ -2253,7 +2253,9 @@ where
             }
             if self.last_applying_idx >= self.last_urgent_proposal_idx {
                 // Urgent requests are flushed, make it lazy again.
-                self.raft_group.skip_bcast_commit(true);
+                if ctx.cfg.skip_bcast_commit {
+                    self.raft_group.skip_bcast_commit(true);
+                }
                 self.last_urgent_proposal_idx = u64::MAX;
             }
             let cbs = if !self.proposals.is_empty() {

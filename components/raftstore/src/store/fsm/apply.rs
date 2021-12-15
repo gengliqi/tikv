@@ -406,6 +406,8 @@ where
     write_state: bool,
     key_num: LocalIntCounter,
     state_key_num: LocalIntCounter,
+
+    disable_wal: bool,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -461,9 +463,10 @@ where
             apply_wait: APPLY_TASK_WAIT_TIME_HISTOGRAM.local(),
             apply_time: APPLY_TIME_HISTOGRAM.local(),
             key_buffer: Vec::with_capacity(1024),
-            write_state: cfg.write_apply_state,
+            write_state: cfg.apply_write_state,
             key_num: APPLY_KEY_NUM_TOTAL.with_label_values(&["all"]).local(),
             state_key_num: APPLY_KEY_NUM_TOTAL.with_label_values(&["state"]).local(),
+            disable_wal: cfg.apply_disable_wal,
         }
     }
 
@@ -524,7 +527,13 @@ where
         }
         if !self.kv_wb_mut().is_empty() {
             let mut write_opts = engine_traits::WriteOptions::new();
-            write_opts.set_sync(need_sync);
+            if self.disable_wal {
+                write_opts.set_sync(false);
+                write_opts.set_disable_wal(true);
+            } else {
+                write_opts.set_sync(need_sync);
+            }
+            
             self.kv_wb().write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("failed to write to engine: {:?}", e);
             });

@@ -229,7 +229,9 @@ pub struct Config {
 
     pub raft_msg_flush_interval: ReadableDuration,
 
-    pub write_apply_state: bool,
+    pub apply_write_state: bool,
+    pub apply_disable_wal: bool,
+    pub skip_bcast_commit: bool,
 
     // Deprecated! These configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
@@ -327,7 +329,9 @@ impl Default for Config {
             io_reschedule_concurrent_max_count: 4,
             io_reschedule_hotpot_duration: ReadableDuration::secs(5),
             raft_msg_flush_interval: ReadableDuration::micros(250),
-            write_apply_state: true,
+            apply_write_state: true,
+            apply_disable_wal: false,
+            skip_bcast_commit: true,
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),
