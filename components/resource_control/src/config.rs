@@ -29,46 +29,34 @@ pub struct Config {
     /// Minimum write IO rate that background tasks are always allowed,
     /// even under maximum compaction pressure.
     pub bg_write_io_floor: ReadableSize,
-    /// When true, enables fair two-phase scheduling for reads: groups whose
-    /// current-minute RU rate exceeds their historical baseline are placed in
-    /// phase 1 (deprioritised in the yatp priority queue) relative to groups
-    /// within their baseline (phase 0). Protects sustained workloads from
-    /// sudden traffic spikes without hard-rejecting requests.
-    ///
-    /// Requires `readpool.unified.auto-adjust-pool-size` to be enabled, which
-    /// is *not* the default. A group is deprioritised while the unified read
-    /// pool is scaled in and released once the pool recovers to its configured
-    /// size, so with auto-adjustment off the pool never moves and no group is
-    /// ever deprioritised. This is not rejected at config load, for backward
-    /// compatibility, so enabling this alone silently has no effect.
+    /// Deprecated, accepted for configuration compatibility and ignored.
+    /// Resource-controlled unified read pools always use group fair scheduling;
+    /// the historical two-phase policy has been removed.
     pub enable_fair_scheduling: bool,
-    /// When true, enables Tier-1 admission control for reads: high-priority
-    /// read requests from groups that are over their RU baseline are shed
-    /// (SchedTooBusy) when CPU exceeds fg_cpu_throttle_threshold.
+    /// Deprecated, accepted for configuration compatibility and ignored.
+    /// Foreground reads use the unified read pool's CPU budget, not the shared
+    /// foreground limiter's historical CPU debt. Background limits still apply.
     pub enable_read_admission_control: bool,
-    /// When true, enables Tier-1 admission control for writes: high-priority
-    /// write requests from groups that are over their RU baseline are shed
-    /// (SchedTooBusy) when CPU exceeds fg_cpu_throttle_threshold.
+    /// Enables historical CPU-debt admission for foreground writes. Requests
+    /// wait on per-group debt, or are rejected when delay slots are exhausted.
     pub enable_write_admission_control: bool,
     /// Size of the sliding window (in minutes) used to compute per-group
-    /// historical RU baselines for fair scheduling and admission control.
-    /// Also sizes the unified read pool's historical CPU-usage tracker, whose
-    /// average is used as a scale-down floor for the pool's thread count.
+    /// shared read/write usage baselines for foreground write admission.
     /// The window is divided into 30-second buckets (2 per minute). Minimum 2,
     /// maximum 60. Not hot-reloadable; changing requires a restart.
     #[online_config(skip)]
     pub historical_usage_window_mins: u64,
     /// Percentage of headroom above the historical RU baseline before a group
-    /// is considered "over baseline" for two-phase scheduling and CPU
-    /// utilization throttling. For example, 20.0 means a group must exceed
-    /// 1.2× its historical rate to be deprioritized or rate-limited.
+    /// is considered "over baseline" for foreground CPU utilization throttling.
+    /// For example, 20.0 means a group must exceed 1.2× its historical rate
+    /// before its foreground write-admission rate can be limited.
     /// Default: 20.0 (20%).
     pub baseline_burst_pct: f64,
     /// Maximum number of requests that can concurrently sit in the admission
-    /// control delay phase (reads and writes combined). When this limit is
-    /// reached, additional over-baseline requests are rejected immediately
-    /// (SchedTooBusy) rather than delayed. Set to 0 to disable the limit
-    /// (unlimited delayed requests). Default: 10_000.
+    /// control delay phase (foreground writes and background requests). When
+    /// this limit is reached, additional over-baseline requests are
+    /// rejected immediately (SchedTooBusy) rather than delayed. Set to 0 to
+    /// disable the limit (unlimited delayed requests). Default: 10_000.
     pub admission_max_delayed_count: u64,
 }
 
@@ -112,6 +100,16 @@ fn validate_cpu_pct(name: &str, value: f64) -> Result<(), Box<dyn Error>> {
 
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.enable_fair_scheduling {
+            tikv_util::warn!(
+                "resource-control.enable-fair-scheduling is deprecated and ignored; unified reads use group fair scheduling"
+            );
+        }
+        if self.enable_read_admission_control {
+            tikv_util::warn!(
+                "resource-control.enable-read-admission-control is deprecated and ignored; foreground reads use the unified read pool CPU budget"
+            );
+        }
         validate_cpu_pct("bg-cpu-throttle-threshold", self.bg_cpu_throttle_threshold)?;
         validate_cpu_pct("fg-cpu-throttle-threshold", self.fg_cpu_throttle_threshold)?;
         validate_cpu_pct(
@@ -253,6 +251,20 @@ mod tests {
     #[test]
     fn test_validate_accepts_defaults() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn test_deprecated_read_policy_flags_remain_config_compatible() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"enable-fair-scheduling":true,"enable-read-admission-control":true}"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.enable_fair_scheduling);
+        assert!(cfg.enable_read_admission_control);
+        let encoded = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(encoded["enable-fair-scheduling"], true);
+        assert_eq!(encoded["enable-read-admission-control"], true);
     }
 
     #[test]

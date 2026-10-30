@@ -43,13 +43,6 @@ lazy_static! {
     )
     .unwrap();
 
-    pub static ref TWO_PHASE_THROTTLED_REQUESTS: IntCounterVec = register_int_counter_vec!(
-        "tikv_resource_control_two_phase_throttled_requests_total",
-        "Total requests assigned to phase 1 (RU rate above 15-min baseline) per resource group",
-        &["resource_group"]
-    )
-    .unwrap();
-
     pub static ref GROUP_RU_HISTORICAL_RATE: GaugeVec = register_gauge_vec!(
         "tikv_resource_control_group_ru_historical_rate",
         "Historical CPU utilization % per resource group (sliding window average)",
@@ -99,7 +92,7 @@ lazy_static! {
 
     pub static ref READ_POOL_CPU_VEC: GaugeVec = register_gauge_vec!(
         "tikv_resource_control_read_pool_cpu_percent",
-        "Unified read pool CPU usage as a percentage of one core (100 = 1 core): historical (floor), current (measured), and target (foreground-pressure-driven ceiling)",
+        "Unified read pool CPU usage as a percentage of one core (100 = 1 core): current (measured) and target (configured ceiling)",
         &["type"]
     )
     .unwrap();
@@ -113,7 +106,6 @@ lazy_static! {
 }
 
 pub fn deregister_metrics(name: &str) {
-    _ = TWO_PHASE_THROTTLED_REQUESTS.remove_label_values(&[name]);
     _ = GROUP_QUOTA_LIMIT_VEC.remove_label_values(&[name, "cpu"]);
     _ = GROUP_RU_HISTORICAL_RATE.remove_label_values(&[name]);
     _ = GROUP_RU_CURRENT_RATE.remove_label_values(&[name]);

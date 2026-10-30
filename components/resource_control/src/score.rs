@@ -1,7 +1,7 @@
 // Copyright 2026 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! Common resource-pressure scoring shared by background quota adjustment
-//! (`worker.rs`) and foreground/read-pool throttling (`resource_group.rs`).
+//! (`worker.rs`) and foreground write throttling (`resource_group.rs`).
 //!
 //! `compute_resource_scores` produces three independent 0-100 scores —
 //! `cpu_score`, `io_score`, `compaction_score` — each simply the resource's
@@ -12,10 +12,10 @@
 //! Background quota adjustment turns its score into a `[0, 1]` pressure
 //! fraction via [`pressure_fraction`], over its own
 //! `(bg_cpu_throttle_threshold, fg_cpu_throttle_threshold)` range.
-//! Foreground/read-pool throttling instead just tightens whatever's currently
-//! in effect by a fixed percentage per tick once engaged — see
-//! `resource_group.rs::adjust_group_throttling` and
-//! `compute_read_pool_target_cpu`.
+//! Foreground write throttling tightens the historical CPU rate by a fixed
+//! percentage per tick once engaged — see
+//! `resource_group.rs::adjust_group_throttling`. Unified read scheduling uses
+//! its own CPU budget and does not consume these pressure scores.
 
 use std::time::Duration;
 
@@ -24,12 +24,6 @@ use tikv_util::{
     thread_name_prefix::matches_thread_name_prefix,
     time::Instant,
 };
-
-/// Test-only: a cpu_score high enough to guarantee maximum pressure
-/// regardless of configured thresholds, used to drive foreground/read-pool
-/// throttling tests unconditionally into their "fully engaged" branch.
-#[cfg(test)]
-pub(crate) const TARGET_CPU: f64 = 90.0;
 
 /// Shortest interval [`ThreadGroupCpuTracker::measure_cpu_cores`] will measure
 /// over; below this the tick count is too small to be meaningful and the cached

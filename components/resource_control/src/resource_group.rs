@@ -24,13 +24,14 @@ use tikv_util::{
     info,
     resource_control::{DEFAULT_RESOURCE_GROUP_NAME, TaskMetadata, TaskPriority},
     time::Instant,
+    yatp_pool::fair_queue::{GroupPolicy, GroupProvider},
 };
 use yatp::queue::priority::TaskPriorityProvider;
 
 use crate::{
     config::Config,
     metrics,
-    metrics::{TWO_PHASE_THROTTLED_REQUESTS, deregister_metrics},
+    metrics::deregister_metrics,
     resource_limiter::{ResourceLimiter, ResourceType},
 };
 
@@ -58,9 +59,7 @@ const RESET_VT_THRESHOLD: u64 = (u64::MAX >> 4) / 2;
 
 /// Fraction of `fg_cpu_throttle_threshold` below which foreground CPU
 /// pressure counts as cleared — a dead zone so tighten/release don't flap
-/// when `cpu_score` hovers near the threshold. Shared by
-/// [`ResourceGroupManager::adjust_group_throttling`] and
-/// [`ResourceGroupManager::adjust_group_scheduling`].
+/// when `cpu_score` hovers near the threshold.
 ///
 /// Must stay strictly less than [`THROTTLE_DECREASE_FACTOR`]: the tighten
 /// step below shrinks whatever's currently enforced by
@@ -71,26 +70,20 @@ const RESET_VT_THRESHOLD: u64 = (u64::MAX >> 4) / 2;
 /// toggle every tick instead of settling.
 const LEEWAY_THRESHOLD_RATIO: f64 = 0.85;
 
-/// Per-tick multiplicative step used to tighten the per-group CPU rate limit
-/// ([`ResourceGroupManager::adjust_group_throttling`]) and to ratchet down
-/// the read pool's CPU ceiling
-/// ([`ResourceGroupManager::compute_read_pool_target_cpu`]) once foreground
-/// CPU pressure is engaged. See [`LEEWAY_THRESHOLD_RATIO`] for the invariant
-/// this must satisfy relative to the leeway threshold.
+/// Per-tick multiplicative step used to tighten the per-group CPU rate limit.
+/// See [`LEEWAY_THRESHOLD_RATIO`] for the invariant relative to the recovery
+/// threshold.
 const THROTTLE_DECREASE_FACTOR: f64 = 0.9;
 
 /// Duration of each bucket in the RuTracker ring buffer.
 const RU_BUCKET_SECS: u64 = 30;
 
-/// Sliding-window RU consumption tracker for both Tier-1 admission control
-/// and two-phase scheduling phase decisions.
+/// Sliding-window consumption tracker for foreground write admission control.
 ///
-/// Tracks actual CPU µs consumed (via `consume_penalty`) across reads and
-/// writes in a configurable ring buffer of 30-second buckets. Window size is
-/// set from `historical_usage_window_mins` (× 2 buckets per minute). Using real
-/// RU rather than virtual
-/// time avoids weight-skewing: a high-weight group accumulates VT faster
-/// without necessarily consuming more CPU.
+/// Tracks synchronous poll duration in µs across reads and writes, as recorded
+/// by `LimitedFuture`, in a configurable ring buffer of 30-second buckets.
+/// Window size is set from `historical_usage_window_mins` (× 2 buckets per
+/// minute). This shared history does not affect the unified read scheduler.
 pub struct RuTracker {
     /// Ring buffer of completed 30-second bucket totals (oldest at `head`).
     buckets: Vec<u64>,
@@ -257,38 +250,6 @@ impl RuTracker {
     }
 }
 
-/// Encodes a two-phase scheduling priority.
-///
-/// Bit position of the phase bit within the 64-bit encoded priority.
-/// Format: `[4-bit group_priority | 1-bit phase | 59-bit tag]`
-const PRIORITY_TAG_BITS: u32 = 59;
-
-/// Whether a task is within or over its historical RU baseline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PriorityPhase {
-    /// Within baseline — given scheduling preference over phase-1 tasks.
-    WithinBaseline = 0,
-    /// Over baseline — deprioritised relative to within-baseline tasks.
-    OverBaseline = 1,
-}
-
-/// Format: `[4-bit group_priority | 1-bit phase | 59-bit tag]`
-///
-/// Phase 0 (within baseline) always sorts before phase 1 (over baseline)
-/// within the same group priority tier. Using only 1 bit for phase leaves
-/// 59 bits for the VT tag, matching `RESET_VT_THRESHOLD` (`2^59`).
-fn encode_two_phase_priority(group_priority: u32, phase: PriorityPhase, tag: u64) -> u64 {
-    assert!((1..=16).contains(&group_priority));
-    let tag = tag & ((1u64 << PRIORITY_TAG_BITS) - 1);
-    let phase_bit = (phase as u64) << PRIORITY_TAG_BITS;
-    (!((group_priority - 1) as u64) << 60) | phase_bit | tag
-}
-
-/// Returns true if the encoded priority value represents a phase-1 task.
-#[inline]
-fn is_phase1(priority: u64) -> bool {
-    (priority >> PRIORITY_TAG_BITS) & 1 == 1
-}
 pub enum ResourceConsumeType {
     CpuTime(Duration),
     IoBytes(u64),
@@ -334,9 +295,94 @@ impl Drop for DelaySlotGuard {
     }
 }
 
+struct ReadGroupPolicy {
+    policy: Arc<GroupPolicy>,
+    quota: u64,
+}
+
+/// Stable read-scheduler identities, independent of the legacy VT controllers.
+/// Metadata mutations hold this lock through publication in `resource_groups`;
+/// the queue only clones policy handles and never calls back while holding it.
+#[derive(Default)]
+struct ReadGroupPolicies {
+    groups: HashMap<String, ReadGroupPolicy>,
+    next_id: u64,
+}
+
+impl ReadGroupPolicies {
+    fn is_special(name: &str, quota: u64) -> bool {
+        quota == 0 || (name == DEFAULT_RESOURCE_GROUP_NAME && quota == MAX_RU_QUOTA)
+    }
+
+    fn upsert(&mut self, name: String, quota: u64, priority: u32) {
+        let quota = quota.min(MAX_RU_QUOTA);
+        let priority = if priority == 0 {
+            MEDIUM_PRIORITY
+        } else {
+            priority.clamp(1, 16)
+        };
+        let weight = if Self::is_special(&name, quota) {
+            self.groups
+                .iter()
+                .filter(|(other_name, group)| {
+                    *other_name != &name && !Self::is_special(other_name, group.quota)
+                })
+                .map(|(_, group)| group.quota)
+                .max()
+                .unwrap_or(0)
+                .max(DEFAULT_MAX_RU_QUOTA)
+                .saturating_mul(10)
+                .min(MAX_RU_QUOTA)
+        } else {
+            quota
+        };
+        if let Some(group) = self.groups.get_mut(&name) {
+            group.quota = quota;
+            group.policy.update(priority, weight);
+        } else {
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .expect("resource group generation overflow");
+            self.groups.insert(
+                name.clone(),
+                ReadGroupPolicy {
+                    policy: Arc::new(GroupPolicy::new(self.next_id, name, priority, weight)),
+                    quota,
+                },
+            );
+        }
+        self.refresh_special_weights();
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(group) = self.groups.remove(name) {
+            group.policy.retire();
+        }
+    }
+
+    fn refresh_special_weights(&self) {
+        let max_quota = self
+            .groups
+            .iter()
+            .filter(|(name, group)| !Self::is_special(name, group.quota))
+            .map(|(_, group)| group.quota)
+            .max()
+            .unwrap_or(0)
+            .max(DEFAULT_MAX_RU_QUOTA);
+        let weight = max_quota.saturating_mul(10).min(MAX_RU_QUOTA);
+        for (name, group) in &self.groups {
+            if Self::is_special(name, group.quota) {
+                group.policy.update(group.policy.priority(), weight);
+            }
+        }
+    }
+}
+
 /// ResourceGroupManager manages the metadata of each resource group.
 pub struct ResourceGroupManager {
     pub(crate) resource_groups: DashMap<String, ResourceGroup>,
+    read_group_policies: RwLock<ReadGroupPolicies>,
     // the count of all groups, a fast path because call `DashMap::len` is a little slower.
     group_count: AtomicU64,
     registry: RwLock<Vec<Arc<ResourceController>>>,
@@ -347,9 +393,9 @@ pub struct ResourceGroupManager {
     has_background: AtomicBool,
     // lastest config.
     config: Arc<VersionTrack<Config>>,
-    // Per-group RU consumption trackers for Tier-1 high-priority throttling.
-    // Per-group sliding-window tracker and token-bucket limiter.
-    // Rate on the limiter is set to `fraction × historical_rate` each tick.
+    // Shared read/write usage history and the foreground write-admission
+    // limiter. The unified read pool records usage but does not wait on this
+    // limiter's historical CPU debt.
     // The Arc allows handing out limiter references to LimitedFuture wrappers
     // in the read/write pools without copying the limiter state.
     ru_trackers: DashMap<String, Mutex<(RuTracker, Arc<ResourceLimiter>)>>,
@@ -364,19 +410,6 @@ pub struct ResourceGroupManager {
     // only engages when this flag is set, ensuring background is fully
     // squeezed before foreground traffic is touched.
     bg_cpu_at_floor: AtomicBool,
-    // Latest foreground CPU pressure (0.0-1.0), refreshed every tick by
-    // `online_adjust_resource_quota`. Consumed by the unified read pool to
-    // drive its thread-count scale-down decision. Encoded via `f64::to_bits`.
-    read_pool_cpu_pressure: AtomicU64,
-    // Sliding-window tracker of the unified read pool's actual CPU usage
-    // (in µs of CPU time per tick). Its `historical_rate()` is used as a
-    // floor: the read pool should never be scaled below the thread count
-    // needed to sustain its historical CPU consumption.
-    read_pool_cpu_tracker: Mutex<RuTracker>,
-    // True when the last `adjust_group_scheduling` tick saw cpu_score below
-    // the leeway threshold, i.e. the system is comfortably idle and the
-    // unified read pool may scale its thread count up toward its max.
-    read_pool_scale_up_allowed: AtomicBool,
 }
 
 impl Default for ResourceGroupManager {
@@ -404,11 +437,9 @@ impl ResourceGroupManager {
             true,
         ));
         let start_secs = RuTracker::now_secs();
-        // 2 buckets per minute (30s each) to match RU_BUCKET_SECS, mirroring
-        // the per-group ru_trackers window sizing in `record_ru_consumption`.
-        let read_pool_num_buckets = (config.historical_usage_window_mins.max(2) as usize) * 2;
         let manager = Self {
             resource_groups: Default::default(),
+            read_group_policies: RwLock::new(ReadGroupPolicies::default()),
             group_count: AtomicU64::new(0),
             registry: Default::default(),
             delayed_req_count: AtomicI64::new(0),
@@ -419,9 +450,6 @@ impl ResourceGroupManager {
             ru_trackers: Default::default(),
             start_secs,
             bg_cpu_at_floor: AtomicBool::new(false),
-            read_pool_cpu_pressure: AtomicU64::new(0.0f64.to_bits()),
-            read_pool_cpu_tracker: Mutex::new(RuTracker::new(start_secs, read_pool_num_buckets)),
-            read_pool_scale_up_allowed: AtomicBool::new(false),
         };
 
         // init the default resource group by default.
@@ -471,6 +499,12 @@ impl ResourceGroupManager {
 
     pub fn add_resource_group(&self, rg: PbResourceGroup) {
         let group_name = rg.get_name().to_ascii_lowercase();
+        let mut read_policies = self.read_group_policies.write();
+        read_policies.upsert(
+            group_name.clone(),
+            Self::get_ru_setting(&rg, true),
+            rg.priority,
+        );
         self.registry.read().iter().for_each(|controller| {
             let ru_quota = Self::get_ru_setting(&rg, controller.is_read);
             controller.add_resource_group(group_name.clone().into_bytes(), ru_quota, rg.priority);
@@ -520,6 +554,22 @@ impl ResourceGroupManager {
 
     pub fn remove_resource_group(&self, name: &str) {
         let group_name = name.to_ascii_lowercase();
+        // The fallback identity must remain available even if PD deletes its
+        // customized definition. Reset its policy without retiring the handle.
+        if group_name == DEFAULT_RESOURCE_GROUP_NAME {
+            let mut group = PbResourceGroup::new();
+            group.name = group_name;
+            group.priority = MEDIUM_PRIORITY;
+            group.mode = GroupMode::RuMode;
+            // Zero is the legacy controller's reset sentinel and maps to the
+            // same finite special weight in the read policy registry.
+            group.mut_r_u_settings().mut_r_u().mut_settings().fill_rate = 0;
+            self.add_resource_group(group);
+            return;
+        }
+        let mut read_policies = self.read_group_policies.write();
+        read_policies.remove(&group_name);
+        read_policies.refresh_special_weights();
         self.registry.read().iter().for_each(|controller| {
             controller.remove_resource_group(group_name.as_bytes());
         });
@@ -532,6 +582,7 @@ impl ResourceGroupManager {
     }
 
     pub fn retain(&self, mut f: impl FnMut(&String, &PbResourceGroup) -> bool) {
+        let mut read_policies = self.read_group_policies.write();
         let mut removed_names = vec![];
         self.resource_groups.retain(|k, v| {
             // avoid remove default group.
@@ -545,6 +596,11 @@ impl ResourceGroupManager {
             ret
         });
         if !removed_names.is_empty() {
+            for name in &removed_names {
+                read_policies.remove(name);
+                deregister_metrics(name);
+            }
+            read_policies.refresh_special_weights();
             self.registry.read().iter().for_each(|controller| {
                 for name in &removed_names {
                     controller.remove_resource_group(name.as_bytes());
@@ -572,7 +628,7 @@ impl ResourceGroupManager {
     }
 
     pub fn derive_controller(&self, name: String, is_read: bool) -> Arc<ResourceController> {
-        let controller = Arc::new(ResourceController::new(name, is_read, self.config.clone()));
+        let controller = Arc::new(ResourceController::new(name, is_read));
         self.registry.write().push(controller.clone());
         for g in &self.resource_groups {
             let ru_quota = Self::get_ru_setting(&g.value().group, controller.is_read);
@@ -653,41 +709,12 @@ impl ResourceGroupManager {
         self.bg_cpu_at_floor.load(Ordering::Relaxed)
     }
 
-    fn set_read_pool_cpu_pressure(&self, pressure: f64) {
-        self.read_pool_cpu_pressure
-            .store(pressure.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Latest foreground CPU pressure (0.0-1.0), refreshed every tick by
-    /// `online_adjust_resource_quota`.
-    pub fn read_pool_cpu_pressure(&self) -> f64 {
-        f64::from_bits(self.read_pool_cpu_pressure.load(Ordering::Relaxed))
-    }
-
-    /// Records `read_pool_cpu` (in cores) into the historical tracker and
-    /// returns the floor CPU:
-    pub fn read_pool_cpu_floor(&self, read_pool_cpu: f64, interval_secs: f64) -> f64 {
-        self.read_pool_cpu_floor_at(read_pool_cpu, interval_secs, RuTracker::now_secs())
-    }
-
-    fn read_pool_cpu_floor_at(&self, read_pool_cpu: f64, interval_secs: f64, now: u64) -> f64 {
-        let mut tracker = self.read_pool_cpu_tracker.lock().unwrap();
-        tracker.advance(now);
-        if interval_secs > 0.0 {
-            let cpu_us = (read_pool_cpu * interval_secs * 1_000_000.0).max(0.0) as u64;
-            tracker.record(cpu_us);
-        }
-        tracker.refresh_cached_historical_rate(self.start_secs, now);
-        tracker.cached_historical_rate / 1_000_000.0
-    }
-
     /// `cpu_score` is the common CPU-utilization score (0-100) computed by
     /// [`crate::score::compute_resource_scores`]: the max of process and grpc
     /// normalized utilization.
     pub fn online_adjust_resource_quota(&self, cpu_score: f64) {
         let now = RuTracker::now_secs();
         self.adjust_group_throttling(cpu_score, now);
-        self.adjust_group_scheduling(cpu_score);
     }
 
     /// Per-group CPU rate-limit throttling. Only groups whose current rate
@@ -704,8 +731,7 @@ impl ResourceGroupManager {
         let burst_factor = 1.0 + self.config.value().baseline_burst_pct / 100.0;
 
         // Advance all trackers to `now` and refresh cached historical rates
-        // up front so adjust_group_scheduling and the throttling logic below
-        // always see fresh baseline data.
+        // up front so the throttling logic below sees fresh baseline data.
         for entry in &self.ru_trackers {
             let mut guard = entry.lock().unwrap();
             guard.0.advance(now);
@@ -797,138 +823,27 @@ impl ResourceGroupManager {
         });
     }
 
-    fn adjust_group_scheduling(&self, cpu_score: f64) {
-        let throttle_threshold = self.config.value().fg_cpu_throttle_threshold;
-        let leeway_threshold = throttle_threshold * LEEWAY_THRESHOLD_RATIO;
-
-        // Engaged/not-engaged gate consumed by compute_read_pool_target_cpu,
-        // which only ever checks read_pool_cpu_pressure() > 0.0 — so this
-        // stores a plain 1.0/0.0 rather than a continuously-varying
-        // fraction. Reset to 0 whenever foreground is not under CPU
-        // pressure so a transient spike can't pin the read pool down
-        // indefinitely.
-        let engaged = cpu_score > throttle_threshold && self.is_bg_cpu_at_floor();
-        self.set_read_pool_cpu_pressure(if engaged { 1.0 } else { 0.0 });
-
-        // Comfortably idle (below leeway) → allow the read pool to scale its
-        // thread count back up toward its max on the next tick it checks in.
-        self.read_pool_scale_up_allowed
-            .store(cpu_score < leeway_threshold, Ordering::Relaxed);
-    }
-
-    /// Marks resource groups that have exceeded their own quota (current
-    /// rate over their historical baseline by more than `baseline_burst_pct`)
-    /// as over-quota (phase 1), deprioritizing them. A group within its
-    /// baseline is left untouched.
-    ///
-    /// This function only ever sets the over-quota flag, never clears it —
-    /// clearing is the caller's responsibility, once the unified read pool
-    /// has scaled back up to `core_thread_count`, via
-    /// [`Self::reset_group_priorities`]. Otherwise a sustained noisy group's
-    /// own `cached_historical_rate` eventually drifts up to absorb its
-    /// elevated usage, and comparing against it again here would silently
-    /// (and wrongly) release the group early.
-    pub fn deprioritize_over_quota_groups(&self) {
-        if !self.config.value().enable_fair_scheduling {
-            return;
-        }
-        let now = RuTracker::now_secs();
-        let burst_factor = 1.0 + self.config.value().baseline_burst_pct / 100.0;
-        for entry in &self.ru_trackers {
-            let group_bytes = entry.key().as_bytes();
-            let guard = entry.value().lock().unwrap();
-            let hist = guard.0.cached_historical_rate;
-            let current = guard.0.current_rate(now);
-            let over_quota = hist > 0.0 && current > hist * burst_factor;
-            drop(guard);
-            if over_quota {
-                for controller in self.registry.read().iter() {
-                    controller.set_group_phase(group_bytes, true);
-                }
-            }
-        }
-    }
-
-    /// Resets every tracked resource group's two-phase priority back to
-    /// phase 0 (not over-quota). Called once the unified read pool has
-    /// scaled back up to `core_thread_count`, releasing any groups that
-    /// [`Self::deprioritize_over_quota_groups`] had deprioritized.
-    pub fn reset_group_priorities(&self) {
-        for controller in self.registry.read().iter() {
-            controller.reset_all_group_phases();
-        }
-    }
-
-    /// Decides the unified read pool's target CPU (in cores) under
-    /// foreground pressure: once pressure engages, returns
-    /// `THROTTLE_DECREASE_FACTOR` below the currently measured
-    /// `read_pool_cpu`, instead of jumping straight to a computed value. The
-    /// ceiling is clamped to the historical-CPU floor so
-    /// it never drops below what the pool has sustained historically, and
-    /// resets to `f64::INFINITY` (no ceiling) as soon as pressure clears —
-    /// callers that `min()` this into their own ceiling get back exactly
-    /// that ceiling, unaffected. Also records `read_pool_cpu` into the
-    /// historical tracker so the floor stays current.
-    /// [`Self::read_pool_scale_up_allowed`] to know whether it's safe to do
-    /// so.
-    pub fn compute_read_pool_target_cpu(&self, read_pool_cpu: f64, interval_secs: f64) -> f64 {
-        let floor_cpu = self.read_pool_cpu_floor(read_pool_cpu, interval_secs);
-
-        metrics::READ_POOL_CPU_VEC
-            .with_label_values(&["historical"])
-            .set(floor_cpu * 100.0);
-        metrics::READ_POOL_CPU_VEC
-            .with_label_values(&["current"])
-            .set(read_pool_cpu * 100.0);
-
-        // The floor and metrics above are kept current either way, so
-        // re-enabling fair scheduling doesn't start from a stale floor; only
-        // the ceiling itself is gated.
-        if self.config.value().enable_fair_scheduling && self.read_pool_cpu_pressure() > 0.0 {
-            (read_pool_cpu * THROTTLE_DECREASE_FACTOR).max(floor_cpu)
-        } else {
-            f64::INFINITY
-        }
-    }
-
-    /// True when the system was comfortably idle (foreground CPU below the
-    /// leeway threshold) on the last `adjust_group_scheduling` tick, i.e. the
-    /// unified read pool may scale its thread count up toward its max.
-    pub fn read_pool_scale_up_allowed(&self) -> bool {
-        // Without fair scheduling there is nothing holding the pool back.
-        !self.config.value().enable_fair_scheduling
-            || self.read_pool_scale_up_allowed.load(Ordering::Relaxed)
-    }
-
     /// Returns the token-bucket debt delay for `group`, or `None` if no
     /// throttling is active.
     ///
-    /// Conditions for a non-zero delay (all must hold):
-    ///   1. `enable_read_admission_control` / `enable_write_admission_control`
-    ///      on
-    ///   2. Rate-limit is active (not NO_LIMIT sentinel)
-    ///   3. Tracker has warmed up (≥2 completed 1-min buckets)
-    ///   4. Token-bucket has accumulated debt (group exceeded its allowed rate)
+    /// Background requests consult their limiter directly. Foreground writes
+    /// consult historical CPU debt only when `enable_write_admission_control`
+    /// is enabled. Foreground reads always bypass this historical limiter.
     pub fn compute_admission_delay(
         &self,
         resource_limiter: &ResourceLimiter,
         is_read: bool,
     ) -> Option<Duration> {
-        // Always consume tokens so the token-bucket debt stays accurate
-        // for scheduling decisions. Only return the delay when admission
-        // control is enabled (or for background limiters, always).
-        let delay = resource_limiter.admission_delay(is_read);
-        if !resource_limiter.is_background() {
-            let config = self.config.value();
-            let ac_enabled = if is_read {
-                config.enable_read_admission_control
-            } else {
-                config.enable_write_admission_control
-            };
-            if !ac_enabled {
-                return None;
-            }
+        // Reads share accounting with writes, but their admission budget is
+        // owned by the read queue. Do not reset the shared limiter: writes can
+        // still be waiting on its debt. Background limiters remain independent
+        // and apply to both reads and writes.
+        if !resource_limiter.is_background()
+            && (is_read || !self.config.value().enable_write_admission_control)
+        {
+            return None;
         }
+        let delay = resource_limiter.admission_delay(is_read);
         if delay.is_zero() { None } else { Some(delay) }
     }
 
@@ -1109,6 +1024,24 @@ impl ResourceGroupManager {
     }
 }
 
+impl GroupProvider for ResourceGroupManager {
+    fn group(&self, name: &str) -> Arc<GroupPolicy> {
+        let groups = self.read_group_policies.read();
+        groups
+            .groups
+            .get(name)
+            .or_else(|| groups.groups.get(&name.to_ascii_lowercase()))
+            .unwrap_or_else(|| {
+                groups
+                    .groups
+                    .get(DEFAULT_RESOURCE_GROUP_NAME)
+                    .expect("default read resource group must exist")
+            })
+            .policy
+            .clone()
+    }
+}
+
 pub(crate) struct ResourceGroup {
     pub group: PbResourceGroup,
     pub limiter: Option<Arc<ResourceLimiter>>,
@@ -1186,10 +1119,6 @@ pub struct ResourceController {
     last_rest_vt_time: Cell<Instant>,
     // whether the settings are customized by user
     customized: AtomicBool,
-    // Shared config. Read on the hot path to check enable_fair_scheduling.
-    config: Arc<VersionTrack<Config>>,
-    // Whether any group is in phase 1, so a reset can skip the sweep.
-    any_group_deprioritized: AtomicBool,
 }
 
 // we are ensure to visit the `last_rest_vt_time` by only 1 thread so it's
@@ -1198,7 +1127,7 @@ unsafe impl Send for ResourceController {}
 unsafe impl Sync for ResourceController {}
 
 impl ResourceController {
-    fn new(name: String, is_read: bool, config: Arc<VersionTrack<Config>>) -> Self {
+    fn new(name: String, is_read: bool) -> Self {
         Self {
             name,
             is_read,
@@ -1207,17 +1136,11 @@ impl ResourceController {
             max_ru_quota: Mutex::new(DEFAULT_MAX_RU_QUOTA),
             last_rest_vt_time: Cell::new(Instant::now_coarse()),
             customized: AtomicBool::new(false),
-            config,
-            any_group_deprioritized: AtomicBool::new(false),
         }
     }
 
     pub fn new_for_test(name: String, is_read: bool) -> Self {
-        let controller = Self::new(
-            name,
-            is_read,
-            Arc::new(VersionTrack::new(Config::default())),
-        );
+        let controller = Self::new(name, is_read);
         // add the "default" resource group.
         controller.add_resource_group(
             DEFAULT_RESOURCE_GROUP_NAME.as_bytes().to_owned(),
@@ -1274,9 +1197,6 @@ impl ResourceController {
             weight,
             virtual_time: AtomicU64::new(self.last_min_vt.load(Ordering::Acquire)),
             vt_delta_for_get,
-            // New groups start in phase 0; ResourceGroupManager updates this
-            // each second once the RuTracker has enough history.
-            is_over_baseline: AtomicBool::new(false),
         };
 
         // maybe update existed group
@@ -1342,30 +1262,6 @@ impl ResourceController {
         self.resource_group(name).consume(resource)
     }
 
-    /// Updates the two-phase `is_over_baseline` flag for a single group.
-    /// Called by `ResourceGroupManager::adjust_group_scheduling`.
-    pub fn set_group_phase(&self, group: &[u8], over_baseline: bool) {
-        let consumptions = self.resource_consumptions.read();
-        if let Some(tracker) = consumptions.get(group) {
-            tracker
-                .is_over_baseline
-                .store(over_baseline, Ordering::Relaxed);
-            if over_baseline {
-                self.any_group_deprioritized.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Clears every group's phase-1 flag, or does nothing if none is set.
-    pub fn reset_all_group_phases(&self) {
-        if !self.any_group_deprioritized.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        for tracker in self.resource_consumptions.read().values() {
-            tracker.is_over_baseline.store(false, Ordering::Relaxed);
-        }
-    }
-
     pub fn update_min_virtual_time(&self) {
         let start = Instant::now_coarse();
         let mut min_vt = u64::MAX;
@@ -1418,8 +1314,7 @@ impl ResourceController {
 
     pub fn get_priority(&self, name: &[u8], pri: CommandPri) -> u64 {
         let level = Self::command_pri_to_level(pri);
-        self.resource_group(name)
-            .get_priority(level, None, true, self.is_two_phase_enabled())
+        self.resource_group(name).get_priority(level, None, true)
     }
 
     /// Returns the priority for the given task metadata without incrementing
@@ -1432,14 +1327,7 @@ impl ResourceController {
         } else {
             Some(metadata.override_priority())
         };
-        group.get_priority(level, override_priority, false, self.is_two_phase_enabled())
-    }
-
-    /// Returns true when fair two-phase scheduling is active (read controller
-    /// with enable_fair_scheduling enabled).
-    #[inline]
-    fn is_two_phase_enabled(&self) -> bool {
-        self.is_read && self.config.value().enable_fair_scheduling
+        group.get_priority(level, override_priority, false)
     }
 
     fn command_pri_to_level(pri: CommandPri) -> usize {
@@ -1454,7 +1342,7 @@ impl ResourceController {
 impl TaskPriorityProvider for ResourceController {
     fn priority_of(&self, extras: &yatp::queue::Extras) -> u64 {
         let metadata = TaskMetadata::from(extras.metadata());
-        let p = self.resource_group(metadata.group_name()).get_priority(
+        self.resource_group(metadata.group_name()).get_priority(
             extras.current_level() as usize,
             if metadata.override_priority() == 0 {
                 None
@@ -1462,16 +1350,7 @@ impl TaskPriorityProvider for ResourceController {
                 Some(metadata.override_priority())
             },
             true,
-            self.is_two_phase_enabled(),
-        );
-        if is_phase1(p)
-            && let Ok(name) = std::str::from_utf8(metadata.group_name())
-        {
-            TWO_PHASE_THROTTLED_REQUESTS
-                .with_label_values(&[name])
-                .inc();
-        }
-        p
+        )
     }
 }
 
@@ -1492,10 +1371,6 @@ struct GroupPriorityTracker {
     virtual_time: AtomicU64,
     // the constant delta value for each `get_priority` call,
     vt_delta_for_get: u64,
-    // Two-phase scheduling: true when this group's current-minute RU rate
-    // exceeds its historical baseline (set by ResourceGroupManager each second).
-    // Phase 1 tasks are deprioritised relative to phase-0 (within-baseline) tasks.
-    is_over_baseline: AtomicBool,
 }
 
 impl GroupPriorityTracker {
@@ -1504,18 +1379,7 @@ impl GroupPriorityTracker {
     /// When `advance_vt` is true, atomically increments the virtual time
     /// (used when actually scheduling a task). When false, reads virtual
     /// time without advancing it (used for priority comparison only).
-    ///
-    /// When `two_phase` is true and `is_over_baseline` is set, the task is
-    /// placed in phase 1 (deprioritised); otherwise it runs in phase 0.
-    /// `is_over_baseline` is updated each second by `ResourceGroupManager`
-    /// from real CPU µs tracked across reads and writes via `consume_penalty`.
-    fn get_priority(
-        &self,
-        level: usize,
-        override_priority: Option<u32>,
-        advance_vt: bool,
-        two_phase: bool,
-    ) -> u64 {
+    fn get_priority(&self, level: usize, override_priority: Option<u32>, advance_vt: bool) -> u64 {
         let task_extra_priority = TASK_EXTRA_FACTOR_BY_LEVEL[level] * 1000 * self.weight;
         let priority = override_priority.unwrap_or(self.group_priority);
         let vt_delta = self.vt_delta_for_get;
@@ -1526,13 +1390,7 @@ impl GroupPriorityTracker {
             self.virtual_time.load(Ordering::Relaxed) + vt_delta
         } + task_extra_priority;
 
-        if two_phase && self.is_over_baseline.load(Ordering::Relaxed) {
-            encode_two_phase_priority(priority, PriorityPhase::OverBaseline, vt)
-        } else if two_phase {
-            encode_two_phase_priority(priority, PriorityPhase::WithinBaseline, vt)
-        } else {
-            concat_priority_vt(priority, vt)
-        }
+        concat_priority_vt(priority, vt)
     }
 
     #[inline]
@@ -1567,10 +1425,7 @@ pub(crate) mod tests {
     use yatp::queue::Extras;
 
     use super::*;
-    use crate::{
-        resource_limiter::ResourceType::{Cpu, Io},
-        score::TARGET_CPU,
-    };
+    use crate::resource_limiter::ResourceType::{Cpu, Io};
 
     pub fn new_resource_group_ru(name: String, ru: u64, group_priority: u32) -> PbResourceGroup {
         new_resource_group(name, true, ru, ru, group_priority)
@@ -1777,6 +1632,92 @@ pub(crate) mod tests {
 
         resource_manager.remove_resource_group("test2");
         assert_eq!(resource_manager.get_group_count(), 2);
+    }
+
+    #[test]
+    fn test_read_group_policy_preserves_identity_until_deleted() {
+        let manager = ResourceGroupManager::default();
+        manager.add_resource_group(new_resource_group_ru("Tenant".into(), 100, LOW_PRIORITY));
+        let policy = manager.group("tenant");
+        assert_eq!(policy.name(), "tenant");
+        assert_eq!(policy.weight(), 100);
+        assert_eq!(policy.priority(), LOW_PRIORITY);
+        assert!(Arc::ptr_eq(&policy, &manager.group("TENANT")));
+
+        // A reload and a real quota/priority update both keep scheduler state
+        // attached to the same identity.
+        manager.add_resource_group(new_resource_group_ru("tenant".into(), 100, LOW_PRIORITY));
+        assert!(Arc::ptr_eq(&policy, &manager.group("tenant")));
+        manager.add_resource_group(new_resource_group_ru("tenant".into(), 400, HIGH_PRIORITY));
+        assert!(Arc::ptr_eq(&policy, &manager.group("tenant")));
+        assert_eq!(policy.weight(), 400);
+        assert_eq!(policy.priority(), HIGH_PRIORITY);
+
+        manager.remove_resource_group("tenant");
+        assert!(policy.is_retired());
+        assert!(Arc::ptr_eq(
+            &manager.group("tenant"),
+            &manager.group("default")
+        ));
+        manager.add_resource_group(new_resource_group_ru("tenant".into(), 200, 0));
+        let recreated = manager.group("tenant");
+        assert_ne!(policy.id(), recreated.id());
+        assert!(!recreated.is_retired());
+        assert_eq!(recreated.priority(), MEDIUM_PRIORITY);
+    }
+
+    #[test]
+    fn test_read_group_policy_special_weights_do_not_rescale_finite_groups() {
+        let manager = ResourceGroupManager::default();
+        let default = manager.group("default");
+        assert_eq!(default.weight(), DEFAULT_MAX_RU_QUOTA * 10);
+        manager.add_resource_group(new_resource_group_ru("unlimited".into(), 0, 0));
+        let unlimited = manager.group("unlimited");
+        manager.add_resource_group(new_resource_group_ru("small".into(), 10, 0));
+        let small = manager.group("small");
+        manager.add_resource_group(new_resource_group_ru("large".into(), 50_000, 0));
+        assert_eq!(default.weight(), 500_000);
+        assert_eq!(unlimited.weight(), 500_000);
+        assert_eq!(small.weight(), 10);
+
+        manager.remove_resource_group("large");
+        assert_eq!(default.weight(), DEFAULT_MAX_RU_QUOTA * 10);
+        assert_eq!(unlimited.weight(), DEFAULT_MAX_RU_QUOTA * 10);
+        assert_eq!(small.weight(), 10);
+
+        // An explicitly finite default quota is an ordinary weight. Raw-mode
+        // read policies use CPU quota rather than the write-IO quota.
+        manager.add_resource_group(new_resource_group_ru("default".into(), 100, 0));
+        manager.add_resource_group(new_resource_group("raw".into(), false, 20, 90_000, 0));
+        assert_eq!(default.weight(), 100);
+        assert_eq!(manager.group("raw").weight(), 20);
+        manager.add_resource_group(new_resource_group_ru("maximum".into(), u64::MAX, 0));
+        assert_eq!(manager.group("maximum").weight(), MAX_RU_QUOTA);
+        assert_eq!(unlimited.weight(), MAX_RU_QUOTA);
+        assert_eq!(small.weight(), 10);
+    }
+
+    #[test]
+    fn test_read_group_policy_retain_and_default_fallback() {
+        let manager = ResourceGroupManager::default();
+        let default = manager.group("default");
+        manager.add_resource_group(new_resource_group_ru("kept".into(), 100, 0));
+        manager.add_resource_group(new_resource_group_ru("removed".into(), 200, 0));
+        let kept = manager.group("kept");
+        let removed = manager.group("removed");
+        manager.retain(|name, _| name == "kept");
+        assert!(removed.is_retired());
+        assert!(!kept.is_retired());
+        assert!(Arc::ptr_eq(&default, &manager.group("missing")));
+        assert!(Arc::ptr_eq(&kept, &manager.group("kept")));
+
+        manager.add_resource_group(new_resource_group_ru("default".into(), 10, LOW_PRIORITY));
+        manager.remove_resource_group("default");
+        assert!(Arc::ptr_eq(&default, &manager.group("default")));
+        assert!(!default.is_retired());
+        assert_eq!(default.priority(), MEDIUM_PRIORITY);
+        assert_eq!(default.weight(), DEFAULT_MAX_RU_QUOTA * 10);
+        assert_eq!(manager.get_group_count(), 2);
     }
 
     #[test]
@@ -2072,459 +2013,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_encode_two_phase_priority_ordering() {
-        // Phase 0 (reservation) must sort before phase 1 (weight) for the
-        // same group_priority and a larger tag value.
-        let phase0 =
-            encode_two_phase_priority(MEDIUM_PRIORITY, PriorityPhase::WithinBaseline, 9999);
-        let phase1 = encode_two_phase_priority(MEDIUM_PRIORITY, PriorityPhase::OverBaseline, 1);
-        assert!(
-            phase0 < phase1,
-            "phase 0 must be higher priority than phase 1"
-        );
-
-        // Within phase 0, lower tag = higher priority.
-        let p0_low = encode_two_phase_priority(MEDIUM_PRIORITY, PriorityPhase::WithinBaseline, 100);
-        let p0_high =
-            encode_two_phase_priority(MEDIUM_PRIORITY, PriorityPhase::WithinBaseline, 200);
-        assert!(p0_low < p0_high);
-
-        // group_priority still dominates across phases.
-        let high_phase1 =
-            encode_two_phase_priority(HIGH_PRIORITY, PriorityPhase::OverBaseline, u64::MAX >> 8);
-        let low_phase0 = encode_two_phase_priority(LOW_PRIORITY, PriorityPhase::WithinBaseline, 0);
-        assert!(high_phase1 < low_phase0);
-    }
-
-    #[test]
-    fn test_deprioritize_over_quota_groups_ru_based() {
-        // Two-phase scheduling driven by real RU (CPU µs) from
-        // ResourceGroupManager: only groups that have exceeded their own
-        // historical quota are deprioritized, and only once the caller (the
-        // unified read pool) actually calls deprioritize_over_quota_groups.
-        let mut cfg = Config::default();
-        cfg.enable_fair_scheduling = true;
-        let mgr = ResourceGroupManager::new(cfg);
-
-        let steady = new_resource_group_ru("steady".into(), 1000, MEDIUM_PRIORITY);
-        let spike = new_resource_group_ru("spike".into(), 1000, MEDIUM_PRIORITY);
-        mgr.add_resource_group(steady);
-        mgr.add_resource_group(spike);
-
-        let ctl = mgr.derive_controller("read".into(), true);
-
-        // Warm up steady's RuTracker: 2 completed 30s buckets with consistent
-        // rate (current == historical → within baseline).
-        let t0 = RuTracker::now_secs();
-        {
-            let e = mgr
-                .ru_trackers
-                .entry("steady".to_owned())
-                .or_insert_with(|| {
-                    Mutex::new((
-                        RuTracker::new(t0, 30),
-                        Arc::new(ResourceLimiter::new(
-                            "".into(),
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            0,
-                            false,
-                        )),
-                    ))
-                });
-            let mut tr = e.lock().unwrap();
-            tr.0.record_at(6000, t0 + 15);
-            tr.0.record_at(0, t0 + 30); // close bucket 0: 6000 µs
-            tr.0.record_at(6000, t0 + 45);
-            tr.0.record_at(0, t0 + 60); // close bucket 1: 6000 µs → stable baseline
-        }
-        // Simulate a spike for "spike": current bucket >> historical.
-        {
-            let e = mgr
-                .ru_trackers
-                .entry("spike".to_owned())
-                .or_insert_with(|| {
-                    Mutex::new((
-                        RuTracker::new(t0, 30),
-                        Arc::new(ResourceLimiter::new(
-                            "".into(),
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            0,
-                            false,
-                        )),
-                    ))
-                });
-            let mut tr = e.lock().unwrap();
-            tr.0.record_at(3000, t0 + 30);
-            tr.0.record_at(0, t0 + 60); // close bucket [t0+30,t0+60): 3000µs baseline
-            tr.0.record_at(12000, t0 + 90); // current open bucket: 12000µs spike (left open)
-        }
-
-        // deprioritize_over_quota_groups reads `cached_historical_rate`,
-        // which is refreshed by `adjust_group_throttling` on
-        // resource_control's own tick (independent of, but still running
-        // alongside, the unified read pool's tick that calls
-        // deprioritize_over_quota_groups in production).
-        mgr.online_adjust_resource_quota(0.0);
-
-        // Before the caller ever deprioritizes, neither group is
-        // deprioritized, even though "spike" is already over its own
-        // baseline.
-        {
-            let groups = ctl.resource_consumptions.read();
-            assert!(
-                !groups
-                    .get(b"steady".as_ref())
-                    .unwrap()
-                    .is_over_baseline
-                    .load(Ordering::Relaxed),
-                "steady should be phase 0 before deprioritize_over_quota_groups runs"
-            );
-            assert!(
-                !groups
-                    .get(b"spike".as_ref())
-                    .unwrap()
-                    .is_over_baseline
-                    .load(Ordering::Relaxed),
-                "spike should be phase 0 before deprioritize_over_quota_groups runs"
-            );
-        }
-
-        // Only "spike" (over its own baseline) is deprioritized; "steady"
-        // (within baseline) is not.
-        mgr.deprioritize_over_quota_groups();
-        {
-            let groups = ctl.resource_consumptions.read();
-            assert!(
-                !groups
-                    .get(b"steady".as_ref())
-                    .unwrap()
-                    .is_over_baseline
-                    .load(Ordering::Relaxed),
-                "steady is within its baseline → should stay phase 0"
-            );
-            assert!(
-                groups
-                    .get(b"spike".as_ref())
-                    .unwrap()
-                    .is_over_baseline
-                    .load(Ordering::Relaxed),
-                "spike exceeded its baseline → should be phase 1"
-            );
-        }
-
-        // Phase ordering: steady (phase 0) must sort before spike (phase 1).
-        let groups = ctl.resource_consumptions.read();
-        let steady_pri = groups
-            .get(b"steady".as_ref())
-            .unwrap()
-            .get_priority(1, None, false, true);
-        let spike_pri = groups
-            .get(b"spike".as_ref())
-            .unwrap()
-            .get_priority(1, None, false, true);
-        assert!(!is_phase1(steady_pri), "steady should be phase 0");
-        assert!(is_phase1(spike_pri), "spike should be phase 1");
-        assert!(
-            steady_pri < spike_pri,
-            "phase 0 must schedule before phase 1"
-        );
-    }
-
-    #[test]
-    fn test_deprioritize_over_quota_groups_releases_when_inactive() {
-        // A group over its own quota stays deprioritized until the caller
-        // explicitly calls reset_group_priorities — e.g. once the unified
-        // read pool has scaled back up to core_thread_count.
-        // deprioritize/target-cpu are gated on fair scheduling.
-        let mut cfg = Config::default();
-        cfg.enable_fair_scheduling = true;
-        let mgr = ResourceGroupManager::new(cfg);
-
-        let spike = new_resource_group_ru("spike".into(), 1000, MEDIUM_PRIORITY);
-        mgr.add_resource_group(spike);
-        let ctl = mgr.derive_controller("read".into(), true);
-
-        let t0 = RuTracker::now_secs();
-        {
-            let e = mgr
-                .ru_trackers
-                .entry("spike".to_owned())
-                .or_insert_with(|| {
-                    Mutex::new((
-                        RuTracker::new(t0, 30),
-                        Arc::new(ResourceLimiter::new(
-                            "".into(),
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            0,
-                            false,
-                        )),
-                    ))
-                });
-            let mut tr = e.lock().unwrap();
-            tr.0.record_at(3000, t0 + 30);
-            tr.0.record_at(0, t0 + 60); // close bucket: 3000µs baseline
-            tr.0.record_at(12000, t0 + 90); // open bucket: 12000µs spike
-        }
-
-        // Refresh `cached_historical_rate`, normally done by
-        // `adjust_group_throttling` on resource_control's own tick.
-        mgr.online_adjust_resource_quota(0.0);
-
-        mgr.deprioritize_over_quota_groups();
-        assert!(
-            ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "spike exceeded its quota → should be phase 1"
-        );
-
-        // Caller (e.g. the unified read pool, once it has scaled back up to
-        // core_thread_count) calls reset_group_priorities: released
-        // immediately, even though spike's RU history hasn't changed.
-        mgr.reset_group_priorities();
-        assert!(
-            !ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "spike should be released once the caller resets priorities"
-        );
-    }
-
-    #[test]
-    fn test_deprioritize_over_quota_groups_does_not_self_release() {
-        // A sustained noisy group must stay deprioritized even once its own
-        // `cached_historical_rate` has drifted up to absorb its elevated
-        // usage (current no longer exceeds hist * burst_factor) — only
-        // reset_group_priorities is allowed to release it.
-        // deprioritize/target-cpu are gated on fair scheduling.
-        let mut cfg = Config::default();
-        cfg.enable_fair_scheduling = true;
-        let mgr = ResourceGroupManager::new(cfg);
-
-        let spike = new_resource_group_ru("spike".into(), 1000, MEDIUM_PRIORITY);
-        mgr.add_resource_group(spike);
-        let ctl = mgr.derive_controller("read".into(), true);
-
-        let t0 = RuTracker::now_secs();
-        {
-            let e = mgr
-                .ru_trackers
-                .entry("spike".to_owned())
-                .or_insert_with(|| {
-                    Mutex::new((
-                        RuTracker::new(t0, 30),
-                        Arc::new(ResourceLimiter::new(
-                            "".into(),
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            0,
-                            false,
-                        )),
-                    ))
-                });
-            let mut tr = e.lock().unwrap();
-            tr.0.record_at(3000, t0 + 30);
-            tr.0.record_at(0, t0 + 60); // close bucket: 3000µs baseline
-            tr.0.record_at(12000, t0 + 90); // open bucket: 12000µs spike
-        }
-        mgr.online_adjust_resource_quota(0.0);
-
-        mgr.deprioritize_over_quota_groups();
-        assert!(
-            ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "spike exceeded its quota → should be phase 1"
-        );
-
-        // Simulate the historical baseline catching up to the sustained
-        // elevated rate: overwrite cached_historical_rate directly to match
-        // current, as if enough windows had rolled over.
-        {
-            let e = mgr.ru_trackers.get("spike").unwrap();
-            let mut tr = e.lock().unwrap();
-            let now = RuTracker::now_secs();
-            tr.0.cached_historical_rate = tr.0.current_rate(now);
-        }
-
-        // Calling deprioritize_over_quota_groups again must not clear the
-        // flag just because current no longer exceeds the (now-caught-up)
-        // historical rate.
-        mgr.deprioritize_over_quota_groups();
-        assert!(
-            ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "spike must stay deprioritized even after its baseline catches up"
-        );
-
-        // Only an explicit reset releases it.
-        mgr.reset_group_priorities();
-        assert!(
-            !ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "spike should be released once the caller resets priorities"
-        );
-    }
-
-    #[test]
-    fn test_read_pool_scale_up_allowed_when_idle() {
-        let mgr = ResourceGroupManager::default();
-        // Drive cpu_score comfortably below the leeway threshold so
-        // adjust_group_scheduling marks the system as idle.
-        mgr.online_adjust_resource_quota(0.0);
-        assert!(mgr.read_pool_scale_up_allowed());
-
-        // With no pressure, compute_read_pool_target_cpu imposes no ceiling
-        // at all — scaling up is the unified read pool's own responsibility.
-        let target_cpu = mgr.compute_read_pool_target_cpu(2.0, 10.0);
-        assert_eq!(target_cpu, f64::INFINITY, "no pressure → no ceiling");
-    }
-
-    #[test]
-    fn test_compute_read_pool_target_cpu_holds_in_leeway_zone() {
-        // deprioritize/target-cpu are gated on fair scheduling.
-        let mut cfg = Config::default();
-        cfg.enable_fair_scheduling = true;
-        let mgr = ResourceGroupManager::new(cfg);
-        // cpu_score in the leeway zone: not engaged (bg not at floor), and
-        // above leeway_threshold, so neither scale-down nor scale-up fires.
-        mgr.online_adjust_resource_quota(65.0);
-        assert!(!mgr.read_pool_scale_up_allowed());
-        assert_eq!(mgr.read_pool_cpu_pressure(), 0.0);
-
-        let target_cpu = mgr.compute_read_pool_target_cpu(2.0, 10.0);
-        assert_eq!(
-            target_cpu,
-            f64::INFINITY,
-            "leeway zone should impose no ceiling"
-        );
-    }
-
-    #[test]
-    fn test_read_pool_entry_points_are_inert_without_fair_scheduling() {
-        // The read pool consults the manager unconditionally and relies on it
-        // to be a no-op while fair scheduling is off, so that gate lives here
-        // rather than at the call site.
-        let mgr = ResourceGroupManager::default();
-        assert!(!mgr.get_config().value().enable_fair_scheduling);
-
-        // Pressure is still tracked (adjust_group_scheduling is not gated)...
-        mgr.set_bg_cpu_at_floor(true);
-        mgr.online_adjust_resource_quota(TARGET_CPU);
-        assert_eq!(mgr.read_pool_cpu_pressure(), 1.0);
-
-        // ...but it must not turn into a ceiling, or hold back scale-out.
-        assert_eq!(
-            mgr.compute_read_pool_target_cpu(4.0, 10.0),
-            f64::INFINITY,
-            "no ceiling should be imposed while fair scheduling is off"
-        );
-        assert!(
-            mgr.read_pool_scale_up_allowed(),
-            "scale-out must not be blocked while fair scheduling is off"
-        );
-
-        // And a group that genuinely is over quota — so that dropping the gate
-        // really would deprioritize it — must be left alone.
-        let spike = new_resource_group_ru("spike".into(), 1000, MEDIUM_PRIORITY);
-        mgr.add_resource_group(spike);
-        let ctl = mgr.derive_controller("read".into(), true);
-        let t0 = RuTracker::now_secs();
-        {
-            let e = mgr
-                .ru_trackers
-                .entry("spike".to_owned())
-                .or_insert_with(|| {
-                    Mutex::new((
-                        RuTracker::new(t0, 30),
-                        Arc::new(ResourceLimiter::new(
-                            "".into(),
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            0,
-                            false,
-                        )),
-                    ))
-                });
-            let mut tr = e.lock().unwrap();
-            tr.0.record_at(3000, t0 + 30);
-            tr.0.record_at(0, t0 + 60); // close bucket: 3000µs baseline
-            tr.0.record_at(12000, t0 + 90); // open bucket: 12000µs spike
-        }
-        // Refresh cached_historical_rate, as resource_control's own tick would.
-        mgr.online_adjust_resource_quota(0.0);
-        mgr.deprioritize_over_quota_groups();
-        assert!(
-            !ctl.resource_consumptions
-                .read()
-                .get(b"spike".as_ref())
-                .unwrap()
-                .is_over_baseline
-                .load(Ordering::Relaxed),
-            "deprioritize must be a no-op while fair scheduling is off"
-        );
-    }
-
-    #[test]
-    fn test_compute_read_pool_target_cpu_scales_down_with_pressure() {
-        // deprioritize/target-cpu are gated on fair scheduling.
-        let mut cfg = Config::default();
-        cfg.enable_fair_scheduling = true;
-        let mgr = ResourceGroupManager::new(cfg);
-        // Seed a historical floor of 0 cores (cold tracker), then engage
-        // pressure (cpu_score == TARGET_CPU).
-        mgr.set_bg_cpu_at_floor(true);
-        mgr.online_adjust_resource_quota(TARGET_CPU);
-        assert_eq!(mgr.read_pool_cpu_pressure(), 1.0);
-
-        // Once engaged, the ceiling is 10% below the currently measured
-        // usage instead of collapsing straight to the (cold, i.e. 0)
-        // historical floor.
-        let target_cpu = mgr.compute_read_pool_target_cpu(4.0, 10.0);
-        assert!(
-            (target_cpu - 3.6).abs() < 1e-9,
-            "should be 10% below measured usage, got {target_cpu}"
-        );
-
-        // Stateless: calling again with the same measured usage gives the
-        // same result rather than ratcheting further down on its own.
-        let target_cpu = mgr.compute_read_pool_target_cpu(4.0, 10.0);
-        assert!(
-            (target_cpu - 3.6).abs() < 1e-9,
-            "repeated calls with unchanged usage should not ratchet further, got {target_cpu}"
-        );
-
-        // It does respond to a drop in measured usage (e.g. after the read
-        // pool itself cut its thread count in response to the previous
-        // tick's lower ceiling).
-        let target_cpu = mgr.compute_read_pool_target_cpu(3.6, 10.0);
-        assert!(
-            (target_cpu - 3.24).abs() < 1e-9,
-            "should track 10% below whatever usage is currently measured, got {target_cpu}"
-        );
-    }
-
-    #[test]
     fn test_adjust_group_throttling_decreases_by_10_percent_per_tick() {
         // fg_cpu_throttle_threshold=70, baseline_burst_pct=20 (defaults) ->
         // burst_factor = 1.2.
@@ -2740,9 +2228,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_admission_decision() {
+    fn test_read_admission_bypasses_foreground_history_but_not_background_limits() {
+        let manager = ResourceGroupManager::new(Config {
+            // Deprecated read settings must not reactivate historical delay.
+            enable_read_admission_control: true,
+            enable_fair_scheduling: true,
+            enable_write_admission_control: true,
+            ..Config::default()
+        });
+        let foreground = manager.get_foreground_group_limiter("default");
+        foreground.get_limiter(Cpu).set_rate_limit(1.0);
+        foreground.consume(Duration::from_secs(1), IoBytes::default(), false, true);
+
+        assert_eq!(
+            manager.admission_decision(true, &foreground),
+            AdmissionDecision::Allow
+        );
+        assert_eq!(foreground.get_limiter(Cpu).get_rate_limit(), 1.0);
+        assert!(matches!(
+            manager.admission_decision(false, &foreground),
+            AdmissionDecision::Delay(_)
+        ));
+        manager.release_delay_slot();
+
+        let background = manager.get_background_limiter();
+        background.get_limiter(Cpu).set_rate_limit(1.0);
+        background.consume(Duration::from_secs(1), IoBytes::default(), false, true);
+        assert!(matches!(
+            manager.admission_decision(true, &background),
+            AdmissionDecision::Delay(_)
+        ));
+        manager.release_delay_slot();
+        assert_eq!(manager.delayed_req_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_write_admission_decision() {
         let mut cfg = Config::default();
-        cfg.enable_read_admission_control = true;
+        cfg.enable_write_admission_control = true;
         cfg.admission_max_delayed_count = 10; // low limit to test rejection path
         let mgr = ResourceGroupManager::new(cfg);
         // Add a second group so the code path is active.
@@ -2757,14 +2280,14 @@ pub(crate) mod tests {
         // CPU below threshold → Allow (stays NO_LIMIT, no throttling).
         mgr.online_adjust_resource_quota(50.0); // below 80%
         assert_eq!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Allow
         );
 
         // CPU above threshold but no warmed-up tracker data → stays NO_LIMIT → Allow.
         mgr.online_adjust_resource_quota(90.0);
         assert_eq!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Allow
         );
 
@@ -2799,7 +2322,7 @@ pub(crate) mod tests {
         }
         // Debt is non-zero → Delay.
         assert!(matches!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Delay(_)
         ));
         // One slot acquired above; release it.
@@ -2808,13 +2331,13 @@ pub(crate) mod tests {
         // Exhaust the delay slots: acquire 10 (the configured max).
         for _ in 0..10 {
             assert!(matches!(
-                mgr.admission_decision(true, &spike_limiter),
+                mgr.admission_decision(false, &spike_limiter),
                 AdmissionDecision::Delay(_)
             ));
         }
         // 11th request: over the limit → Reject.
         assert_eq!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Reject
         );
         // Release all slots.
@@ -2825,7 +2348,7 @@ pub(crate) mod tests {
         // Drop CPU into leeway zone (72-80%): multiplier holds, still delays.
         mgr.online_adjust_resource_quota(75.0);
         assert!(matches!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Delay(_)
         ));
 
@@ -2836,48 +2359,8 @@ pub(crate) mod tests {
             mgr.online_adjust_resource_quota(50.0);
         }
         assert_eq!(
-            mgr.admission_decision(true, &spike_limiter),
+            mgr.admission_decision(false, &spike_limiter),
             AdmissionDecision::Allow
         );
-    }
-
-    #[test]
-    fn test_read_pool_cpu_floor_cold_tracker() {
-        let mgr = ResourceGroupManager::default();
-        let t0 = RuTracker::now_secs();
-        // Cold tracker → historical rate 0 → floor == 0.0 cores.
-        let floor = mgr.read_pool_cpu_floor_at(8.0, 10.0, t0);
-        assert_eq!(floor, 0.0);
-    }
-
-    #[test]
-    fn test_read_pool_cpu_floor_matches_historical_usage() {
-        // Small window (minimum 2 min = 4 buckets = 120s) so a handful of
-        // directly-seeded buckets fully cover it, giving an exact,
-        // non-ramping historical rate to assert against.
-        let cfg = Config {
-            historical_usage_window_mins: 2,
-            ..Default::default()
-        };
-        let mgr = ResourceGroupManager::new(cfg);
-        let t0 = mgr.start_secs;
-
-        // Seed 4 fully-completed 30s buckets at a sustained 4 cores of usage
-        // (4 cores * 30s * 1_000_000 us/s = 120_000_000 us per bucket). Each
-        // `record_at` call commits the *previous* call's contribution to a
-        // bucket, so a 5th call is needed to flush the 4th bucket closed.
-        {
-            let mut tracker = mgr.read_pool_cpu_tracker.lock().unwrap();
-            tracker.record_at(120_000_000, t0 + 30);
-            tracker.record_at(120_000_000, t0 + 60);
-            tracker.record_at(120_000_000, t0 + 90);
-            tracker.record_at(120_000_000, t0 + 120);
-            tracker.record_at(120_000_000, t0 + 150);
-        }
-        // system_uptime (150s) >= window_secs (120s) → historical_rate uses
-        // the full window as denominator: 480_000_000 / 120 = 4_000_000 us/s
-        // = 4 cores → floor = 4.0.
-        let floor = mgr.read_pool_cpu_floor_at(4.0, 30.0, t0 + 150);
-        assert_eq!(floor, 4.0);
     }
 }

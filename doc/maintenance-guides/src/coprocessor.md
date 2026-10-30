@@ -51,6 +51,14 @@ It is a read-heavy hot path and directly impacts query latency.
 - Online config is limited but real: `Endpoint::config_manager()` exposes
   `CopConfigManager`, which currently updates memory quota. If config scope
   expands, update lifecycle and operational sections in this guide together.
+- In an RC unified read pool, the unary response future and the entire
+  streaming response own a `ReadPoolCancellationGuard`. Dropping either
+  cancels its queued task without waiting for the CPU gate to reopen and
+  releases the task's live-capacity and memory permits. An IO-waiting inner
+  future can also be dropped without waiting for its external operation to
+  complete. A running poll sees cancellation when it returns; synchronous
+  execution is not forcibly interrupted. Non-RC pools keep their existing
+  detached behavior.
 
 ## Data Model And Metadata Contracts
 
@@ -102,6 +110,26 @@ It is a read-heavy hot path and directly impacts query latency.
 - enforce request deadlines, concurrency limits, and memory quotas
 - collect execution stats and produce coprocessor responses
 
+## Cooperative Read Scheduling
+
+- Boxed `BatchExecutor::next_batch` calls share a post-batch checkpoint in
+  `components/tidb_query_executors/src/interface.rs`. IndexLookup's concrete
+  table-scan child has the corresponding explicit checkpoint.
+- `RangesScanner` checks every 32 completed get/scan operations, including
+  empty ranges, when a poll-scoped cooperative context is installed. Other
+  callers retain the legacy scanner rescheduling policy.
+- The read-pool wrapper owns the poll time slice and CPU-budget context;
+  executor/scanner code owns safe-point placement. Never keep a poll guard
+  across an await. A synchronous storage operation or one compute batch can
+  still overrun the slice; this is not a hard execution-time bound.
+- Checkpoint changes must preserve streaming range accounting, row order and
+  execution/storage statistics, including empty ranges and resumed scans.
+- The fair wrapper checks CPU debt before every inner poll, including inline
+  repolls that bypass queue pop. Exhaustion must use a true scheduler yield.
+- Fair-task cancellation owns the inner future through a per-task
+  `FutureSlot`; cancel must not wait for a running poll or drop that future
+  while holding the scheduler or task-slot lock.
+
 ## Critical Invariants
 
 - Range bounds in `ReqContext` must stay aligned with the actual request.
@@ -109,6 +137,9 @@ It is a read-heavy hot path and directly impacts query latency.
   semantics.
 - Handler execution must respect request deadline and cancellation behavior.
 - Memory quota and concurrency limiters must remain cheap and correct.
+- Keep cancellation attached to the complete streaming response, not only the
+  first future that submits it. A guard dropped before admission must also
+  prevent a later-polled submission from creating a live task.
 - Request parsing and admission must stay aligned: when the dedicated setting
   is enabled, a request class that reports quota samples to the background
   quota limiter should use the dedicated background-limited semaphore instead

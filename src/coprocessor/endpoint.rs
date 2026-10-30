@@ -50,7 +50,7 @@ use crate::{
         cache::CachedRequestHandler, interceptors::*, metrics::*,
         statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
     },
-    read_pool::ReadPoolHandle,
+    read_pool::{ReadPoolCancellationGuard, ReadPoolHandle},
     server::Config,
     storage::{
         self, Engine, Snapshot, SnapshotStore,
@@ -698,7 +698,8 @@ impl<E: Engine> Endpoint<E> {
             resource_limiter,
         );
         async move {
-            spawn_fut_result?.await?;
+            let (spawn_fut, _cancel_guard) = spawn_fut_result?;
+            spawn_fut.await?;
             rx.map_err(|_| Error::MaxPendingTasksExceeded).await?
         }
     }
@@ -990,7 +991,7 @@ impl<E: Engine> Endpoint<E> {
             warn!("coprocessor stream send error"; "error" => %e);
         });
 
-        let spawn_fut = self.read_pool_spawn_with_memory_quota_check(
+        let (spawn_fut, cancel_guard) = self.read_pool_spawn_with_memory_quota_check(
             allocated_bytes,
             future,
             priority,
@@ -1008,7 +1009,13 @@ impl<E: Engine> Endpoint<E> {
                 .map(|_| Err(Error::MaxPendingTasksExceeded))
         }))
         .filter_map(futures::future::ready)
-        .chain(rx);
+        .chain(rx)
+        .map(move |response| {
+            // Keep cancellation attached to the entire response stream, not
+            // just the first item that drives admission and enqueueing.
+            let _guard = &cancel_guard;
+            response
+        });
         Ok(stream)
     }
 
@@ -1049,7 +1056,7 @@ impl<E: Engine> Endpoint<E> {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
-    ) -> Result<BoxFuture<'static, Result<()>>>
+    ) -> Result<(BoxFuture<'static, Result<()>>, ReadPoolCancellationGuard)>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -1060,11 +1067,19 @@ impl<E: Engine> Endpoint<E> {
             // Release quota after handle completed.
             drop(owned_quota);
         });
-        Ok(self
-            .read_pool
-            .spawn(fut, priority, task_id, metadata, resource_limiter)
-            .map(|r| r.map_err(|_| Error::MaxPendingTasksExceeded))
-            .boxed())
+        let (spawn, cancellation) = self.read_pool.spawn_with_cancellation(
+            fut,
+            priority,
+            task_id,
+            metadata,
+            resource_limiter,
+        );
+        Ok((
+            spawn
+                .map(|r| r.map_err(|_| Error::MaxPendingTasksExceeded))
+                .boxed(),
+            cancellation,
+        ))
     }
 }
 
@@ -1573,7 +1588,6 @@ mod tests {
             DummyReporter,
             engine,
             None,
-            None,
             CleanupMethod::InPlace,
             false,
         );
@@ -1587,6 +1601,87 @@ mod tests {
             None,
         );
         (endpoint, read_pool)
+    }
+
+    fn assert_queued_rc_request_cancellation(streaming: bool) {
+        let manager = Arc::new(ResourceGroupManager::default());
+        let pool = build_yatp_read_pool(
+            &UnifiedReadPoolConfig {
+                max_thread_count: 1,
+                max_tasks_per_worker: 4,
+                ..Default::default()
+            },
+            DummyReporter,
+            TestEngineBuilder::new().build().unwrap(),
+            Some(manager.clone()),
+            CleanupMethod::InPlace,
+            false,
+        );
+        let handle = pool.handle();
+        let queue = match &handle {
+            ReadPoolHandle::Yatp {
+                fair_queue: Some(queue),
+                ..
+            } => queue.clone(),
+            _ => unreachable!(),
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        block_on(handle.spawn(
+            async move {
+                started_tx.send(()).unwrap();
+                // Keep the worker occupied so cancellation must clean queued
+                // work directly. Bound shutdown even if an assertion fails.
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            },
+            CommandPri::Normal,
+            1,
+            TaskMetadata::default(),
+            None,
+        ))
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let endpoint = Endpoint::<RocksEngine>::new(
+            &Config::default(),
+            handle,
+            ConcurrencyManager::new_for_test(1.into()),
+            ResourceTagFactory::new_for_test(),
+            Arc::new(QuotaLimiter::default()),
+            Some(manager),
+        );
+        let handler_builder =
+            Box::new(|_, _: &_| Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
+        let parsed = ParseCopRequestResult::default_for_test(handler_builder);
+        let mut response: BoxFuture<'_, ()> = if streaming {
+            Box::pin(endpoint.handle_stream_request(parsed).unwrap())
+                .into_future()
+                .map(|_| ())
+                .boxed()
+        } else {
+            endpoint.handle_unary_request(parsed).map(|_| ()).boxed()
+        };
+        let first_poll = block_on(futures::future::poll_fn(|cx| {
+            std::task::Poll::Ready(response.as_mut().poll(cx))
+        }));
+        assert!(first_poll.is_pending());
+        assert_eq!(queue.snapshot().live_tasks, 2);
+        assert_eq!(queue.snapshot().queued, 1);
+        assert!(endpoint.memory_quota.in_use() > 0);
+        drop(response);
+        assert_eq!(queue.snapshot().live_tasks, 1);
+        assert_eq!(queue.snapshot().queued, 0);
+        assert_eq!(endpoint.memory_quota.in_use(), 0);
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn test_cancel_queued_rc_unary_request_releases_capacity_and_memory() {
+        assert_queued_rc_request_cancellation(false);
+    }
+
+    #[test]
+    fn test_cancel_queued_rc_stream_request_releases_capacity_and_memory() {
+        assert_queued_rc_request_cancellation(true);
     }
 
     #[test]
