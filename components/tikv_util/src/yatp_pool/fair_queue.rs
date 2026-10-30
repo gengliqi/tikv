@@ -34,6 +34,7 @@ use crate::{
 const VT_SCALE: u128 = 1 << 32;
 const REFILL_INTERVAL: Duration = Duration::from_millis(10);
 const BURST_WINDOW: Duration = Duration::from_millis(100);
+const PARALLELISM_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 type LaneId = (u32, u64);
 type ReadyKey = (Reverse<u32>, u128, u64);
 
@@ -102,6 +103,7 @@ pub struct FairQueueConfig {
 pub struct FairQueueStats {
     pub queued: usize,
     pub live_tasks: usize,
+    pub active_dispatches: usize,
     pub reserved_vt: u128,
     pub evicted_tasks: u64,
 }
@@ -153,6 +155,8 @@ struct State {
     sequence: u64,
     live: usize,
     max_tasks: usize,
+    parallelism: usize,
+    active_dispatches: usize,
     evicted: u64,
     closed: bool,
 }
@@ -303,6 +307,8 @@ impl FairQueue {
                     sequence: 0,
                     live: 0,
                     max_tasks: config.max_tasks,
+                    parallelism: usize::MAX,
+                    active_dispatches: 0,
                     evicted: 0,
                     closed: false,
                 }),
@@ -320,11 +326,20 @@ impl FairQueue {
         self.shared.state.lock().unwrap().max_tasks = limit;
     }
 
+    /// Limits simultaneous dispatches independently of YATP's physical worker
+    /// count. Lowering the limit lets existing dispatches finish before more
+    /// work starts; it never interrupts a poll or an inline repoll.
+    pub fn set_parallelism(&self, limit: usize) {
+        assert!(limit > 0);
+        self.shared.state.lock().unwrap().parallelism = limit;
+    }
+
     pub fn snapshot(&self) -> FairQueueStats {
         let s = self.shared.state.lock().unwrap();
         FairQueueStats {
             queued: s.locations.len(),
             live_tasks: s.live,
+            active_dispatches: s.active_dispatches,
             reserved_vt: s.lanes.values().map(|l| l.reserved).sum(),
             evicted_tasks: s.evicted,
         }
@@ -747,6 +762,14 @@ impl TaskQueue<TaskCell> for FairQueue {
                 self.shared.metrics.gate_pending.inc();
                 return PopResult::Pending { retry_at };
             }
+            if s.active_dispatches >= s.parallelism {
+                // Custom YATP queues can be polled by physical workers above
+                // core_thread_count. Keep queued work visible and arrange a
+                // retry even when completing a dispatch produces no new push.
+                return PopResult::Pending {
+                    retry_at: Instant::now() + PARALLELISM_RETRY_INTERVAL,
+                };
+            }
             let lane_id = (priority, group);
             let mut lane = s.take_lane(lane_id);
             let roll = rand::thread_rng().gen_range(0..100);
@@ -776,6 +799,7 @@ impl TaskQueue<TaskCell> for FairQueue {
             let reserved = weighted(self.shared.config.slice_precharge, weight);
             lane.reserved = lane.reserved.saturating_add(reserved);
             lane.in_flight += 1;
+            s.active_dispatches += 1;
             s.put_lane(lane_id, lane);
             s.advance_reference(priority);
             drop(s);
@@ -835,6 +859,9 @@ impl TaskQueue<TaskCell> for FairQueue {
     }
 
     fn has_ready_task(&self) -> bool {
+        // This is also FutureRunner's preemption hint. The current dispatch
+        // may occupy the last parallelism slot, but queued work must still be
+        // allowed to preempt it. Only pop() enforces the dispatch limit.
         self.shared
             .cpu
             .lock()
@@ -904,6 +931,10 @@ impl Drop for Dispatch {
     fn drop(&mut self) {
         self.settle();
         let mut s = self.shared.state.lock().unwrap();
+        s.active_dispatches = s
+            .active_dispatches
+            .checked_sub(1)
+            .expect("unbalanced fair dispatch");
         let mut lane = s.take_lane(self.lane);
         lane.in_flight -= 1;
         // The final completion must advance an empty domain as well. Never
@@ -1264,9 +1295,68 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_parallelism_tracks_lifetime_and_online_changes() {
+        let q = queue(&[10_000]);
+        q.set_parallelism(1);
+        let (first, cancel_first) = task(&q, 0, 0, None);
+        q.push(first);
+        q.push(task(&q, 0, 0, None).0);
+        q.push(task(&q, 0, 0, None).0);
+
+        let PopResult::Ready(first) = q.pop() else {
+            panic!("first dispatch should be available");
+        };
+        let first_guard = DispatchGuard::install();
+        assert_eq!(q.snapshot().active_dispatches, 1);
+        assert!(matches!(q.pop(), PopResult::Pending { .. }));
+        // A full parallelism limit must not suppress the preemption hint.
+        assert!(q.has_ready_task());
+
+        // Settling one poll and beginning an inline repoll retain the same
+        // dispatch slot. Only returning to the scheduler releases it.
+        ACTIVE.with(|active| {
+            let active = active.borrow();
+            active.as_ref().unwrap().borrow_mut().settle();
+        });
+        assert_eq!(q.snapshot().active_dispatches, 1);
+        ACTIVE.with(|active| {
+            let active = active.borrow();
+            active.as_ref().unwrap().borrow_mut().begin_poll();
+        });
+        assert!(matches!(q.pop(), PopResult::Pending { .. }));
+
+        q.set_parallelism(2);
+        let PopResult::Ready(second) = q.pop() else {
+            panic!("raising parallelism should permit another dispatch");
+        };
+        let second_guard = DispatchGuard::install();
+        assert_eq!(q.snapshot().active_dispatches, 2);
+        q.set_parallelism(1);
+        assert!(matches!(q.pop(), PopResult::Pending { .. }));
+        drop(second.task_cell);
+        drop(second_guard);
+        assert_eq!(q.snapshot().active_dispatches, 1);
+        assert!(matches!(q.pop(), PopResult::Pending { .. }));
+
+        // Cancellation may release live-task capacity, but cannot release the
+        // slot of a dispatch that still owns a task cell or a running poll.
+        cancel_first.cancel();
+        drop(first.task_cell);
+        assert_eq!(q.snapshot().active_dispatches, 1);
+        assert!(matches!(q.pop(), PopResult::Pending { .. }));
+        drop(first_guard);
+        assert_eq!(q.snapshot().active_dispatches, 0);
+        dispatch(&q, Duration::from_micros(1), false);
+        assert_eq!(q.snapshot().active_dispatches, 0);
+        assert_eq!(q.snapshot().live_tasks, 0);
+        assert!(matches!(q.pop(), PopResult::Empty));
+    }
+
+    #[test]
     fn concurrent_admit_dispatch_cancel_and_drain() {
         let q = queue(&[10_000; 16]);
         q.set_max_tasks(64);
+        q.set_parallelism(2);
         let barrier = Arc::new(Barrier::new(9));
         let finished = Arc::new(AtomicUsize::new(0));
         let mut threads = Vec::new();
@@ -1290,6 +1380,8 @@ mod tests {
                     }
                     if let PopResult::Ready(pop) = q.pop() {
                         let guard = DispatchGuard::install();
+                        assert!(q.snapshot().active_dispatches <= 2);
+                        thread::yield_now();
                         drop(pop.task_cell);
                         drop(guard);
                         finished.fetch_add(1, Ordering::Relaxed);
@@ -1305,6 +1397,7 @@ mod tests {
         let stats = q.snapshot();
         assert_eq!(stats.queued, 0);
         assert_eq!(stats.live_tasks, 0);
+        assert_eq!(stats.active_dispatches, 0);
         assert_eq!(stats.reserved_vt, 0);
         assert!(finished.load(Ordering::Relaxed) > 0);
     }
@@ -1428,6 +1521,7 @@ mod tests {
         }));
         assert!(result.is_err());
         drop(pop.task_cell);
+        assert_eq!(q.snapshot().active_dispatches, 0);
         assert_eq!(q.snapshot().reserved_vt, 0);
         assert_eq!(q.snapshot().live_tasks, 0);
         assert!(q.shared.state.lock().unwrap().records.is_empty());

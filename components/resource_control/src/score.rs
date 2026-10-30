@@ -25,6 +25,10 @@ use tikv_util::{
     time::Instant,
 };
 
+/// A `cpu_score` above any sane threshold, for tests that engage pressure.
+#[cfg(test)]
+pub(crate) const PEAK_CPU_PCT: f64 = 90.0;
+
 /// Shortest interval [`ThreadGroupCpuTracker::measure_cpu_cores`] will measure
 /// over; below this the tick count is too small to be meaningful and the cached
 /// value is returned instead. Mirrors

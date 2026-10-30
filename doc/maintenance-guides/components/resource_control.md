@@ -173,6 +173,16 @@ Read admission and accounting:
   configured `max-thread-count`: `auto-adjust-pool-size` and `cpu-threshold`
   do not control that pool, and `read-cpu-ratio` owns its CPU budget. Non-RC
   pools retain their existing CPU-threshold and autoscaling behavior.
+- YATP prestarts surplus physical workers for online growth, and its Custom
+  queue can be popped before those workers park. The fair queue therefore
+  bounds active dispatches under its existing scheduler lock. The bound is
+  installed before workers start and updated by `scale_pool_size`. Only
+  `Dispatch::drop` releases a slot; inline repolls and cancellation of a running
+  task do not release it early. Lowering the bound lets current dispatches
+  finish but blocks new ones until below the new limit. A full bound returns
+  `Pending` with a 1ms retry, while `has_ready_task` still signals queued work
+  to the current runner for preemption. Online growth retains YATP's wake
+  behavior: new submissions or worker turnover activate the additional threads.
 - A ready `BTreeSet` indexes current committed-plus-reserved VT per nonempty
   priority lane. Selection and the initial precharge share one scheduler
   critical section. A separate committed index advances each priority's
@@ -195,6 +205,171 @@ future destructors under the scheduler lock.
 Implementation and validation details are in
 [`resource-control-read-pool.md`](../../design/resource-control-read-pool.md).
 
+## Noisy-Group Selection
+
+Detection runs once per quota-worker tick in `online_adjust_resource_quota_at`,
+before `adjust_group_throttling`. The verdict is a set of group names used by
+foreground write admission's per-group rate limit: -15% per engaged tick and
++10% per tick on recovery. A finite write limiter is the only held state;
+there is no read-scheduler Phase actuator or pool-size recovery handshake.
+The quota worker uses `normal-control-interval` (10s by default) while quiet
+and `overloaded-control-interval` (5s) while loaded.
+
+`reports_noisy_groups` follows only `enable-write-admission-control`.
+`noisy_group_names` returns an empty list when this gate is disabled, so the
+client can clear an earlier verdict. The deprecated read flags do not enable
+reporting. These names retain master's attribution over shared read/write
+usage; they are not proof of write-only consumption, nor a verdict from the
+new read fair queue. Splitting read and write attribution requires a separate
+accounting change. Read-pool busy-threshold decisions must use the actual
+queue contract rather than these history-based names.
+
+The fair read queue skips the client's whole-pool FIFO `busy_threshold`
+estimate even when no group is classified as noisy: another group's backlog
+does not predict this request's position under weighted RG scheduling and
+MLFQ. Hard live-task caps, background admission, and the global CPU gate still
+apply. Non-RC pools retain the estimate-based rejection. The aggregate wait
+gauge remains available as a backlog indicator, not a per-request latency
+prediction for the fair queue.
+
+`select_noisy_groups(cpu_score)`:
+
+- `survey_groups` makes one pass over the per-group trackers. A group is a
+  candidate when it is above its own baseline by more than `baseline_burst_pct`
+  (default 20%) and has been for `MIN_ENGAGE_TICKS` ticks.
+- Candidates rank by *excess* (rate above baseline) — what identifies the group
+  that changed, not the group that is merely large. Ties break on name, since
+  candidates arrive in `DashMap` order and would otherwise vary per restart.
+- `take_biggest_movers` takes from the top until credited relief covers
+  `total_usage * (cpu_score - fg_cpu_throttle_threshold) / 100` — a tick barely
+  over the threshold names only the worst offender, a saturated one reaches
+  further down. Candidates below `TAIL_EXCESS_RATIO` (10%) of the top excess
+  are spared, and the top candidate is always taken unless something is
+  already held.
+- Groups a finite write limiter is already holding stay named — they sit inside their gate
+  only because they are held there — and their whole share is credited against
+  the target rather than inflating one the innocent tail would be taken to
+  meet.
+
+Baselines are *quiet-window* frozen, not rolling: a group's baseline updates
+after a full window of quiet samples (CPU below 85% of the foreground
+threshold), so the reference does not drift upward during an overload.
+Recovery starts below 90% of that threshold, and the cached verdict clears
+once pressure has cleared and no finite foreground write limiter remains.
+
+What a *missing* baseline means is the operator's call, and it is the only
+thing separating the first two policies below. `candidate_baseline` is the sole
+interpreter of `noisy_detection`: it answers both "is this group a candidate"
+and "what baseline is its excess charged against". `refresh_trackers` gathers
+statistics only and never sees the policy — it advances two policy-free
+counters, `over_baseline_ticks` and `active_ticks`, and each policy reads
+whichever one it rests on. A new policy is therefore one arm in one `match`.
+
+`noisy_detection` (`NoisyDetection`, default `baseline-fallback-current-usage`)
+picks the ranking key:
+
+- `baseline` — furthest above its own quiet baseline. Names the group that
+  changed. A group whose quiet window has not elapsed has no baseline and is
+  never a candidate, so an overload driven entirely by a group with no history
+  goes unattributed and nothing is throttled.
+- `baseline-fallback-current-usage` — as `baseline`, except a missing baseline
+  reads as zero, so every bit of such a group's usage counts as excess and it
+  ranks on current usage. Keeps a node with no history protected, which is why
+  it is the default: excluding a fresh group hid the culprit during its ramp.
+- `current-usage` — largest consumer right now, no history. Nothing to go
+  stale, but the legitimately largest tenant is blamed every time.
+
+Baselines are recorded under every policy, including `current-usage`, so a
+switch takes effect on the next tick rather than waiting a quiet window for
+history to reappear.
+
+`tikv_resource_control_effective_noisy_detection{policy=...}` reads 1 for the
+policy in force, which is how you confirm an online change landed. It is the
+configured policy: the fallback is per group, not node-wide, and a group
+currently falling back is the one whose
+`tikv_resource_control_group_ru_baseline` reads 0.
+
+Accounting knob: `request_base_cost_micros` (default 40µs) is a fixed arrival
+charge, added to a group's foreground tracker once per request at the gRPC
+handler entry — before admission control, so a rejected request still pays, and
+skipped for background-routed requests, which their background limiter meters.
+It is cached outside the config lock and re-read by `refresh_cached_config` on
+each control tick, so a config change lands within one tick. `RuTrackerSlot`
+shares the open-bucket atomic counter to avoid its per-group mutex on ordinary
+recording. This ledger contains synchronous poll wall time and the fixed
+arrival charge, not measured thread CPU. The arrival charge does not add
+limiter debt and does not charge the new read scheduler's wall-VT or CPU gate.
+
+## Background Egress Limit (`bg-egress-limit`)
+
+`resource-control.bg-egress-limit` caps the response bytes that background
+reads send out per node. It is an `egress_limiter` token bucket on the shared
+background `ResourceLimiter`, next to its CPU, IO and write-IO limiters.
+`worker.rs::adjust_egress_limit` sets its rate from the config each tick; the
+rate is absolute and does not scale with utilization, and 0 means unlimited.
+
+How it is enforced:
+
+- Charged where the response is built: callers pass the same bytes they report
+  through `record_network_out_bytes` to
+  `resource_limiter.rs::update_background_egress` (unary coprocessor in
+  `src/coprocessor/endpoint.rs`, and the transactional KV reads in
+  `src/storage/mod.rs`). Charging only builds debt; it never sleeps.
+- A coprocessor request with batch tasks is charged once, for the data its
+  response returns, when that response is committed: in
+  `batch.rs::account_returned_response` when results are merged, and in
+  `Endpoint::parse_and_handle_unary_request` when they are not. Its top task and
+  children are not charged as they finish, so a later task of the same request
+  never waits at admission for the request's own buffered output, and a request
+  that times out is not charged for data it never returns.
+- Repaid only at background read admission: `ResourceLimiter::admission_delay`
+  adds the egress debt when `is_read` and the limiter is background, and
+  `src/read_pool.rs::admission_and_enqueue` waits for it before the yatp
+  enqueue.
+- The admission wait, for egress as for CPU/IO debt, is bounded by the request
+  deadline for coprocessor requests (`src/coprocessor/endpoint.rs`) and
+  transactional KV reads (the `admission_deadline` of
+  `ReadPoolHandle::spawn_handle`). A read whose deadline passes is dropped
+  before it enters the pool, releasing its admission delay slot, and fails
+  with `DeadlineExceeded`. Raw KV reads are not bounded.
+
+Invariant: egress debt stays out of `ResourceLimiter::consume`. Backup and
+ImportSST pay CPU/IO debt through `LimitedFuture` (which calls `consume`), and
+background writes are admitted with `is_read = false`, so none of them wait for
+egress debt they do not create. Adding egress to `consume` or to write
+admission would make a background scan throttle them.
+
+Scope and known gaps:
+
+- A request is background only if its task type is listed in its group's
+  `BACKGROUND=(TASK_TYPES=...)`, or in the `default` group's when its group has
+  no background settings. Otherwise nothing is charged or paced.
+- Streaming coprocessor and raw KV responses are not charged, though those
+  reads still wait at admission. Streaming bytes are counted separately.
+- Point gets merged from `BatchCommands` (`batch_get_command`) use the limiter
+  of the first get for the whole batch (#20112).
+- Reads on a legacy (non-unified) read pool are charged but never wait, since
+  that pool has no admission gate; `TikvConfig::validate` warns about it.
+- It is a soft limit. Admission only sees debt that is already charged and a
+  delayed read does not check again, so the short-term excess is about one
+  second's worth of the rate plus the responses of the background reads in
+  flight.
+
+Signals:
+
+- `tikv_resource_control_background_resource_consumption{type="egress"}`:
+  charged bytes, counted even when the limit is 0.
+- `tikv_resource_control_background_egress_wait_duration_seconds`: egress debt
+  background reads waited for at admission, i.e. whether the limit binds.
+- `tikv_resource_control_background_egress_uncharged_bytes_total`: background
+  streaming bytes the limit does not cover.
+- `tikv_resource_control_background_quota_limiter{type="egress"}` is only the
+  configured rate, not evidence that it binds.
+- `worker.rs::check_egress_limit_active` warns once when the limit is set and
+  no group has any background task type. It stays quiet when some group has
+  one, even if the group serving a job lacks its task type; zero egress
+  consumption during a background job is the sign of that.
+
 ## Critical Invariants
 
 - Group configuration must converge safely when PD watch streams restart or the
@@ -206,12 +381,18 @@ Implementation and validation details are in
   value.
 - Background-group reporting must not silently double-count or regress versioned
   limiter statistics.
+- Background egress debt is repaid only at background read admission, never in
+  `ResourceLimiter::consume` or write admission (see "Background Egress Limit").
 
 ## Observability And Operational Signals
 
 - limiter and scheduling metrics in `metrics.rs`
 - logs on PD watch/reload failures, compaction restarts, and config loads
 - RU reporting cadence and background-group behavior
+- background egress consumption, wait, and uncharged-bytes metrics (see
+  "Background Egress Limit")
+- noisy-detection policy, live usage, quiet baseline, and finite write-limit
+  gauges; these describe the historical write policy independently of read VT
 - The process-level `tikv_yatp_fair_pool_*` metrics in
   `tikv_util/src/yatp_pool/metrics.rs` report actual poll CPU/wall time, poll
   duration, CPU-gate Pending attempts, global/group capacity rejections, and
@@ -251,6 +432,13 @@ Start triage with:
   `src/storage`
 - Background RU reporting changes:
   inspect `worker.rs`, limiter statistics, and PD-facing reporting contracts
+- Background egress changes:
+  inspect `resource_limiter.rs`, `worker.rs`, read admission, and response
+  accounting in coprocessor/storage; never move this debt into write admission
+- Noisy feedback or arrival-accounting changes:
+  inspect `resource_group.rs`, `config.rs`, RPC handler calls to
+  `consume_penalty`, and client health reporting; deprecated read flags must
+  remain inert
 - Config knob changes:
   inspect `config.rs`, runtime update sites, metrics, and reviewer-facing docs
 - Pressure-scoring changes (`score.rs`):
@@ -283,7 +471,8 @@ Start triage with:
 - Metrics live under `metrics.rs` and within the group/limiter code.
 - Many unit tests are inline in:
   `future.rs`, `service.rs`, `worker.rs`, `channel.rs`, `resource_limiter.rs`,
-  and `score.rs`.
+  `score.rs`, and — for detection, throttling and the read-pool contract —
+  `resource_group.rs`.
 - Changes should usually be validated together with the call sites in
   `src/server`, `src/storage`, `components/batch-system`, and (for
   read-provider / admission changes) `src/read_pool.rs`.

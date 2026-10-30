@@ -24,7 +24,9 @@ use raftstore::{
     coprocessor::{Config as CopConfig, ConsistencyCheckMethod},
     store::Config as RaftstoreConfig,
 };
-use resource_control::config::{Config as ResourceControlConfig, PriorityCtlStrategy};
+use resource_control::config::{
+    Config as ResourceControlConfig, NoisyDetection, PriorityCtlStrategy,
+};
 use security::SecurityConfig;
 use slog::Level;
 use test_util::assert_eq_debug;
@@ -858,6 +860,7 @@ fn test_serde_custom_tikv_config() {
         stream_channel_window: 123,
         import_mode_timeout: ReadableDuration::secs(1453),
         memory_use_ratio: 0.3,
+        use_direct_io_for_ingest: true,
     };
     value.panic_when_unexpected_key_or_data = true;
     value.gc = GcConfig {
@@ -873,6 +876,7 @@ fn test_serde_custom_tikv_config() {
             tombstones_percent_threshold: 30,
             redundant_rows_threshold: 50000,
             redundant_rows_percent_threshold: 20,
+            redundant_bytes_threshold: ReadableSize::mb(129),
             bottommost_level_force: false,
             mvcc_read_aware_enabled: true,
             mvcc_scan_threshold: 10000,
@@ -922,17 +926,22 @@ fn test_serde_custom_tikv_config() {
     value.resource_control = ResourceControlConfig {
         enabled: false,
         priority_ctl_strategy: PriorityCtlStrategy::Aggressive,
+        noisy_detection: NoisyDetection::CurrentUsage,
         bg_cpu_throttle_threshold: 60.0,
         fg_cpu_throttle_threshold: 70.0,
         bg_compaction_pressure_threshold: 70.0,
         bg_write_io_ceiling: ReadableSize::gb(100),
         bg_write_io_floor: ReadableSize::mb(10),
+        bg_egress_limit: ReadableSize::mb(50),
         enable_fair_scheduling: false,
         enable_read_admission_control: false,
         enable_write_admission_control: false,
         historical_usage_window_mins: 15,
         baseline_burst_pct: 20.0,
         admission_max_delayed_count: 10_000,
+        request_base_cost_micros: 40,
+        normal_control_interval: ReadableDuration::secs(20),
+        overloaded_control_interval: ReadableDuration::secs(3),
     };
 
     let custom = read_file_in_project_dir("integrations/config/test-custom.toml");
@@ -949,6 +958,7 @@ fn test_serde_custom_tikv_config() {
 fn test_serde_default_config() {
     let cfg: TikvConfig = toml::from_str("").unwrap();
     assert_eq!(cfg, TikvConfig::default());
+    assert_eq!(cfg.security.redact_info_log, log_wrappers::RedactOption::On);
 
     let content = read_file_in_project_dir("integrations/config/test-default.toml");
     let cfg: TikvConfig = toml::from_str(&content).unwrap();

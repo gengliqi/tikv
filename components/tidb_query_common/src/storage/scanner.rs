@@ -169,6 +169,8 @@ impl<T: Storage, F: KvFormat> RangesScanner<T, F> {
                 if let Some(rows) = self.scanned_rows_per_range.last_mut() {
                     *rows += 1;
                 }
+            } else {
+                self.ranges_iter.notify_drained();
             }
             if cooperative_safe_points_active() {
                 // Count completed storage operations, including empty ranges.
@@ -178,7 +180,8 @@ impl<T: Storage, F: KvFormat> RangesScanner<T, F> {
                     self.keys_since_checkpoint = 0;
                     cooperative_checkpoint().await;
                 }
-            } else if some_row.is_some() {
+            } else {
+                // Empty ranges consume the legacy scheduling budget too.
                 self.rescheduler.check_reschedule(force_check).await;
             }
             if let Some(row) = some_row {
@@ -186,9 +189,6 @@ impl<T: Storage, F: KvFormat> RangesScanner<T, F> {
                 let kv = F::make_kv_pair((row.key, row.value, row.commit_ts.map(|n| n.into())))
                     .map_err(|e| StorageError(anyhow::Error::from(e)))?;
                 return Ok(Some(kv));
-            } else {
-                // No more row in the range.
-                self.ranges_iter.notify_drained();
             }
         }
     }
@@ -388,6 +388,84 @@ mod tests {
         assert_eq!(scanner.peek_scanned_rows_sum(), 1);
         assert_eq!(scanner.scanned_rows_per_range.len(), CHECK_KEYS + 1);
         assert!(block_on(scanner.next()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cooperative_empty_ranges_do_not_use_legacy_budget() {
+        use std::{
+            future::Future,
+            task::{Context, Poll},
+            time::Instant as StdInstant,
+        };
+
+        use tikv_util::task_reschedule::PollRescheduleContextGuard;
+
+        let mut scanner = RangesScanner::<_, ApiV1>::new(RangesScannerOptions {
+            storage: create_storage(),
+            ranges: vec![
+                PointRange::from("missing").into(),
+                PointRange::from("foo").into(),
+            ],
+            scan_backward_in_range: false,
+            is_key_only: false,
+            is_scanned_range_aware: true,
+            load_commit_ts: false,
+        });
+        scanner.rescheduler.prev_start = Instant::now() - Duration::from_millis(10);
+        let mut next = Box::pin(scanner.next());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // An expired legacy timer must not override the active cooperative
+        // budget, even when a point range is empty.
+        let _guard = PollRescheduleContextGuard::new(StdInstant::now(), Duration::from_secs(60));
+        match next.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(Some(row))) => {
+                assert_eq!(row, (b"foo".to_vec(), b"1".to_vec(), None));
+            }
+            other => panic!("unexpected scan result: {other:?}"),
+        }
+        drop(next);
+        assert_eq!(scanner.scanned_rows_per_range, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_empty_ranges_yield() {
+        use std::{future::Future, task::Context};
+
+        use futures::{pin_mut, task::noop_waker};
+
+        // Cover point lookups and interval scans in both directions. The
+        // scheduling assertion uses an expired budget rather than slow storage.
+        for ranges in [
+            vec![PointRange::from("a").into(), PointRange::from("c").into()],
+            vec![
+                IntervalRange::from(("a", "b")).into(),
+                IntervalRange::from(("c", "d")).into(),
+            ],
+        ] {
+            for scan_backward_in_range in [false, true] {
+                let mut scanner = RangesScanner::<_, ApiV1>::new(RangesScannerOptions {
+                    storage: FixtureStorage::from(Vec::<(Vec<u8>, Vec<u8>)>::new()),
+                    ranges: ranges.clone(),
+                    scan_backward_in_range,
+                    is_key_only: false,
+                    is_scanned_range_aware: true,
+                    load_commit_ts: false,
+                });
+                scanner.rescheduler.prev_start = Instant::now() - Duration::from_millis(10);
+                {
+                    let next = scanner.next();
+                    pin_mut!(next);
+                    let waker = noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(next.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(block_on(next).unwrap(), None);
+                }
+                let mut scanned_rows = Vec::new();
+                scanner.collect_scanned_rows_per_range(&mut scanned_rows);
+                assert_eq!(scanned_rows, vec![0, 0]);
+                assert_eq!(block_on(scanner.next()).unwrap(), None);
+            }
+        }
     }
 
     #[test]

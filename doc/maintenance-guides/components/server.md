@@ -32,13 +32,15 @@ read as lifecycle glue, not business logic.
 
 Concrete startup checkpoints:
 
-1. `TikvServerCore::init_config`
-2. `check_conflict_addr`
-3. `init_fs`
-4. engine and utility initialization
-5. service registration and runtime start
-6. status server start
-7. service-event loop
+1. `TikvServerCore::init_config`, including the advisory advertised-address
+   probe after config validation and fallback expansion
+2. snapshot-recovery engine access and PD bootstrap, when recovery is enabled
+3. `check_conflict_addr`
+4. `init_fs`
+5. regular engine and utility initialization
+6. service registration and runtime start
+7. status server start
+8. service-event loop
 
 ## Data Model And Metadata Contracts
 
@@ -103,17 +105,41 @@ High-risk config contracts:
 - Startup ordering matters. Many subsystems assume other pieces already exist.
 - Shutdown ordering matters. Workers and services must stop after their
   dependents drain.
+- In `server.rs`, `TikvServer::engines` must stay populated until `stop()`.
+  `prepare_stop` uses it to disable manual compactions through the KV engine
+  before workers are joined; without that, shutdown waits for an in-flight
+  manual compaction that the KV engine would otherwise cancel. Threads that
+  need the engines, such as the signal handler, get a clone. `server2.rs`
+  (raftstore-v2) has no equivalent cancellation and needs separate handling.
 - Config validation must remain backward-compatible with persisted data layout
   and engine selection.
+- The effective advertised store address, and the status address when enabled,
+  must be probed after config validation but before any path opens engines or
+  publishes store metadata to PD. Probe failures are advisory so deployments
+  using NAT, containers, Services, or load balancers remain compatible.
+- Numeric advertised addresses use a synchronous fast path. Hostname resolution
+  runs on TiKV's standard thread wrapper with a bounded per-endpoint wait; the
+  wait timeout cannot cancel libc, NSS, or system DNS resolution, so at most two
+  one-shot resolver threads may outlive the startup wait.
+- Forwarded third-party logs must not expose credentials. TiKV filters
+  Debug/Trace records from the affected legacy `azure_core` transport until
+  an SDK upgrade, patch, or logging fix replaces that temporary mitigation.
 - Service pause/resume must stay consistent with the small control plane in
   `components/service`.
 
 ## Observability And Operational Signals
 
+- `setup.rs` applies `security.redact-info-log` to log wrappers and protobuf
+  formatting. The default is `on`; explicit `false` / `"off"` disables redaction,
+  and `"marker"` preserves user data inside redaction markers. Online changes
+  are applied by `SecurityConfigManager` in `components/security`.
 - startup and shutdown logs
 - config persistence and validation output
 - disk-space reservation and lock-file failures
 - memory/high-water signals registered during startup
+- `tikv_server_advertise_addr_probe_failure_total`, labeled by endpoint and
+  bounded failure reason; startup warnings remain the primary signal when the
+  advertised status endpoint itself is unreachable
 
 Start triage with:
 
@@ -151,6 +177,10 @@ Start triage with:
   reverse?
 - Does it alter graceful shutdown semantics?
 - Does it add expensive initialization to the critical startup path?
+- Does every store-bootstrap path, including snapshot recovery, run the
+  advertised-address probe before engine access and PD metadata publication?
+- Does a change to third-party log forwarding expose credentials or remove
+  diagnostics needed for failure triage?
 
 ## Observability And Tests
 

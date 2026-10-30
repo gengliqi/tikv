@@ -20,12 +20,14 @@ use kvproto::{errorpb, kvrpcpb::CommandPri};
 use online_config::{ConfigChange, ConfigManager, ConfigValue, Result as CfgResult};
 use prometheus::{Histogram, IntCounter, IntGauge, core::Metric};
 use resource_control::{
-    AdmissionDecision, READ_POOL_CPU_VEC, ResourceGroupManager, ResourceLimiter, TaskPriority,
-    with_resource_limiter,
+    AdmissionDecision, CONTROL_TICK, LEEWAY_FACTOR, LEEWAY_FRACTION, READ_POOL_CPU_VEC,
+    ResourceGroupManager, ResourceLimiter, TaskPriority, with_resource_limiter,
 };
 use thiserror::Error;
 use tikv_util::{
-    resource_control::TaskMetadata,
+    deadline::Deadline,
+    future::async_timeout,
+    resource_control::{TaskMetadata, group_label},
     sys::{SysQuota, cpu_time::ProcessStat},
     thread_name_prefix::{UNIFIED_READ_POOL_THREAD, matches_thread_name_prefix},
     time::Instant,
@@ -35,7 +37,7 @@ use tikv_util::{
         fair_queue::{FairCancellation, FairQueue, FairQueueConfig},
     },
 };
-use tracker::TlsTrackedFuture;
+use tracker::{TlsTrackedFuture, get_tls_tracker_token, set_tls_tracker_token};
 use yatp::{
     metrics::MULTILEVEL_LEVEL_ELAPSED, pool::Remote, queue::Extras, task::future::TaskCell,
 };
@@ -46,8 +48,6 @@ use crate::{
     storage::kv::{Engine, FlowStatsReporter, destroy_tls_engine, set_tls_engine},
 };
 
-// the duration to check auto-scale unified-thread-pool's thread
-const READ_POOL_THREAD_CHECK_DURATION: Duration = Duration::from_secs(10);
 // consider scale out read pool size if the average thread cpu usage is higher
 // than this threshold.
 const READ_POOL_THREAD_HIGH_THRESHOLD: f64 = 0.8;
@@ -159,7 +159,7 @@ type CancellationSlot = Arc<Mutex<CancellationState>>;
 pub struct ReadPoolCancellationGuard(Option<CancellationSlot>);
 
 impl ReadPoolCancellationGuard {
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.0.take();
     }
 }
@@ -201,7 +201,27 @@ async fn admit_read_task(
     Ok(())
 }
 
+fn full_rejection(metadata: &[u8]) -> ReadPoolError {
+    let metadata = TaskMetadata::from(metadata);
+    let name = std::str::from_utf8(metadata.group_name()).unwrap_or_default();
+    UNIFIED_READ_POOL_FULL_REJECTED
+        .with_label_values(&[group_label(name)])
+        .inc();
+    ReadPoolError::UnifiedReadPoolFull
+}
+
 impl ReadPoolHandle {
+    /// Spawns `f` in the pool selected by `priority`.
+    ///
+    /// On both backends the task is admitted and enqueued only when the
+    /// returned future is first polled, while the TLS tracker token the task
+    /// observes is captured here, at call time.
+    ///
+    /// Two consequences bind callers. A returned future that is never polled
+    /// never runs `f`. And the pool-full errors, `FuturePoolFull` and
+    /// `UnifiedReadPoolFull`, surface at that first poll rather than at this
+    /// call, so a caller that needs backpressure has to await the future
+    /// instead of inspecting the call.
     pub fn spawn<F>(
         &self,
         f: F,
@@ -276,9 +296,32 @@ impl ReadPoolHandle {
                     CommandPri::High => read_pool_high,
                     CommandPri::Normal => read_pool_normal,
                     CommandPri::Low => read_pool_low,
-                };
-                let res = pool.spawn(f).map_err(ReadPoolError::from);
-                futures::future::ready(res).boxed()
+                }
+                .clone();
+                // `FuturePool::spawn` wraps `f` in `TlsTrackedFuture`, which
+                // captures whichever token is set at the moment of that call.
+                // The token is therefore read here, at spawn time, and
+                // reinstalled around that call below, so the task observes its
+                // caller's tracker rather than the tracker of whoever polls
+                // the submission. This is load bearing: if `FuturePool::spawn`
+                // stopped wrapping the future, the task would silently lose
+                // its tracker instead of failing to compile.
+                //
+                // Wrapping the submission itself in `TlsTrackedFuture` would
+                // not work, because its `poll` resets the token to
+                // `INVALID_TRACKER_TOKEN` rather than restoring the previous
+                // value, clearing the poller's tracker. Wrapping `f` would
+                // repeat, on every poll of the task, the switching that
+                // `FuturePool::spawn` already does.
+                let task_tracker = get_tls_tracker_token();
+                async move {
+                    let caller_tracker = get_tls_tracker_token();
+                    set_tls_tracker_token(task_tracker);
+                    // Restore the caller's token on unwinding as well as return.
+                    tikv_util::defer!(set_tls_tracker_token(caller_tracker));
+                    pool.spawn(f).map_err(ReadPoolError::from)
+                }
+                .boxed()
             }
             ReadPoolHandle::Yatp {
                 remote,
@@ -335,7 +378,7 @@ impl ReadPoolHandle {
                         // queued tasks with a strictly lower business priority.
                         let permit = queue
                             .try_acquire(&TaskMetadata::from(metadata.as_slice()))
-                            .ok_or(ReadPoolError::UnifiedReadPoolFull)?;
+                            .ok_or_else(|| full_rejection(&metadata))?;
                         extras.set_metadata(permit.metadata(metadata));
                         if let Some(slot) = cancellation {
                             let handle = permit.cancellation();
@@ -358,7 +401,7 @@ impl ReadPoolHandle {
                     } else {
                         // Preserve the non-RC pool's per-priority capacity semantics.
                         if gauge.get() as usize >= max_tasks {
-                            return Err(ReadPoolError::UnifiedReadPoolFull);
+                            return Err(full_rejection(&metadata));
                         }
                         extras.set_metadata(metadata);
                         let guard = RunningTaskGuard::new(gauge);
@@ -378,6 +421,13 @@ impl ReadPoolHandle {
         }
     }
 
+    /// Spawns `f` like `spawn` and resolves to its output.
+    ///
+    /// With `admission_deadline`, the admission and enqueue of the task, which
+    /// can be delayed for as long as its resource limiter is in debt, fail
+    /// with `ReadPoolError::DeadlineExceeded` once the deadline passes. The
+    /// task is then dropped before it enters the pool, releasing its
+    /// admission delay slot. A task that has entered the pool is not bounded.
     pub fn spawn_handle<F, T>(
         &self,
         f: F,
@@ -385,6 +435,7 @@ impl ReadPoolHandle {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
+        admission_deadline: Option<Deadline>,
     ) -> impl Future<Output = Result<T, ReadPoolError>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -402,9 +453,16 @@ impl ReadPoolHandle {
         );
         async move {
             let mut guard = cancel_guard;
-            spawn_fut.await?;
+            match admission_deadline {
+                Some(deadline) => {
+                    match async_timeout(spawn_fut, deadline.remaining_duration()).await {
+                        Ok(res) => res?,
+                        Err(_) => return Err(ReadPoolError::DeadlineExceeded),
+                    }
+                }
+                None => spawn_fut.await?,
+            }
             let result = rx.map_err(ReadPoolError::from).await;
-            // The task has completed or has already been dropped by the queue.
             guard.disarm();
             result
         }
@@ -445,6 +503,12 @@ impl ReadPoolHandle {
                 fair_queue,
                 ..
             } => {
+                if let Some(queue) = fair_queue {
+                    // Custom YATP queues may be polled by surplus workers.
+                    // Bound dispatches in the shared queue as well, including
+                    // for handles cloned before this online update.
+                    queue.set_parallelism(max_thread_count);
+                }
                 remote.scale_workers(max_thread_count);
                 if fair_queue.is_none() {
                     *max_tasks = max_tasks
@@ -493,6 +557,12 @@ impl ReadPoolHandle {
         } = self
         {
             time_slice_inspector.update();
+            UNIFIED_READ_POOL_EWMA_TIME_SLICE_US
+                .set(time_slice_inspector.get_ewma_time_slice().as_micros() as i64);
+        }
+        // Sampled here so it reports even with no client threshold.
+        if let Some(wait) = self.get_estimated_wait_duration() {
+            UNIFIED_READ_POOL_ESTIMATED_WAIT_US.set(wait.as_micros() as i64);
         }
     }
 
@@ -501,11 +571,34 @@ impl ReadPoolHandle {
             .map(|s| s * (self.get_queue_size_per_worker() as u32))
     }
 
+    /// Whole-pool FIFO wait cannot estimate a request's wait in a weighted
+    /// group queue with MLFQ. Keep the capacity/CPU gates, but do not redirect
+    /// one group's reads based on another group's backlog.
+    fn uses_group_fair_queue(&self) -> bool {
+        matches!(
+            self,
+            Self::Yatp {
+                fair_queue: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Bytes, not `&str`: most requests never need the name, so skip UTF-8.
     pub fn check_busy_threshold(
         &self,
         busy_threshold: Duration,
+        resource_group: &[u8],
     ) -> Result<(), errorpb::ServerIsBusy> {
         if busy_threshold.is_zero() {
+            return Ok(());
+        }
+        // The advisory estimate is valid only for the legacy pool.
+        if self.uses_group_fair_queue() {
+            let group = std::str::from_utf8(resource_group).unwrap_or_default();
+            UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED
+                .with_label_values(&[group_label(group)])
+                .inc();
             return Ok(());
         }
         let estimated_wait = match self.get_estimated_wait_duration() {
@@ -518,6 +611,10 @@ impl ReadPoolHandle {
         let mut busy_err = errorpb::ServerIsBusy::default();
         busy_err.set_reason("estimated wait time exceeds threshold".to_owned());
         busy_err.estimated_wait_ms = u32::try_from(estimated_wait.as_millis()).unwrap_or(u32::MAX);
+        let group = std::str::from_utf8(resource_group).unwrap_or_default();
+        UNIFIED_READ_POOL_BUSY_THRESHOLD_REJECTED
+            .with_label_values(&[group_label(group)])
+            .inc();
         warn!("Already many pending tasks in the read queue, task is rejected";
             "busy_threshold" => ?&busy_threshold,
             "busy_err" => ?&busy_err,
@@ -695,7 +792,7 @@ pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
         if config.cpu_threshold != 0.0 {
             warn!("readpool.unified.cpu-threshold is ignored with resource control; use read-cpu-ratio");
         }
-        FairQueue::new(
+        let queue = FairQueue::new(
             manager.clone(),
             FairQueueConfig {
                 max_tasks,
@@ -705,7 +802,13 @@ pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
                 slice_precharge: config.slice_precharge.0,
                 max_time_slice: config.max_time_slice.0,
             },
-        )
+        );
+        // YATP physically starts extra workers to support online growth. Its
+        // custom queue path can pop before parking those surplus workers.
+        // Install the bound before any worker starts, while retaining the
+        // reserve threads needed by scale_pool_size.
+        queue.set_parallelism(config.max_thread_count);
+        queue
     });
     let pool = if let Some(queue) = fair_queue.as_ref() {
         builder.build_fair_pool(queue.clone())
@@ -856,6 +959,9 @@ impl ReadPoolCpuTimeTracker {
     }
 }
 struct ReadPoolConfigRunner {
+    // The period the timer last slept for, and so the window the tick's
+    // measurements cover. `on_timeout` re-picks it after the adjustment, which
+    // is what keeps it equal to the elapsed time rather than the next period.
     interval: Duration,
     sender: SyncSender<usize>,
     handle: ReadPoolHandle,
@@ -930,6 +1036,11 @@ impl RunnableWithTimer for ReadPoolConfigRunner {
 
     fn on_timeout(&mut self) {
         self.adjust_pool_size();
+        // Re-picked every tick, and after the adjustment so a tick that has
+        // just found the node loaded is followed by a fast one. Outside
+        // adjust_pool_size because that returns early when auto_adjust is off,
+        // and the period should not be frozen by it.
+        self.interval = self.control_tick();
     }
 }
 
@@ -940,6 +1051,20 @@ impl ReadPoolConfigRunner {
                 running_tasks.iter().map(|r| r.get()).sum()
             }
             _ => unreachable!(),
+        }
+    }
+
+    // The period for the next tick, from the resource manager's last verdict:
+    // shorter while the node is loaded. CONTROL_TICK when resource control is
+    // off, which is the only case where there is no verdict to follow.
+    fn control_tick(&self) -> Duration {
+        match &self.handle {
+            ReadPoolHandle::Yatp {
+                resource_manager, ..
+            } => resource_manager
+                .as_ref()
+                .map_or(CONTROL_TICK, |rm| rm.control_tick()),
+            _ => CONTROL_TICK,
         }
     }
 
@@ -998,9 +1123,8 @@ impl ReadPoolConfigRunner {
             && thread_usage < (self.cur_thread_count - 1) as f64 * READ_POOL_THREAD_LOW_THRESHOLD
             && running_tasks < self.cur_thread_count as i64 * RUNNING_TASKS_PER_THREAD_THRESHOLD;
 
-        let leeway = 0.1;
-        let busy_cpu_scale_in = read_pool_cpu > (leeway + 1.0) * target_cpu_cores;
-        let busy_cpu_scale_out = read_pool_cpu < (1.0 - leeway) * target_cpu_cores
+        let busy_cpu_scale_in = read_pool_cpu > (1.0 + LEEWAY_FRACTION) * target_cpu_cores;
+        let busy_cpu_scale_out = read_pool_cpu < LEEWAY_FACTOR * target_cpu_cores
             && self.cur_thread_count < self.core_thread_count;
 
         let new_thread_count = if busy_cpu_scale_in {
@@ -1082,7 +1206,7 @@ impl ReadPoolConfigManager {
         cpu_threshold: f64,
     ) -> Self {
         let runner = ReadPoolConfigRunner {
-            interval: READ_POOL_THREAD_CHECK_DURATION,
+            interval: CONTROL_TICK,
             sender,
             handle,
             cpu_time_tracker: ReadPoolCpuTimeTracker::new(&get_unified_read_pool_name()),
@@ -1145,6 +1269,8 @@ pub enum ReadPoolError {
 
     #[error("Read pool task was canceled before submission")]
     TaskCanceled,
+    #[error("Deadline exceeded before the task was admitted")]
+    DeadlineExceeded,
 
     #[error("{0}")]
     Canceled(#[from] oneshot::Canceled),
@@ -1167,6 +1293,38 @@ mod metrics {
             &["name"]
         )
         .unwrap();
+        // Splits the two ServerIsBusy sources: wait gate and capacity gate.
+        pub static ref UNIFIED_READ_POOL_BUSY_THRESHOLD_REJECTED: IntCounterVec =
+            register_int_counter_vec!(
+                "tikv_unified_read_pool_busy_threshold_rejected_total",
+                "Requests rejected because the estimated read pool wait exceeded the client's busy threshold",
+                &["resource_group"]
+            )
+            .unwrap();
+        pub static ref UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED: IntCounterVec =
+            register_int_counter_vec!(
+                "tikv_unified_read_pool_busy_threshold_skipped_total",
+                "Requests that skipped the estimated-wait gate because resource control manages the read queue",
+                &["resource_group"]
+            )
+            .unwrap();
+        pub static ref UNIFIED_READ_POOL_FULL_REJECTED: IntCounterVec =
+            register_int_counter_vec!(
+                "tikv_unified_read_pool_full_rejected_total",
+                "Requests rejected because the unified read pool queue was at capacity",
+                &["resource_group"]
+            )
+            .unwrap();
+        pub static ref UNIFIED_READ_POOL_ESTIMATED_WAIT_US: IntGauge = register_int_gauge!(
+            "tikv_unified_read_pool_estimated_wait_us",
+            "Whole-pool FIFO wait estimate in microseconds; a backlog indicator rather than a per-request wait prediction for the fair queue"
+        )
+        .unwrap();
+        pub static ref UNIFIED_READ_POOL_EWMA_TIME_SLICE_US: IntGauge = register_int_gauge!(
+            "tikv_unified_read_pool_ewma_time_slice_us",
+            "EWMA of a single task poll duration in the unified read pool, in microseconds"
+        )
+        .unwrap();
     }
 }
 
@@ -1178,7 +1336,8 @@ mod tests {
     use futures_executor::block_on;
     use kvproto::kvrpcpb::ResourceControlContext;
     use raftstore::store::{ReadStats, WriteStats};
-    use resource_control::ResourceGroupManager;
+    use resource_control::{ResourceGroupManager, config::Config as ResourceControlConfig};
+    use tikv_util::resource_control::DEFAULT_RESOURCE_GROUP_NAME;
 
     use super::*;
     use crate::storage::TestEngineBuilder;
@@ -1189,6 +1348,87 @@ mod tests {
     impl FlowStatsReporter for DummyReporter {
         fn report_read_stats(&self, _read_stats: ReadStats) {}
         fn report_write_stats(&self, _write_stats: WriteStats) {}
+    }
+
+    #[test]
+    fn test_future_pools_spawn_submission_contract() {
+        use std::sync::mpsc;
+
+        use tracker::{GLOBAL_TRACKERS, RequestInfo, RequestType, Tracker, TrackerToken};
+
+        fn new_tracker() -> TrackerToken {
+            GLOBAL_TRACKERS.insert(Tracker::new(RequestInfo::new(
+                &kvproto::kvrpcpb::Context::default(),
+                RequestType::Unknown,
+                0,
+            )))
+        }
+
+        // Use one underlying pool for all priorities so the test focuses on lazy
+        // submission and tracker propagation, not priority routing.
+        let pool = YatpPoolBuilder::new(yatp_pool::DefaultTicker::default())
+            .name_prefix("test-future-pools-spawn-contract")
+            .build_future_pool();
+        let handle = ReadPoolHandle::FuturePools {
+            read_pool_high: pool.clone(),
+            read_pool_normal: pool.clone(),
+            read_pool_low: pool.clone(),
+        };
+
+        // Preserve the test thread's ambient tracker, then create distinct tokens
+        // for the submitted task and the context that will poll its submission.
+        let previous_tracker = get_tls_tracker_token();
+        let task_tracker = new_tracker();
+        let caller_tracker = new_tracker();
+        set_tls_tracker_token(task_tracker);
+
+        // `started` reports the token seen by the task, `release` keeps the task
+        // pending so the running-task gauge is stable, and `finished` makes
+        // teardown wait until the task reaches its end.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        // Calling `spawn` must capture `task_tracker`, but must not enqueue the
+        // task until the returned submission future is polled.
+        let spawn_fut = handle.spawn(
+            async move {
+                started_tx.send(get_tls_tracker_token()).unwrap();
+                release_rx.await.unwrap();
+                finished_tx.send(()).unwrap();
+            },
+            CommandPri::Normal,
+            1,
+            TaskMetadata::default(),
+            None,
+        );
+
+        // Poll the submission under a different tracker to ensure polling does
+        // not overwrite the caller's TLS context.
+        set_tls_tracker_token(caller_tracker);
+
+        let running_tasks_before_poll = pool.get_running_task_count();
+        // The first poll only admits and enqueues the task; it does not await the
+        // task's completion.
+        block_on(spawn_fut).unwrap();
+        let observed_caller_tracker = get_tls_tracker_token();
+        let running_tasks_after_poll = pool.get_running_task_count();
+        let observed_task_tracker = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The task reads its token while it runs, so let it reach the end
+        // before removing the trackers it and the poller point at.
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        set_tls_tracker_token(previous_tracker);
+        GLOBAL_TRACKERS.remove(task_tracker);
+        GLOBAL_TRACKERS.remove(caller_tracker);
+
+        assert_eq!(running_tasks_before_poll, 0);
+        assert_eq!(running_tasks_after_poll, 1);
+        // The task inherits its call-time tracker, while the poller's tracker is
+        // preserved across submission.
+        assert_eq!(observed_task_tracker, task_tracker);
+        assert_eq!(observed_caller_tracker, caller_tracker);
     }
 
     #[test]
@@ -1232,11 +1472,31 @@ mod tests {
         block_on(handle.spawn(task2, CommandPri::Normal, 2, TaskMetadata::default(), None))
             .unwrap();
 
+        let full_rejected = || {
+            UNIFIED_READ_POOL_FULL_REJECTED
+                .with_label_values(&[DEFAULT_RESOURCE_GROUP_NAME])
+                .get()
+        };
+        let before = full_rejected();
+
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None)) {
             Err(ReadPoolError::UnifiedReadPoolFull) => {}
             _ => panic!("should return full error"),
         }
+        // No resource group in the metadata, so the rejection is "default".
+        assert!(
+            full_rejected() > before,
+            "the default group's full-pool rejection must be counted under \
+             {DEFAULT_RESOURCE_GROUP_NAME}"
+        );
+        assert_eq!(
+            UNIFIED_READ_POOL_FULL_REJECTED
+                .with_label_values(&[""])
+                .get(),
+            0,
+            "an empty group name must never reach the label"
+        );
         tx1.send(()).unwrap();
 
         thread::sleep(Duration::from_millis(300));
@@ -1360,7 +1620,7 @@ mod tests {
         let mut ctx = ResourceControlContext::default();
         ctx.override_priority = 16; // high priority
         let metadata = TaskMetadata::from_ctx(&ctx);
-        let f = handle.spawn_handle(task_high, CommandPri::Normal, 6, metadata, None);
+        let f = handle.spawn_handle(task_high, CommandPri::Normal, 6, metadata, None, None);
         tx_h.send(()).unwrap();
         block_on(f).unwrap();
 
@@ -1525,12 +1785,74 @@ mod tests {
         worker.stop();
     }
 
+    // A task whose admission is delayed by resource limiter debt gives up once
+    // its admission deadline passes, instead of waiting out the whole debt,
+    // and releases its admission delay slot.
+    #[test]
+    fn test_spawn_handle_admission_respects_deadline() {
+        // One delayed request at a time, so a leaked delay slot would make the
+        // next delayed request be rejected instead.
+        let rm_config = resource_control::config::Config {
+            admission_max_delayed_count: 1,
+            ..Default::default()
+        };
+        let resource_manager = Arc::new(ResourceGroupManager::new(rm_config));
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let pool = build_yatp_read_pool(
+            &UnifiedReadPoolConfig::default(),
+            DummyReporter,
+            engine,
+            Some(resource_manager),
+            CleanupMethod::InPlace,
+            false,
+        );
+        let handle = pool.handle();
+        // About a minute of background egress debt at 1 KiB/s.
+        let limiter = Arc::new(ResourceLimiter::new(
+            "test-bg".to_owned(),
+            f64::INFINITY,
+            f64::INFINITY,
+            0,
+            true,
+        ));
+        limiter.set_egress_limit_for_test(1024.0);
+        limiter.consume_egress(64 * 1024);
+        assert!(limiter.admission_delay(true) > Duration::from_secs(30));
+
+        let metadata = TaskMetadata::from_ctx(&ResourceControlContext::default());
+        for _ in 0..2 {
+            let started_at = Instant::now();
+            let res = block_on(handle.spawn_handle(
+                async { 42 },
+                CommandPri::Normal,
+                1,
+                metadata.deep_clone(),
+                Some(limiter.clone()),
+                Some(Deadline::from_now(Duration::from_millis(100))),
+            ));
+            assert!(
+                matches!(res, Err(ReadPoolError::DeadlineExceeded)),
+                "{res:?}"
+            );
+            assert!(started_at.saturating_elapsed() < Duration::from_secs(10));
+        }
+
+        // Without a deadline, a task with no limiter is not delayed at all.
+        let res = block_on(handle.spawn_handle(
+            async { 42 },
+            CommandPri::Normal,
+            2,
+            metadata,
+            None,
+            None,
+        ));
+        assert_eq!(res.unwrap(), 42);
+    }
+
     fn test_runner(
         auto_adjust: bool,
         resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> (ReadPoolConfigRunner, tikv_util::worker::Worker) {
-        use tikv_util::worker::Worker;
-
         let config = UnifiedReadPoolConfig {
             min_thread_count: 1,
             max_thread_count: 8,
@@ -1619,6 +1941,7 @@ mod tests {
                 CommandPri::Normal,
                 1,
                 TaskMetadata::default(),
+                None,
                 None,
             );
             tracker::clear_tls_tracker_token();
@@ -1750,6 +2073,7 @@ mod tests {
             2,
             TaskMetadata::default(),
             None,
+            None,
         ));
         let first_poll = block_on(futures::future::poll_fn(|cx| {
             std::task::Poll::Ready(result.as_mut().poll(cx))
@@ -1791,8 +2115,10 @@ mod tests {
         let mut config_handle = pool.handle();
         config_handle.set_max_tasks_per_worker(1);
         let (tx1, rx1) = oneshot::channel::<()>();
+        let (started1_tx, started1_rx) = std::sync::mpsc::channel();
         block_on(existing_handle.spawn(
             async move {
+                let _ = started1_tx.send(());
                 let _ = rx1.await;
             },
             CommandPri::Normal,
@@ -1801,6 +2127,7 @@ mod tests {
             None,
         ))
         .unwrap();
+        started1_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
             block_on(existing_handle.spawn(
                 async {},
@@ -1813,8 +2140,10 @@ mod tests {
         ));
         config_handle.set_max_tasks_per_worker(2);
         let (tx2, rx2) = oneshot::channel::<()>();
+        let (started2_tx, started2_rx) = std::sync::mpsc::channel();
         block_on(existing_handle.spawn(
             async move {
+                let _ = started2_tx.send(());
                 let _ = rx2.await;
             },
             CommandPri::Normal,
@@ -1823,6 +2152,10 @@ mod tests {
             None,
         ))
         .unwrap();
+        // Parallelism is still one: the first task's IO wait must release
+        // its dispatch slot so the second task can run. Both retain live
+        // capacity until their independent IO waiters complete.
+        started2_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let queue = match &existing_handle {
             ReadPoolHandle::Yatp {
                 fair_queue: Some(queue),
@@ -2083,6 +2416,147 @@ mod tests {
     }
 
     #[test]
+    fn test_busy_threshold_rejection_is_counted() {
+        let config = UnifiedReadPoolConfig {
+            min_thread_count: 1,
+            max_thread_count: 1,
+            max_tasks_per_worker: 100,
+            ..Default::default()
+        };
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let pool = build_yatp_read_pool_with_name(
+            &config,
+            DummyReporter,
+            engine,
+            None,
+            CleanupMethod::InPlace,
+            "test-busy-threshold".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+
+        // Both the poll duration and the queue must be non-zero to gate.
+        let (inspector, running_tasks) = match &handle {
+            ReadPoolHandle::Yatp {
+                time_slice_inspector,
+                running_tasks,
+                ..
+            } => (time_slice_inspector, running_tasks),
+            _ => panic!("expected a yatp pool"),
+        };
+        inspector.atomic_ewma_nanos.store(
+            Duration::from_millis(1).as_nanos() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        running_tasks[0].add(500);
+        assert_eq!(
+            handle.get_estimated_wait_duration(),
+            Some(Duration::from_millis(500)),
+            "500 queued tasks on one worker at 1ms per poll"
+        );
+
+        let counter = |g: &str| {
+            UNIFIED_READ_POOL_BUSY_THRESHOLD_REJECTED
+                .with_label_values(&[g])
+                .get()
+        };
+        let before = counter("noisy");
+        // 0 means no gate; 1s is above the estimate. Neither rejects.
+        handle
+            .check_busy_threshold(Duration::ZERO, b"noisy")
+            .expect("a zero threshold disables the gate");
+        handle
+            .check_busy_threshold(Duration::from_secs(1), b"noisy")
+            .expect("1s is above the 500ms estimate");
+        assert_eq!(counter("noisy"), before);
+
+        let err = handle
+            .check_busy_threshold(Duration::from_millis(100), b"noisy")
+            .expect_err("the estimate is over the threshold");
+        assert_eq!(err.estimated_wait_ms, 500);
+        assert_eq!(counter("noisy"), before + 1, "rejection must be counted");
+        assert_eq!(
+            counter("quiet"),
+            0,
+            "rejection must be attributed to its own group"
+        );
+
+        // No name means the default group, not an empty label.
+        let default_before = counter(DEFAULT_RESOURCE_GROUP_NAME);
+        handle
+            .check_busy_threshold(Duration::from_millis(100), b"")
+            .expect_err("the estimate is over the threshold");
+        assert_eq!(counter(""), 0, "an unset group must not become a label");
+        assert_eq!(counter(DEFAULT_RESOURCE_GROUP_NAME), default_before + 1);
+
+        running_tasks[0].sub(500);
+    }
+
+    #[test]
+    fn test_busy_threshold_skips_group_fair_queue() {
+        let config = UnifiedReadPoolConfig {
+            min_thread_count: 1,
+            max_thread_count: 1,
+            max_tasks_per_worker: 100,
+            ..Default::default()
+        };
+        let resource_manager =
+            Arc::new(ResourceGroupManager::new(ResourceControlConfig::default()));
+        resource_manager.add_resource_group(new_resource_group_ru("rc".into(), 5000, 1));
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let pool = build_yatp_read_pool_with_name(
+            &config,
+            DummyReporter,
+            engine,
+            Some(resource_manager.clone()),
+            CleanupMethod::InPlace,
+            "test-busy-threshold-rc".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+        let (inspector, running_tasks) = match &handle {
+            ReadPoolHandle::Yatp {
+                time_slice_inspector,
+                running_tasks,
+                ..
+            } => (time_slice_inspector, running_tasks),
+            _ => panic!("expected a yatp pool"),
+        };
+        inspector.atomic_ewma_nanos.store(
+            Duration::from_millis(1).as_nanos() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        running_tasks[0].add(500);
+        let threshold = Duration::from_millis(100);
+        assert_eq!(
+            handle.get_estimated_wait_duration(),
+            Some(Duration::from_millis(500)),
+            "the wait is still measured, and still reported as a metric"
+        );
+
+        // Group fair scheduling is active without a historical/noisy verdict.
+        let skipped = UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.with_label_values(&["rc"]);
+        let before = skipped.get();
+        assert!(!resource_manager.has_noisy_groups());
+        handle.check_busy_threshold(threshold, b"rc").unwrap();
+        assert_eq!(skipped.get(), before + 1);
+        // Deprecated flags must not change scheduling or restore the invalid
+        // whole-pool estimate. The global/per-group hard caps still apply.
+        resource_manager
+            .get_config()
+            .update(|c| -> Result<(), ()> {
+                c.enable_read_admission_control = true;
+                c.enable_fair_scheduling = true;
+                Ok(())
+            })
+            .unwrap();
+        resource_manager.refresh_cached_config();
+        handle.check_busy_threshold(threshold, b"rc").unwrap();
+        assert_eq!(skipped.get(), before + 2);
+        running_tasks[0].sub(500);
+    }
+
+    #[test]
     fn test_auto_adjust_disable_notifies_pool_size_change() {
         use std::sync::mpsc::sync_channel;
 
@@ -2114,7 +2588,7 @@ mod tests {
         };
 
         let mut runner = ReadPoolConfigRunner {
-            interval: READ_POOL_THREAD_CHECK_DURATION,
+            interval: CONTROL_TICK,
             sender: tx,
             handle,
             cpu_time_tracker: ReadPoolCpuTimeTracker::new("test"),
@@ -2150,5 +2624,220 @@ mod tests {
         }
 
         assert_eq!(runner.cur_thread_count, core_thread_count);
+    }
+
+    #[test]
+    fn test_fair_pool_parallelism_update_reaches_existing_handles() {
+        let pool = build_yatp_read_pool_with_name(
+            &UnifiedReadPoolConfig {
+                max_thread_count: 1,
+                max_tasks_per_worker: 4,
+                ..Default::default()
+            },
+            DummyReporter,
+            TestEngineBuilder::new().build().unwrap(),
+            Some(Arc::new(ResourceGroupManager::default())),
+            CleanupMethod::InPlace,
+            "test-fair-pool-parallelism".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+        let mut config_handle = pool.handle();
+        let queue = match &handle {
+            ReadPoolHandle::Yatp {
+                fair_queue: Some(queue),
+                ..
+            } => queue,
+            _ => unreachable!(),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for id in 0..3 {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let started_tx = started_tx.clone();
+            block_on(handle.spawn(
+                async move {
+                    let _ = started_tx.send(id);
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                },
+                CommandPri::Normal,
+                id,
+                TaskMetadata::default(),
+                None,
+            ))
+            .unwrap();
+        }
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        assert_eq!(queue.snapshot().active_dispatches, 1);
+        assert_eq!(queue.snapshot().queued, 2);
+
+        config_handle.scale_pool_size(2);
+        // YATP updates its core count without waking parked workers; a new
+        // submission triggers its normal wake path after online expansion.
+        block_on(handle.spawn(
+            async {},
+            CommandPri::Normal,
+            3,
+            TaskMetadata::default(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        assert_eq!(queue.snapshot().active_dispatches, 2);
+        config_handle.scale_pool_size(1);
+        // Existing dispatches can finish after a reduction. Releasing just
+        // one slot must not start the third task while the other slot is busy.
+        releases[0].send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue.snapshot().active_dispatches != 1 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(queue.snapshot().active_dispatches, 1);
+        assert_eq!(queue.snapshot().queued, 2);
+
+        config_handle.scale_pool_size(2);
+        block_on(handle.spawn(
+            async {},
+            CommandPri::Normal,
+            4,
+            TaskMetadata::default(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        assert_eq!(queue.snapshot().active_dispatches, 2);
+        releases[1].send(()).unwrap();
+        releases[2].send(()).unwrap();
+    }
+
+    #[test]
+    fn test_admission_timeout_does_not_evict_queued_task() {
+        use std::sync::mpsc::{self, TryRecvError};
+
+        let manager = Arc::new(ResourceGroupManager::new(ResourceControlConfig {
+            admission_max_delayed_count: 1,
+            ..Default::default()
+        }));
+        manager.add_resource_group(new_resource_group_ru("timeout-low".into(), 5000, 1));
+        manager.add_resource_group(new_resource_group_ru("timeout-high".into(), 5000, 16));
+        let pool = build_yatp_read_pool_with_name(
+            &UnifiedReadPoolConfig {
+                min_thread_count: 1,
+                max_thread_count: 1,
+                max_tasks_per_worker: 2,
+                ..Default::default()
+            },
+            DummyReporter,
+            TestEngineBuilder::new().build().unwrap(),
+            Some(manager),
+            CleanupMethod::InPlace,
+            "test-admission-timeout-no-eviction".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+        let (queue, running_tasks) = match &handle {
+            ReadPoolHandle::Yatp {
+                fair_queue: Some(queue),
+                running_tasks,
+                ..
+            } => (queue.clone(), running_tasks.clone()),
+            _ => unreachable!(),
+        };
+        let low_ctx = ResourceControlContext {
+            resource_group_name: "timeout-low".to_owned(),
+            ..Default::default()
+        };
+        let high_ctx = ResourceControlContext {
+            resource_group_name: "timeout-high".to_owned(),
+            ..Default::default()
+        };
+
+        // Hold the only worker synchronously, so the second task remains an
+        // eviction candidate until the admission-timeout checks have finished.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        block_on(handle.spawn(
+            async move {
+                started_tx.send(()).unwrap();
+                // Bound teardown even if an assertion fails before release.
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            },
+            CommandPri::Normal,
+            1,
+            TaskMetadata::from_ctx(&low_ctx),
+            None,
+        ))
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (victim_tx, victim_rx) = mpsc::channel();
+        block_on(handle.spawn(
+            async move {
+                let _ = victim_tx.send(());
+            },
+            CommandPri::Normal,
+            2,
+            TaskMetadata::from_ctx(&low_ctx),
+            None,
+        ))
+        .unwrap();
+        let before = queue.snapshot();
+        assert_eq!(before.live_tasks, 2);
+        assert_eq!(before.queued, 1);
+        let gauges_before = running_tasks.each_ref().map(|gauge| gauge.get());
+
+        // A high-priority task could evict the queued low-priority task if
+        // capacity acquisition ran before this background egress admission.
+        let limiter = Arc::new(ResourceLimiter::new(
+            "timeout-high".to_owned(),
+            f64::INFINITY,
+            f64::INFINITY,
+            0,
+            true,
+        ));
+        limiter.set_egress_limit_for_test(1024.0);
+        limiter.consume_egress(64 * 1024);
+        assert!(limiter.admission_delay(true) > Duration::from_secs(30));
+        for task_id in 3..5 {
+            let (executed_tx, executed_rx) = mpsc::channel();
+            let request = handle.spawn_handle(
+                async move {
+                    let _ = executed_tx.send(());
+                },
+                CommandPri::High,
+                task_id,
+                TaskMetadata::from_ctx(&high_ctx),
+                Some(limiter.clone()),
+                Some(Deadline::from_now(Duration::from_millis(100))),
+            );
+            let result = match block_on(futures::future::select(
+                Box::pin(request),
+                Box::pin(futures_timer::Delay::new(Duration::from_secs(5))),
+            )) {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => {
+                    panic!("admission deadline did not finish within 5s")
+                }
+            };
+            // With just one delay slot, the second timeout also proves the
+            // first attempt released its slot instead of leaking a rejection.
+            assert!(matches!(result, Err(ReadPoolError::DeadlineExceeded)));
+            assert!(matches!(
+                executed_rx.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
+            let after = queue.snapshot();
+            assert_eq!(after.live_tasks, before.live_tasks);
+            assert_eq!(after.queued, before.queued);
+            assert_eq!(after.evicted_tasks, before.evicted_tasks);
+            assert_eq!(
+                running_tasks.each_ref().map(|gauge| gauge.get()),
+                gauges_before
+            );
+            assert!(matches!(victim_rx.try_recv(), Err(TryRecvError::Empty)));
+        }
+
+        release_tx.send(()).unwrap();
+        victim_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 }

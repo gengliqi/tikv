@@ -101,6 +101,10 @@ High-risk contracts:
 - `txn/sched_pool.rs` selects the priority queue only for customized resource
   groups. Background-only control stays on the vanilla queue and throttles
   matching long-running tasks inside the pool.
+- `txn/sched_pool.rs` accumulates MVCC read flow from non-readonly scheduler
+  commands, including reads performed by foreground writes, and reports
+  region-level `ReadStats` to the raftstore reporter during ticker and worker
+  shutdown flushes. Key ranges and bucket deltas are unavailable on this path.
 
 ### MVCC
 
@@ -120,6 +124,10 @@ High-risk contracts:
 - `Storage::with_perf_context_async` scopes the existing engine performance
   observer to each synchronous poll, and BatchGet uses `observe_cpu_async`.
   Thread-local observer guards must never survive an await or worker migration.
+  The observer reports each poll's RocksDB block-read delta before the resource
+  metering tag detaches, preserving detailed TopSQL I/O attribution across
+  cooperative yields. Background egress is charged once from the completed
+  result's response bytes, independently of these per-poll observations.
 - `tikv_util::task_reschedule` supplies the poll wall-time slice;
   `cooperative_checkpoint` also checks the shared read CPU budget. These are
   safe points between calls, not preemption inside a RocksDB/MVCC call. Raw KV
@@ -159,10 +167,16 @@ High-risk contracts:
 
 - Command callbacks must complete exactly once with the correct error/result
   semantics.
+- Lock-wait requeueing must check cancellation while holding the queue shard
+  lock, but release that lock before waiting for a cancellation error or
+  invoking a callback. The cancellation sender needs the same shard lock.
 - Latch ownership must serialize conflicting commands without deadlocking the
   scheduler.
 - MVCC readers and writers must preserve lock, write, and default-CF
   relationships.
+- `CheckTxnStatus` must check whether a shared lock belongs to the queried
+  transaction before rejecting it as an invalid primary. Unrelated shared
+  holders must not hide that transaction's commit or rollback record.
 - Region bounds, snapshot context, and flashback/max-ts safety must remain
   enforced.
 - Max-ts relational validation must use the same whole-millisecond precision as
@@ -175,6 +189,27 @@ High-risk contracts:
 - MVCC conflict, read, and GC-related metrics
 - flow-control and memory-quota behavior
 - lock-wait and deadlock diagnostics
+- PD read-flow reports include reads performed by foreground write commands;
+  inspect `txn/sched_pool.rs` when PD read bytes do not match the read-pool
+  workload.
+- Resource metering / TopSQL records logical IO when
+  `resource-metering.enable-network-io-collection` is enabled. With
+  `resource-metering.enable-detailed-io-collection` also enabled, logical reads
+  and writes are selected independently and the foreground SQL request's
+  RocksDB PerfContext delta is recorded as `rocksdb_block_read_count`. This
+  field feeds the downstream `read_iops` dimension for relative attribution; it
+  is not a device-level IOPS measurement. Storage command boundaries in
+  `metrics.rs` own this attribution for read-only commands and read phases of
+  write commands. In particular, transactional writes and
+  `raw_compare_and_swap` must retain the `Storage` PerfContext because CAS reads
+  the prior value before deciding whether to write. Resumed pessimistic-lock
+  batches can contain work from multiple requests. TopSQL intentionally uses
+  the synthetic command's first context as the representative for the whole
+  batch, including logical writes and the single detailed-I/O PerfContext
+  observation. Mixed-tag batches therefore have approximate attribution,
+  avoiding per-item work on the lock-wakeup path. Do not attribute Raftstore
+  apply/store write-worker activity to the request: those paths use write-only
+  PerfContext metrics and may batch work from multiple requests.
 
 Start triage with:
 

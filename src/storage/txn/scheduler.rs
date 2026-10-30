@@ -48,8 +48,8 @@ use pd_client::{Feature, FeatureGate};
 use raftstore::store::TxnExt;
 use resource_control::{ResourceController, ResourceGroupManager, TaskMetadata};
 use resource_metering::{
-    FutureExt, ResourceTagFactory, record_logical_read_bytes, record_logical_write_bytes,
-    record_network_in_bytes,
+    FutureExt, ResourceTagFactory, io_collection_config, record_logical_read_bytes,
+    record_logical_write_bytes, record_network_in_bytes,
 };
 use smallvec::{SmallVec, smallvec};
 use tikv_kv::{Modify, Snapshot, SnapshotExt, WriteData, WriteEvent};
@@ -87,7 +87,9 @@ use crate::{
             },
             flow_controller::FlowController,
             latch::{Latches, Lock},
-            sched_pool::{SchedPool, tls_collect_query, tls_collect_scan_details},
+            sched_pool::{
+                SchedPool, tls_collect_query, tls_collect_read_flow, tls_collect_scan_details,
+            },
             tracker::TlsFutureTracker,
             txn_status_cache::TxnStatusCache,
         },
@@ -526,6 +528,12 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         });
     }
 
+    fn fail_with_deadline_exceeded(callback: SchedulerTaskCallback) {
+        callback.execute(ProcessResult::Failed {
+            err: StorageError::from(StorageErrorInner::DeadlineExceeded),
+        });
+    }
+
     /// Returns true if admission control consumed the command (reject or
     /// delay); the caller should return without further processing.
     fn apply_admission_control(
@@ -543,7 +551,10 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
 
     /// Spawns an async task on the sched pool that sleeps for `delay` then
     /// calls `schedule_command`. The latch is acquired only after the sleep so
-    /// the delay does not block concurrent writers with overlapping keys.
+    /// the delay does not block concurrent writers with overlapping keys. A
+    /// command whose deadline passes first is never scheduled: like a read
+    /// that misses its admission deadline, it waits until the deadline and
+    /// then fails as timed out.
     fn schedule_after_admission_delay(
         &self,
         cmd: Command,
@@ -560,8 +571,13 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         let rm = self.inner.resource_manager.as_ref().unwrap().clone();
         let execution = async move {
             let mut guard = rm.delay_slot_guard();
-            futures_timer::Delay::new(delay).await;
+            let deadline = cmd.deadline();
+            futures_timer::Delay::new(delay.min(deadline.remaining_duration())).await;
             guard.release();
+            if deadline.check().is_err() {
+                Self::fail_with_deadline_exceeded(cb);
+                return;
+            }
             let cid = sched.inner.gen_id();
             if let Ok(task) = Task::allocate(cid, cmd, mem_quota) {
                 sched.schedule_command(task, cb, None);
@@ -1380,6 +1396,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             } else {
                 record_logical_write_bytes(task.cmd().write_bytes() as u64);
                 self.process_write(snapshot, task, &mut sched_details).await;
+                tls_collect_read_flow(region_id, &sched_details.stat);
             };
             tls_collect_scan_details(tag.get_str(), &sched_details.stat);
             let elapsed = sched_details.start_instant.saturating_elapsed();
@@ -1465,8 +1482,17 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                 txn_status_cache: txn_scheduler.inner.txn_status_cache.clone(),
             };
             let begin_instant = Instant::now();
-            let res = unsafe {
-                with_perf_context::<E, _, _>(tag, || task.process_write(snapshot, context))
+            // A resumed-lock command can merge requests with different tags. TopSQL
+            // intentionally attributes the batch to the command's first context as
+            // its representative, avoiding O(batch size) PerfContext work here.
+            let observe_perf_context = tag != CommandKind::acquire_pessimistic_lock_resumed
+                || io_collection_config().detailed_io_collection_enabled();
+            let res = if observe_perf_context {
+                unsafe {
+                    with_perf_context::<E, _, _>(tag, || task.process_write(snapshot, context))
+                }
+            } else {
+                task.process_write(snapshot, context)
             };
             let cmd_process_duration = begin_instant.saturating_elapsed();
             sched_details.cmd_process_nanos = cmd_process_duration.as_nanos() as u64;
